@@ -1,0 +1,882 @@
+---
+title: "Roadmaps I: Visibility Graphs and the Generalized Voronoi Diagram"
+description: The roadmap contract — accessibility, connectivity, departability — and two very different curves that satisfy it; the visibility graph by rotational sweep with the shortest path; the generalized Voronoi diagram as a deformation retract, its one-dimensionality from the preimage theorem, the Morse definition box, and its construction from geometry, from brushfire, and from range data.
+chapter: 8
+part: PART II
+partTitle: Classical Planners — Search, Potentials, Roadmaps, Cells
+difficulty: Intermediate
+readingTime: 60 min
+quote: Robots use roadmaps in much the same way people use highway systems.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 5
+---
+
+import { RotationalSweep } from '@/components/ch/ch08/rotational-sweep';
+import { VoronoiCarver } from '@/components/ch/ch08/voronoi-carver';
+import { RetractCandy } from '@/components/ch/ch08/retract-candy';
+import { ThreeWaysHook } from '@/components/ch/ch08/three-ways-hook';
+import { BisectorZoo } from '@/components/ch/ch08/bisector-zoo';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'State the roadmap contract of Choset Def. 5.0.2 — accessibility, departability, connectivity — and check it for a given set of curves',
+    'Define the visibility graph, prove it contains a Euclidean-shortest path, build it by rotational plane sweep in O(n² log n), and prune it to supporting and separating lines without losing that path',
+    'Define the generalized Voronoi diagram through two-equidistant faces, access it by gradient ascent of the distance function, and say why the surjectivity refinement SS_ij is what makes the definition unique',
+    'Explain what a deformation retraction is, why the GVD is one, and why that makes it connected and a faithful record of the free space\'s loops',
+    'Use the preimage theorem to show the planar GVD is one-dimensional, and carry away the Morse vocabulary — nondegenerate critical point, index, Euler characteristic — that Chapters 9 and 10 use',
+    'Build the GVD three ways — traced from distances, as brushfire ridges, and from polygon features — and answer a query on either roadmap with Chapter 6\'s A*',
+  ]}
+  prerequisites={[
+    'Worlds, polygons and distance queries (Chapter 2); range scans, D(x) and the curve tracer traceCurve (Chapter 3)',
+    'Polygonal C-obstacles for a disc robot and the T² raster for Reach (Chapter 4); manifolds, tangent spaces and the differential (Chapter 5)',
+    'A* on a graph (Chapter 6); brushfire and its two-back-pointer pixels (Chapter 7)',
+  ]}
+>
+Chapters 6 and 7 answered one query at a time. This chapter builds something to keep: a network of
+one-dimensional curves in $\Qfree$ that captures everything a planner needs about the space, so
+that every later query is "get on, ride, get off". The surprise is that *two very different
+curves qualify*. The **visibility graph** strings obstacle vertices together along lines of sight,
+and it contains the shortest path — one that grazes every corner it turns. The **generalized
+Voronoi diagram** is the set of points equally far from the two nearest obstacles — the path that
+stays as far from everything as it can. One optimizes length, the other clearance; both are
+roadmaps because both satisfy the same three-word contract.
+
+Proving the contract for the GVD brings in two ideas that run through the rest of Part II. A
+**deformation retraction** melts the free space onto its skeleton without tearing, so every loop in
+the free space survives as a loop on the skeleton — which is why the skeleton is connected
+wherever the space is. The **preimage theorem** says that one equation in the plane cuts out a
+curve wherever its gradient does not vanish, which is why the GVD is one-dimensional and also why
+its definition needs a refinement that a range sensor would have insisted on anyway. The theorem
+arrives with the Morse vocabulary — nondegenerate critical points, their index, the Euler
+characteristic — introduced in a definition box here and used without ceremony in Chapters 9 and 10.
+
+Everything on this page runs. The visibility graph is built by Choset's rotational sweep and
+checked against the brute-force definition at sixteen hundred vertices; the exact Voronoi diagram
+of the chapter's slab is traced by Chapter 3's predictor–corrector to $10^{-12}$ and its meet point
+lands on $(2, 1.5)$ to nine digits; the Apartment's GVD is a brushfire ridge, accessed by gradient
+ascent from a hundred and forty-five seeded points, every one of which arrives.
+</Overview>
+
+## The problem: one query, three answers
+
+Put Rusty in room A and the goal in the bedroom, and solve the query three ways: A\* on the
+Chapter 6 lattice, the visibility-graph path on the inflated walls, and the path down the middle
+of the Voronoi diagram.
+
+<Figure caption="One Apartment query, three planners. Orange: A* on a quarter-metre lattice inflated by Rusty's radius. Purple: the visibility-graph path, which hugs every corner it turns. Blue: the GVD path, which keeps to the middle of every room and doorway. The readout prints each path's length and minimum clearance; the three discs drive at the same speed.">
+  <ThreeWaysHook />
+</Figure>
+
+The lattice path is Chapter 6's answer and it is fine. The visibility path is shorter: $6.7$ m on
+average over fifty seeded queries in the chapter's check, against $10.7$ m for the Voronoi path.
+The Voronoi path is safer: its minimum clearance averages $0.48$ m against $0.22$ m — the
+visibility path runs exactly at Rusty's radius from the walls, because that is what "shortest"
+means for a disc. Rusty, being a disc with odometry error and a controller that overshoots, might
+prefer the second — or might not, if the corridor is long and the battery is low. The point of the
+chapter is not that one is right. It is that both are *roadmaps*: built once, searched many times,
+with the same three guarantees.
+
+## Building intuition
+
+### The highway contract
+
+<KeyIdea title="Definition 5.0.2 — roadmap">
+A union of one-dimensional curves $RM$ is a **roadmap** if for every $\qstart$ and $\qgoal$ in
+$\Qfree$ that can be connected by a path: (1) **accessibility** — there is a path from $\qstart$
+to some $q'_{start} \in RM$; (2) **departability** — there is a path from some $q'_{goal} \in RM$
+to $\qgoal$; (3) **connectivity** — there is a path *in* $RM$ from $q'_{start}$ to $q'_{goal}$.
+</KeyIdea>
+
+That is Los Angeles. You plan a path onto the 110, ride to the 105 and the 405, and get off at the
+beach; the side streets are never searched. For a robot the payoff is that the search happens in a
+one-dimensional set, however many dimensions $\Q$ has, and that building the roadmap can be done
+once — or, with a range sensor, incrementally while exploring. The visibility graph satisfies (1)
+and (2) by definition: every point of a polygonal free space sees some vertex. The GVD satisfies
+them by *gradient ascent*: walk away from the nearest obstacle until a second one is equally near.
+Connectivity is the theorem in each case.
+
+### A lighthouse
+
+<Deferred>
+  <RotationalSweep />
+</Deferred>
+
+The obvious way to decide which vertices $v$ can see is to test the segment to each one against
+every obstacle edge — $O(n^2)$ per vertex, $O(n^3)$ for the graph. The sweep is a different
+idea: a beam of light turning about $v$ illuminates, at any moment, the nearest thing in its
+direction, and the nearest thing changes only when the beam passes a vertex. So pause only at
+vertex angles, keep the list $S$ of edges the beam currently crosses sorted by distance, and ask
+of each vertex a single question: *is it nearer than the nearest edge in $S$?* The table beside
+the canvas is Choset's Table 5.1 filling in as the beam turns; three vertices pass the test and the
+other five are behind something. When the sweep finishes, the full graph appears with the A\* path
+from $v$ to the goal, and the *reduced* toggle fades every edge that does not lie on a supporting
+or separating line — the path length does not move. That is the misconception this widget kills:
+visibility does not cost $O(n)$ tests per pair, and most of the edges it finds are never needed.
+
+### Where fronts collide
+
+<Deferred>
+  <VoronoiCarver />
+</Deferred>
+
+Chapter 7 grew brushfire fronts from every obstacle and noticed that a pixel reached by two fronts
+from different obstacles keeps two back pointers. The Voronoi Carver colours those pixels solid as
+the fronts arrive and overlays the exact diagram in purple. On the slab — two pegs and a wall —
+the exact diagram is the vertical bisector of the pegs below their meet point and two *parabolas*
+above it: each parabola has a peg as its focus and the wall as its directrix, because "equidistant
+from a point and a line" is the definition of a parabola. The meet point is $(2, 1.5)$, with
+clearance $2.5$. Slide the resolution: at one-metre cells the ridge is a staircase whose meet
+cell is a cell and a half from the exact one, because the chessboard metric meets at $(2, 2)$ and
+the Manhattan metric at $(2, 1)$; at five centimetres it hugs the curves. The misconception killed:
+the Voronoi diagram of polygons is *not* made of straight lines.
+
+### Melting the candy
+
+<Deferred>
+  <RetractCandy />
+</Deferred>
+
+Imagine a doughnut-shaped candy dissolving. What remains at the end is a ring, far smaller than
+the candy but with the same hole. The Retract Candy does this to the Apartment: every free point
+slides along its own gradient-ascent path onto the GVD, and the scrub is the time $t$ of the
+homotopy $H(q, t)$. Two loops ride along — one around a kitchen island, one in an empty room — and
+their winding numbers about the island are printed at $t = 0$ and now: $1 \to 1$ and $0 \to 0$, at
+every $t$. Then flip to *retract to a point*. That map is also continuous and also fixes its image;
+it is a retraction. But the orange loop has to cross the island to reach the point — the red marks
+— and its winding number is lost. A deformation retraction is a retraction that is homotopic to the
+identity, and that is the property that keeps the holes.
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: 'RM', meaning: 'a roadmap: a union of one-dimensional curves in Q_free satisfying Def. 5.0.2' },
+    { sym: 'v_i,\\; e_{ij}', meaning: 'visibility-graph nodes (obstacle vertices, start, goal) and line-of-sight edges' },
+    { sym: 'l,\\; \\alpha_i,\\; E,\\; S', meaning: 'the sweep half-line, vertex angles, the sorted angle list, the active edge list (Alg. 5)' },
+    { sym: 'n,\\; N', meaning: 'number of obstacles; number of obstacle vertices' },
+    { sym: 'F_i', meaning: 'generalized Voronoi region of QO_i (eq. 5.1)' },
+    { sym: 'S_{ij},\\; SS_{ij},\\; F_{ij}', meaning: 'two-equidistant surface; its surjective subset (∇d_i ≠ ∇d_j); two-equidistant face' },
+    { sym: 'F_{ijk}', meaning: 'meet point: equidistant to three closest obstacles; a boundary point has D = 0' },
+    { sym: 'H(x, t),\\; f \\sim g,\\; \\pi_1(X, x_0)', meaning: 'homotopy; homotopic maps; the first fundamental group (loop classes through x₀)' },
+    { sym: 'G^{-1}(n),\\; DG,\\; \\Sigma(G),\\; T_m M', meaning: 'preimage; differential; critical set; tangent space of M at m' },
+  ]}
+/>
+
+### Visibility
+
+<KeyIdea title="Definitions — visibility graph; supporting and separating lines; reduced graph (Choset §5.1.1)">
+In a polygonal planar $\Qfree$, the **visibility graph** has as nodes $\qstart$, $\qgoal$ and every
+vertex of every C-obstacle, and an edge $e_{ij}$ between $v_i$ and $v_j$ iff $s v_i + (1 - s) v_j
+\in \mathrm{cl}(\Qfree)$ for all $s \in [0, 1]$. Obstacle edges are edges of the graph. A
+**supporting line** is tangent to two obstacles with both on one side; a **separating line** is
+tangent to two obstacles with them on opposite sides; for a polygon, tangency at a vertex $v_i$
+is the nonsmooth kind, $B_\epsilon(v_i) \cap l \cap \QO_i = \{v_i\}$. The **reduced visibility
+graph** keeps only edges on supporting or separating lines. A boundary is **locally convex** at
+$\bar c$ if the tangent line there separates the nearby boundary points; at a reflex vertex no
+line is tangent, so the reduction removes every edge at it.
+</KeyIdea>
+
+<LinkedMath>
+$$
+\htmlClass{term-graph}{e_{ij} \ne \emptyset} \iff s\, v_i + (1 - s)\, v_j \in \mathrm{cl}(\Qfree)\ \ \forall s \in [0, 1],
+\qquad
+\htmlClass{term-path}{\text{shortest path}} = \text{A}^\star\ \text{on}\ \htmlClass{term-graph}{(V, E)}\ \text{from}\ \htmlClass{term-start}{\qstart}\ \text{to}\ \htmlClass{term-goal}{\qgoal}.
+$$
+</LinkedMath>
+
+<Derivation title="The visibility graph contains a shortest path" result="\text{bends only at obstacle vertices} \Rightarrow \text{a path in the visibility graph}">
+**Statement** (Choset §5.1.1). In a polygonal planar $\Qfree$ a Euclidean-shortest path from
+$\qstart$ to $\qgoal$ is a polyline whose interior vertices are obstacle vertices; hence it is a
+path in the visibility graph, and A\* with the Euclidean heuristic finds it.
+
+**Step 1 — locally shortest means straight.** Any sub-arc of a shortest path is shortest between
+its endpoints; in the open free space the shortest curve between two points is the segment, so the
+path is straight wherever it is not touching an obstacle.
+
+**Step 2 — bends live on the boundary.** A bend at a point interior to the free space could be
+shortcut by a chord; so bends occur only on $\partial \Qfree$.
+
+**Step 3 — not on an edge's interior.** A bend at a point interior to an obstacle edge could be
+shortcut too: the chord between two nearby path points stays on the free side of the edge's line.
+So bends occur only at vertices.
+
+**Step 4 — consecutive bends see each other.** Between two bends the path is a segment in
+$\mathrm{cl}(\Qfree)$, which is the definition of a visibility edge. $\blacksquare$
+
+*Connectivity* is Choset's Problem 1 and this chapter's Exercise 1: within a component of $\Qfree$,
+every vertex sees some vertex, and the obstacle edges close the chain. *What breaks in
+$\mathbb{R}^3$:* a shortest path around a polyhedron bends on edges, not at vertices, so the
+visibility graph of vertices misses it (Choset §5.1.1; Exercise 1). *Taut paths use only supporting
+and separating lines:* at a bend the path wraps the vertex, so both polygon neighbours of the
+vertex lie on one side of the path's line — the nonsmooth tangency above. That is why the
+reduction loses no shortest path, and the check confirms it: on fifty seeded fields the full and
+reduced graphs give the same start-to-goal length every time, with $3{,}875$ edges in place of
+$8{,}386$. The same check samples $405$ random collision-free polylines from start to goal and
+finds none shorter than A\* on the graph.
+</Derivation>
+
+<Derivation title="Rotational plane sweep is correct and runs in O(n² log n)" result="v_i \text{ visible} \iff |v v_i| < \text{dist to the nearest edge in } S \text{ and } l \text{ does not enter the obstacle at } v">
+**Statement** (Choset §5.1.2, Algorithm 5). Sweep a half-line $l$ from $v$ through $[0, 2\pi)$,
+pausing at the vertex angles $\alpha_i$ in increasing order, and maintain the set $S$ of edges
+crossing $l$ sorted by distance from $v$. Then $v_i$ is visible iff the segment $v v_i$ does not
+cross the nearest edge of $S$ and $l$ does not pass through the interior of the obstacle at $v$.
+
+**Step 1 — nothing happens between vertices.** The set of edges crossing $l$ changes only when $l$
+passes an endpoint of an edge, that is, a vertex. So pausing at the $\alpha_i$ loses nothing.
+
+**Step 2 — only the nearest crossed edge can occlude.** Every edge in $S$ crosses $l$ at some
+distance; if the nearest crossing lies beyond $v_i$ the segment $v v_i$ crosses none of them, and
+no edge outside $S$ crosses $l$ at all. Two exceptions are handled by hand: edges incident to $v_i$
+reach it exactly and do not occlude it, and when $v$ is itself a vertex, directions into its own
+polygon are blocked whatever $S$ says.
+
+**Step 3 — bookkeeping is logarithmic.** At $\alpha_i$ the two edges at $v_i$ either end (delete
+from $S$) or begin (insert, by distance along $l$). Edges in $S$ do not cross one another, so their
+order by distance is invariant while they are in $S$; with a balanced tree each operation is
+$O(\log n)$.
+
+**Step 4 — the count.** $n$ events per vertex, each $O(\log n)$, plus an $O(n \log n)$ sort:
+$O(n \log n)$ per vertex and $O(n^2 \log n)$ for the graph. $\blacksquare$
+
+*Table 5.1, reproduced.* For Fig. 5.8 — rectangle 1 on $[2, 4] \times [-1, 1]$, rectangle 2 on
+$[6, 10] \times [-2, 4]$, $v$ at the origin — the initial list is $S = \{E_4, E_2, E_8, E_6\}$, the
+events come in the order $\alpha_3, \alpha_7, \alpha_4, \alpha_8, \alpha_1, \alpha_5, \alpha_2,
+\alpha_6$, and the edges added are exactly $(v, v_4)$, $(v, v_8)$, $(v, v_1)$. The port's row for
+$\alpha_1$ reads $\{E_4, E_1\}$ where Choset prints $\{E_1, E_4\}$; his next row, $\{E_4, E_1,
+E_8, E_5\}$, agrees with the port, and the two cannot both be sorted by distance — just past
+$\alpha_1$ the beam meets $E_4$ (the line $x = 2$) before $E_1$ (the line $y = -1$). *Two
+honesty items:* the TypeScript port keeps $S$ as a sorted array, $O(n)$ per update rather than
+$O(\log n)$, which changes the constant and not the idea; and general position — no three
+vertices collinear — is assumed, as Choset assumes it, with the perturbation he suggests as the
+fix. The check runs the sweep and the brute-force definition at $1{,}598$ vertices over fifty
+seeded convex fields and finds no disagreement.
+</Derivation>
+
+### The generalized Voronoi diagram
+
+<KeyIdea title="Definitions — Voronoi region, two-equidistant sets, the GVD (Choset §5.2.1, §5.2.4)">
+The **generalized Voronoi region** of $\QO_i$ is $F_i = \{q \in \Qfree : d_i(q) \le d_h(q)\
+\forall h \ne i\}$ (eq. 5.1). The **two-equidistant surface** is $S_{ij} = \{q : d_i(q) - d_j(q) =
+0\}$; its **surjective** subset is $SS_{ij} = \{q \in S_{ij} : \nabla d_i(q) \ne \nabla d_j(q)\}$;
+the **two-equidistant face** is $F_{ij} = \{q \in SS_{ij} : d_i(q) \le d_h(q)\ \forall h\}$. The
+**GVD** is $\bigcup_i \bigcup_j F_{ij}$. In the plane the $F_{ij}$ are **GVD edges**, ending at
+**meet points** $F_{ijk}$ (equidistant to three closest obstacles) or **boundary points** (where
+$D = 0$, the ends of the diagram's spokes).
+</KeyIdea>
+
+<KeyIdea title="Definitions — retraction, homotopy, deformation retraction, π₁ (Choset §5.2.3)">
+For a manifold $X$ and $A \subset X$, a **retraction** is a continuous $f : X \to A$ with $f(a) =
+a$ for all $a \in A$; $A$ is the **retract**. A **homotopy** between $f, g : U \to V$ is a
+continuous $H : U \times [0, 1] \to V$ with $H(\cdot, 0) = f$ and $H(\cdot, 1) = g$; then $f \sim
+g$. A **deformation retraction** is a homotopy $H : X \times [0, 1] \to X$ with $H(x, 0) = x$,
+$H(x, 1) \in A$ and $H(a, t) = a$ for $a \in A$ — a retraction homotopic to the identity — and
+$A$ is a **deformation retract**. The **first fundamental group** $\pi_1(X, x_0)$ is the group of
+homotopy classes of loops through $x_0$ under concatenation; a deformation retraction preserves
+it: $\pi_1(X, x_0) = \pi_1(A, f(x_0))$.
+</KeyIdea>
+
+<Derivation title="Accessibility of the GVD" result="\dot c = \nabla D(c) \text{ reaches the GVD from any } q \in \Qfree">
+**Statement** (Choset Lemma 5.2.1). In an obstacle-bounded environment, gradient ascent of the
+distance function, $\dot c(t) = \nabla D(c(t))$ with $c(0) = \qstart$ (eq. 5.2), traces a path from
+any free point to the GVD.
+
+**Step 1 — the flow is $\nabla d_i$.** Let $\QO_i$ be the unique closest obstacle at $q$. Nearby,
+$D = d_i$ and the ascent follows $\nabla d_i$, the unit vector away from the closest point
+(Chapter 7, Derivation 2).
+
+**Step 2 — $d_i$ grows, something else must stop it.** Along the flow $d_i$ increases at unit
+rate. The environment is bounded, so $d_i$ cannot grow forever; by continuity of the distance
+functions some $d_j$ must stop exceeding $d_i$.
+
+**Step 3 — the tie.** There is a $\bar t$ with $d_i(c(\bar t)) = d_j(c(\bar t))$, a point of
+$S_{ij}$. $\blacksquare$
+
+*Two refinements the port needs.* First, the tie must be in $SS_{ij}$: two collinear wall pieces
+sharing an endpoint tie at every point beyond the endpoint with $\nabla d_i = \nabla d_j$, and
+that is not a Voronoi edge — the ascent skips such ties and continues with the new nearest
+obstacle. Second, the crossing is detected as a change of nearest obstacle between two steps and
+then bisected, so the landing point is on $S_{ij}$ to $10^{-15}$ rather than within a step of it.
+*Departability* is accessibility run backward from the goal. Choset adds that every free point sees
+some GVD point along a segment, so a robot that can sense the goal may simply drive at it once in
+sight. *The numbers.* From $145$ seeded free points of the Apartment every ascent lands, with
+$|d_i - d_j|$ at most $3 \times 10^{-15}$, and every landing point lies within $0.11$ m of the
+$0.1$ m grid GVD below; on the open slab, $107$ of $120$ starts land within one trace step of the
+traced diagram and the other $13$, below the pegs, walk out of the window — the lemma's
+boundedness hypothesis is not decoration.
+</Derivation>
+
+<Derivation title="The GVD is a deformation retract, hence connected, hence a roadmap" result="RM \sim \mathrm{id},\quad \pi_1(\Qfree) = \pi_1(\mathrm{GVD})">
+**Statement** (Choset §5.2.2–5.2.3). The map $RM : \Qfree \to \mathrm{GVD}$ that sends $q$ to the
+landing point of its gradient ascent (and fixes the GVD) is a retraction homotopic to the
+identity. Consequently each connected component of $\Qfree$ contains exactly one connected
+component of the GVD, and the GVD has the same loop classes as the free space.
+
+**Step 1 — it is a retraction.** $RM(q) = q$ on the GVD by definition; elsewhere it is the ascent
+endpoint, which exists by Lemma 5.2.1.
+
+**Step 2 — it is continuous.** Nearby starts follow nearby flow lines of the piecewise-smooth
+field $\nabla D$ and land nearby (Choset cites [340] for the proof).
+
+**Step 3 — it is homotopic to the identity.** $H(q, t) = c_q(t)$, the point at fraction $t$ of
+$q$'s own ascent path, is continuous in $(q, t)$, equals $q$ at $t = 0$, equals $RM(q)$ at $t =
+1$, and fixes the GVD throughout. That is a deformation retraction.
+
+**Step 4 — connectivity.** The image of a connected set under a continuous map is connected, so
+$RM$ carries each component of $\Qfree$ onto a connected piece of the GVD; and since the GVD lies
+in $\Qfree$ and $RM$ fixes it, that piece is a whole component.
+
+**Step 5 — loops survive.** Deformation retracts preserve $\pi_1$, so a loop in $\Qfree$ that
+cannot be shrunk to a point — one around an island — retracts to a loop on the GVD that cannot
+either. $\blacksquare$
+
+*Retract versus deformation retract.* A point is a retract of the filled doughnut (send
+everything to it) but not a deformation retract: the straight-line homotopy would have to pass
+through the hole. The Retract Candy shows exactly this — the loop around the island keeps winding
+number $1$ about it at $t = 0$, $\tfrac12$ and $1$ under the gradient-ascent homotopy, every one of
+its $48$ points lands on the GVD and none enters the island, while the straight-line retraction to
+a corridor point pierces an obstacle on $14$ of the $48$ rays. The $0.1$ m grid GVD of the
+Apartment has one connected component, as the free space does.
+</Derivation>
+
+<KeyIdea title="Definitions — regular value, critical point, critical value (Choset §5.2.4)">
+For smooth $G : M \to N$, a point $m$ is a **critical point** if the differential $DG(m)$ is not
+surjective; its image $G(m)$ is a **critical value**; $\Sigma(G)$ is the set of critical points.
+A value $n \in N$ is **regular** if $DG(m)$ is surjective for every $m \in G^{-1}(n)$. For a
+real-valued $G$ the differential is the row vector $(\nabla G)^\top$, surjective iff $\nabla G
+\ne 0$.
+</KeyIdea>
+
+<KeyIdea title="Definition box — Morse function (introduced here; imported by Chapters 9–10)">
+A smooth real-valued $f$ is **Morse** if every critical point is **nondegenerate** (nonsingular
+Hessian). Nondegenerate critical points are isolated, and each has an **index**: the number of
+negative eigenvalues of the Hessian — $0$ a minimum, $\dim M$ a maximum, anything else a saddle.
+The topology of the level sets $f^{-1}(\lambda)$ changes only as $\lambda$ crosses a critical
+value, and $\sum (-1)^{\text{index}}$ over the critical points is the Euler characteristic of $M$.
+*Example:* $h(\theta_1, \theta_2) = \cos\theta_1 + \cos\theta_2$ on Reach's torus has four critical
+points, of index $2, 1, 1, 0$ — a maximum at $(0, 0)$, saddles at $(\pi, 0)$ and $(0, \pi)$, a
+minimum at $(\pi, \pi)$ — and $1 - 2 + 1 = 0 = \chi(T^2)$; the check computes the indices from
+Chapter 7's Hessian. Chapter 7's navigation functions are Morse by definition. The distance
+function $D$ is *not* smooth, which is why Chapter 9 introduces the generalized gradient.
+</KeyIdea>
+
+<Derivation title="The planar GVD consists of one-dimensional manifolds" result="SS_{ij} \subset (d_i - d_j)^{-1}(0) \text{ is a 1-manifold},\quad T_q SS_{ij} = \ker (\nabla d_i - \nabla d_j)^\top">
+**Statement** (Choset Theorem 5.2.2, the preimage theorem). Let $G : M \to N$ be smooth and $n$ a
+regular value. Then $G^{-1}(n)$ is a closed submanifold of $M$ of dimension $\dim M - \dim N$, with
+tangent space $T_m G^{-1}(n) = \ker DG(m)$. For $G = d_i - d_j : \Q \to \mathbb{R}$ the set
+$SS_{ij}$ is one-dimensional in the plane.
+
+**Step 1 — the differential.** $D(d_i - d_j) = (\nabla d_i - \nabla d_j)^\top$, a $1 \times 2$ row.
+
+**Step 2 — surjective iff the gradients differ.** A $1 \times 2$ row is surjective onto
+$\mathbb{R}$ iff it is nonzero, i.e. iff $\nabla d_i(q) \ne \nabla d_j(q)$.
+
+**Step 3 — that is the definition of $SS_{ij}$.** The word *surjective* in "two-equidistant
+surjective surface" is this condition. On $SS_{ij}$, $0$ is a regular value of $d_i - d_j$, so
+$SS_{ij}$ is a submanifold of dimension $2 - 1 = 1$, with tangent perpendicular to $\nabla d_i -
+\nabla d_j$.
+
+**Step 4 — faces are submanifolds.** $F_{ij} \subset SS_{ij}$ is cut out by the closed conditions
+$d_i \le d_h$; it is a submanifold with boundary, and the GVD is a finite union of them.
+$\blacksquare$
+
+*The warm-up.* $f(x, y) = x^2 + y^2$ has $Df = [2x, 2y]$, nonzero everywhere on $f^{-1}(91{,}538)$
+— the check finds $|Df| = 605.1$ there — so that preimage is a one-manifold: a circle. *Why
+the refinement is needed.* Cut a nonconvex obstacle into two convex pieces in two different ways
+(Choset Fig. 5.10) and you get two different $S_{ij}$ — but the same $SS_{ij}$, because the parts
+that differ are exactly those where the two closest points coincide and the gradients line up.
+A robot at $q_2$ *outside* the concavity sees one local minimum of $\rho$, not two (Fig. 5.11):
+the sensor could never see the cut, and $SS_{ij}$ is the definition that agrees with the sensor.
+*The tangent.* $\ker (\nabla d_i - \nabla d_j)^\top$ is perpendicular to the chord joining the two
+closest points (Fig. 5.13): on the slab, at the meet point $(2, 1.5)$, $\nabla d_{P_1} = (0.8,
+0.6)$ and $\nabla d_W = (0, -1)$, so the tangent along $P_1 | W$ is $\propto (1, -0.5)$ — slope
+$-0.5$, and $(1, -0.5) \cdot (2, 4) = 0$ against the chord from $P_1$ to the wall's foot $(2, 4)$.
+That tangent is also what Chapter 3's tracer follows.
+</Derivation>
+
+<Derivation title="Size and construction of the polygonal GVD" result="\tfrac{3(n+1)}{2} \le \#\text{edges} \le 6N + 3n - 3,\qquad \tfrac{n+5}{2} \le \#\text{nodes} \le 4N - n - 2">
+**Statement** (Choset §5.2.5). In a polygonal world with $n$ obstacles and $N$ vertices, the GVD's
+edges are straight (vertex–vertex, edge–edge) or parabolic (vertex–edge), and their number lies
+between $\tfrac{3(n+1)}{2}$ and $6N + 3n - 3$; the nodes number between $\tfrac{n+5}{2}$ and $4N -
+n - 2$ [Choset ref. 359].
+
+**Step 1 — three bisectors.** Points equidistant from two points lie on a line; from two lines, on
+their angle bisectors; from a point and a line, on a parabola with that focus and directrix.
+
+**Step 2 — partition by feature pair.** The plane splits into regions by which pair of features
+(vertex or edge) is closest (Fig. 5.14); on each region the GVD edge is one of the three curves.
+
+**Step 3 — count.** The GVD is a planar graph; Euler's formula with the bounds on how many
+feature pairs can be adjacent gives the counts. $\blacksquare$
+
+<Figure caption="The bisector zoo (Choset Fig. 5.14), computed by the module's analytic bisectors. Vertex against vertex and edge against edge give lines; vertex against edge gives a parabola with the vertex as focus and the edge as directrix.">
+  <BisectorZoo />
+</Figure>
+
+*Brushfire.* Choset's third construction is Chapter 7's: a pixel the brushfire reaches by two fronts
+with different back pointers is a GVD pixel, and `ridge_cells` returns them. The grid version of the
+$SS_{ij}$ refinement matters here too: the Apartment's walls are one connected obstacle, so "two
+different obstacles" finds nothing until the back pointer is the *obstacle pixel* of origin and a
+pixel is called a ridge pixel where a neighbour's origin lies far from its own with a different
+direction — the discrete form of two distinct closest points with distinct gradients. The algorithm
+section says how the port does it and what it costs.
+</Derivation>
+
+## The algorithm
+
+<Algorithm
+  name="ROTATIONAL PLANE SWEEP  —  Choset Alg. 5"
+  inputs="a set of vertices {v_i} whose edges do not intersect, and a vertex v"
+  outputs="the subset of {v_i} within line of sight of v"
+  complexity="O(n log n) per vertex with S a balanced tree (the port: a sorted array, O(n) per update); O(n² log n) for the graph"
+>
+1. **for** each vertex $v_i$: compute $\alpha_i$, the angle from the horizontal axis to $v v_i$
+2. create the vertex list $E$, the $\alpha_i$ sorted in increasing order
+3. create the active list $S$: the edges crossing the horizontal half-line from $v$, sorted by distance
+4. **for all** $\alpha_i$ **do**
+5. &nbsp;&nbsp;&nbsp;&nbsp;**if** $v_i$ is visible to $v$ — $|v v_i|$ is less than the distance to the nearest edge of $S$ not incident to $v_i$, and $l$ does not enter the obstacle at $v$ — **then** add $(v, v_i)$ to the graph
+6. &nbsp;&nbsp;&nbsp;&nbsp;**if** $v_i$ is the beginning of an edge not in $S$ **then** insert it into $S$ by distance along $l$
+7. &nbsp;&nbsp;&nbsp;&nbsp;**if** $v_i$ is the end of an edge in $S$ **then** delete it
+8. **end for**
+
+*Reduced graph:* keep $(v_i, v_j)$ iff the line through it is tangent at both ends — at a polygon
+vertex, both polygon neighbours on one side of the line (free nodes impose nothing). *Brute
+force*, for the check: $(v_i, v_j)$ is an edge iff no polygon edge not incident to either endpoint
+properly crosses the segment and its midpoint is not strictly inside any polygon; the second
+clause is what rejects a chord of a convex obstacle.
+</Algorithm>
+
+<Algorithm
+  name="GVD BY RETRACTION AND TRACING  —  Choset eq. (5.2), §5.2.5 (sensor-based construction)"
+  inputs="a distance query giving d_i and ∇d_i for every obstacle (geometry here; Chapter 9 feeds it from range data); a window"
+  outputs="landing points on SS_ij, traced edges F_ij with their meet and boundary points"
+  complexity="retraction: O(#obstacles) per step; tracing: one predictor–corrector step per sample"
+>
+1. **access** (`retract`): from $q$, step along $\nabla d_i$ for the nearest $i$; when the nearest obstacle changes to $j$ and $\angle(\nabla d_i, \nabla d_j) > 0$, bisect $d_i - d_j$ on the last step to $10^{-12}$ — a point of $SS_{ij}$; a tie with equal gradients is skipped
+2. **seed** (`projectToGvd`): for lattice points, Newton along $\nabla d_i - \nabla d_j$ onto $S_{ij}$ for the two nearest sites; keep the point only if they are still the two nearest there and the gradients differ
+3. **trace** (`traceEdge`): Chapter 3's `traceCurve` on $G = d_i - d_j$ with tangent $(\nabla d_i - \nabla d_j)^\perp$, both ways from the seed, until a third site ties (polish the **meet point** by Newton on $(d_i - d_j,\ d_i - d_k)$), $D$ vanishes (a **boundary point**), or the window is left
+4. **collect** (`exactGvd`): skip seeds within a step of an edge already traced for the same pair; each edge carries its samples, its ends, and its analytic type per sample — *line* when both closest features are of the same kind, *parabola* when one is a vertex and the other an edge
+5. **ride**: `Roadmap` is a `Graph` for Chapter 6's A\*; a query is `retract(q_s)`, `retract(q_g)`, A\*
+
+*What this is and is not.* The Rust crate delegates the exact Voronoi diagram of segments to a
+library kernel (Boost.Polygon's algorithm); no such kernel exists in TypeScript, and the port does
+not pretend to be one. Tracing is exact to the tracer's tolerance — $4.8 \times 10^{-13}$ against
+the slab's parabolas — and comfortable for a dozen sites; it is Choset's sensor-based construction
+with the sensor replaced by geometry, which is also why Chapter 9 can reuse it unchanged.
+</Algorithm>
+
+<Algorithm
+  name="GRID GVD  —  Choset §5.2.5 (brushfire method), with the SS_ij refinement in grid form"
+  inputs="an occupancy grid; Chapter 7's brushfire; for connected obstacles, a Euclidean feature transform"
+  outputs="ridge cells, a ridge graph for A*, an access map from any free cell"
+  complexity="O(#cells) brushfire; O(#cells log #cells) feature transform; A* on the ridge"
+>
+1. **separate obstacles** (the slab, a room with furniture): Chapter 7's `brushfire` and its `ridge` — pixels two fronts from different obstacle components reach
+2. **connected obstacles** (the Apartment's walls): propagate each pixel's nearest obstacle *pixel* under the Euclidean distance (Danielsson's vector distance transform, a Dijkstra over 8-neighbours keyed on the true distance to the propagated origin); pixel $p$ is a ridge pixel when a neighbour's origin lies at least $\gamma = 2.5$ cells from $p$'s, the two directions differ by more than $20°$, and $p$ is no nearer the obstacles than the neighbour
+3. **ridge graph**: 8-adjacent ridge cells with Euclidean step costs; `thinRidge` (one Zhang–Suen pass, heuristic) when a one-pixel skeleton is wanted
+4. **access**: climb the brushfire labels to a ridge cell; **ride**: A\* on the ridge graph; **depart**: the goal's climb, reversed
+
+*Why not brushfire origins for step 2:* brushfire's labels are a grid metric and its origin pixels
+are tie-broken by queue order, so along a long wall two neighbouring pixels can carry origins
+many cells apart — a false ridge. The Euclidean features are the quantity Chapter 7 compared
+brushfire against, and the ridge they give is within $0.11$ m of every exact landing point in the
+Apartment check. *Grid ridges are jagged* (Choset Problem 14): on the slab at $0.25$ m the
+8-point ridge passes $0.18$ m from the exact meet point and the 4-point ridge $0.40$ m, and the
+grid meet cells sit at $y \approx 2$ (chessboard) and $y \approx 1.1$ (Manhattan), bracketing
+$y = 1.5$.
+</Algorithm>
+
+## Implementation in Rust
+
+The `roadmap` crate is introduced here; Chapter 9 adds `gvg` as a submodule. Its spine is a graph
+embedded in the free space together with the access map of Def. 5.0.2.
+
+```rust title="crates/roadmap/src/lib.rs"
+use nalgebra::Point2;
+use petgraph::graph::{NodeIndex, UnGraph};
+
+/// A roadmap: a graph embedded in Q_free with the geometry of each edge sampled, plus the
+/// access map of Def. 5.0.2. "Ride" is `search::astar` on `graph` — nothing is re-implemented.
+pub struct Roadmap {
+    pub graph: UnGraph<Point2<f64>, f64>,
+    /// One polyline per edge, in edge-index order: a chord for the visibility graph, a traced curve for the GVD.
+    pub polylines: Vec<Vec<Point2<f64>>>,
+}
+
+/// Accessibility as a trait: where does q get on, and along what path?
+pub trait Access {
+    fn access(&self, q: Point2<f64>) -> Option<(NodeIndex, Vec<Point2<f64>>)>;
+}
+
+pub struct QueryResult { pub path: Vec<Point2<f64>>, pub length: f64, pub min_clearance: f64 }
+
+/// Get on, ride, get off. `None` when start and goal land in different roadmap components —
+/// which, for a roadmap, means they are in different components of Q_free.
+pub fn query(rm: &Roadmap, acc: &dyn Access, q_s: Point2<f64>, q_g: Point2<f64>, d: &dyn Fn(Point2<f64>) -> f64) -> Option<QueryResult> {
+    let (ns, on) = acc.access(q_s)?;
+    let (ng, off) = acc.access(q_g)?;
+    let ride = search::astar_graph(&rm.graph, ns, ng, |n| (rm.graph[n] - rm.graph[ng]).norm())?;
+    let mut path = on;
+    for w in ride.path.windows(2) {
+        let e = rm.graph.find_edge(w[0], w[1]).unwrap();
+        path.extend(rm.polylines[e.index()].iter().skip(1));
+    }
+    path.extend(off.into_iter().rev().skip(1));
+    let length = path.windows(2).map(|w| (w[1] - w[0]).norm()).sum();
+    let min_clearance = path.iter().map(|p| d(*p)).fold(f64::INFINITY, f64::min);
+    Some(QueryResult { path, length, min_clearance })
+}
+```
+
+The sweep keeps $S$ in a `BTreeMap` keyed by distance along the current ray — the balanced tree
+the $O(n \log n)$ bound assumes.
+
+```rust title="crates/roadmap/src/visibility.rs" {22-31}
+use std::collections::BTreeMap;
+use ordered_float::OrderedFloat;
+
+/// Choset Alg. 5 for one vertex `v`. `polys` are the C-obstacles (general position assumed).
+pub fn rotational_sweep(polys: &[cspace::Polygon], v: Point2<f64>) -> Vec<Point2<f64>> {
+    let (nodes, edges) = index_vertices_and_edges(polys);
+    // Step 1–2: angles α_i in [0, 2π), sorted (ties broken by distance).
+    let mut events: Vec<(f64, usize)> = nodes.iter().enumerate()
+        .filter(|(_, n)| n.p != v)
+        .map(|(i, n)| (angle_from(v, n.p), i)).collect();
+    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    // Step 3: S = edges crossing the horizontal half-line, keyed by crossing distance.
+    let mut s: BTreeMap<OrderedFloat<f64>, usize> = edges.iter().enumerate()
+        .filter(|(_, e)| !incident(e, v) && crosses_half_line(e, v))
+        .map(|(i, e)| (OrderedFloat(ray_distance(v, 0.0, e)), i)).collect();
+    let mut visible = Vec::new();
+    for (alpha, i) in events {
+        let vi = nodes[i].p;
+        let d = (vi - v).norm();
+        // Step 5: nearest crossed edge not incident to v_i; the sweep line must not enter the obstacle at v.
+        let nearest = s.iter().filter(|(_, &e)| !incident_to(&edges[e], i))
+            .map(|(_, &e)| ray_distance(v, alpha, &edges[e])).fold(f64::INFINITY, f64::min);
+        if d < nearest - 1e-9 && !enters_obstacle_at(polys, v, vi - v) && !midpoint_buried(polys, v, vi) {
+            visible.push(vi);
+        }
+        // Steps 6–7: an incident edge already in S ends here; otherwise it begins. Key by the
+        // distance just past α so two edges starting at v_i are ordered the way the beam meets them.
+        for &e in &nodes[i].incident {
+            if let Some(k) = s.iter().find(|(_, &x)| x == e).map(|(k, _)| *k) { s.remove(&k); }
+            else { s.insert(OrderedFloat(ray_distance(v, alpha + 1e-7, &edges[e])), e); }
+        }
+    }
+    visible
+}
+
+/// Keep only edges on supporting or separating lines: tangent (both polygon neighbours on one
+/// side) at both ends. At a reflex vertex nothing is tangent — the local-convexity test of §5.1.1.
+pub fn reduced(polys: &[cspace::Polygon], g: &Roadmap) -> Roadmap { /* filter edges by tangent_at(a, b) && tangent_at(b, a) */ filter_tangent(polys, g) }
+```
+
+Tracing the GVD is Chapter 3's tracer on $G = d_i - d_j$; a meet point is two equations in two
+unknowns.
+
+```rust title="crates/roadmap/src/gvd/retract.rs · src/gvd/mod.rs" {6-18}
+/// Eq. (5.2): follow ∇D until two obstacles tie with distinct gradients (SS_ij). A tie with
+/// equal gradients — collinear wall pieces beyond their shared endpoint — is not the GVD and is
+/// skipped. The crossing is bisected so the landing point is on S_ij to 1e-12.
+pub fn retract(dist: &dyn cspace::DistanceQuery<2>, q0: Point2<f64>, step: f64, bounds: Aabb) -> Retraction {
+    let mut q = q0; let mut path = vec![q0];
+    let mut ds = sorted(dist.distances(&q));
+    for _ in 0..MAX_STEPS {
+        let (i, g) = (ds[0].index, ds[0].grad);
+        let next = q + step * g;
+        if !bounds.contains(next) { return Retraction::left_window(path); }
+        let ds_next = sorted(dist.distances(&next));
+        let j = ds_next[0].index;
+        if j != i && angle(dist.grad_of(i, &q), dist.grad_of(j, &q)) > GRAD_TOL {
+            let land = bisect(|t| { let p = q.lerp(&next, t); dist.d_of(i, &p) - dist.d_of(j, &p) }, q, next, 60);
+            path.push(land);
+            return Retraction::landed(path, [i, j]);
+        }
+        q = next; ds = ds_next; path.push(q);
+    }
+    Retraction::budget(path)
+}
+
+/// A meet point F_ijk: Newton on F(q) = (d_i − d_j, d_i − d_k) with J = [∇d_i − ∇d_j; ∇d_i − ∇d_k].
+/// Rejected unless i, j, k are the three *closest* sites at the solution.
+pub fn meet_point(sites: &[Site], i: usize, j: usize, k: usize, seed: Point2<f64>) -> Option<MeetPoint> { newton_2x2(sites, [i, j, k], seed, 60, 1e-12) }
+
+/// Sensor-based edge following (§5.2.5): Chapter 3's predictor–corrector on G = d_i − d_j, tangent
+/// (∇d_i − ∇d_j)^⊥ — perpendicular to the chord between the two closest points (Fig. 5.13).
+pub fn trace_edge(sites: &[Site], i: usize, j: usize, q0: Point2<f64>, turn: Turn, step: f64, bounds: Aabb) -> (Vec<Point2<f64>>, EdgeEnd) {
+    let g = |q: Point2<f64>| sites[i].distance(q).d - sites[j].distance(q).d;
+    let dg = |q: Point2<f64>| sites[i].distance(q).grad - sites[j].distance(q).grad;
+    let stop = |q: Point2<f64>| !bounds.contains(q) || clearance(sites, q) < step || third_site_ties(sites, i, j, q);
+    let tr = bugs::trace_curve(&g, &dg, q0, turn, bugs::TraceParams { step, newton_iters: 4, tol: 1e-12, ..Default::default() }, Some(&stop));
+    (tr.points.clone(), classify_end(sites, i, j, &tr))
+}
+```
+
+The grid GVD reuses Chapter 7's brushfire for separate obstacles and adds the Euclidean feature
+transform for connected walls.
+
+```rust title="crates/roadmap/src/gvd/grid.rs"
+/// Pixel p is on the grid GVD when a neighbour's nearest obstacle pixel lies ≥ γ cells from p's,
+/// in a direction differing by more than `min_angle`, and p is no nearer the obstacles than the
+/// neighbour. Features come from a Euclidean vector distance transform (Dijkstra keyed on the
+/// true distance to the propagated origin pixel); brushfire's grid-metric origins are tie-broken
+/// by queue order and would call long straight walls ridges.
+pub fn ridge_from_features(occ: &cspace::Raster, ft: &FeatureTransform, gamma: f64, min_angle: f64) -> Vec<bool> {
+    let mut mask = vec![false; occ.len()];
+    for p in occ.free_pixels() {
+        let o = ft.origin[p];
+        for q in occ.neighbors8(p).filter(|&q| !occ.is_occupied(q) && ft.origin[q] != o && ft.dist2[q] <= ft.dist2[p]) {
+            let oq = ft.origin[q];
+            if occ.pixel_distance(o, oq) < gamma { continue; }
+            if occ.direction_angle(p, o, oq) < min_angle { continue; }
+            mask[p] = true; break;
+        }
+    }
+    mask
+}
+```
+
+### The worked example, and its printed output
+
+```rust title="crates/roadmap/examples/three_obstacle_gvd.rs · sweep_table.rs"
+fn main() {
+    // The slab: pegs at (0, 0) and (4, 0), a wall along y = 4, a window [−2, 6] × [−1, 4].
+    let sites = [Site::point(0.0, 0.0), Site::point(4.0, 0.0), Site::segment((-12.0, 4.0), (16.0, 4.0))];
+    let gvd = exact_gvd(&sites, Aabb::new(-2.0, -1.0, 6.0, 4.0), 0.02);
+    for m in &gvd.meet_points { println!("meet point ({:.3}, {:.3}) clearance {:.3}", m.q.x, m.q.y, m.clearance); }
+    for e in &gvd.edges {
+        let kind = if e.types.iter().all(|t| *t == EdgeType::Parabola) { "parabola" } else { "line" };
+        println!("edge {:?}: {} ({} samples, length {:.2})", e.sites, kind, e.points.len(), e.length);
+    }
+    let t = tangent_at(&sites, 0, 2, Point2::new(2.0, 1.5));
+    println!("tangent along P1|W at the meet point: slope {:.3}", t.y / t.x);
+    let occ = cspace::Raster::from_sites(&sites, 0.25, Aabb::new(-2.0, -1.0, 6.0, 4.0));
+    for conn in [Conn::Four, Conn::Eight] {
+        let d = potential::brushfire(&occ, conn);
+        let ridge = RidgeGraph::new(&d);
+        let c = ridge.nearest(occ.cell_at(2.0, 1.5));
+        println!("{conn:?}: nearest ridge cell to (2, 1.5) at {:?}, {} ridge cells", occ.center(c), ridge.len());
+    }
+    // Fig. 5.8 / Table 5.1.
+    let (polys, v) = fig_5_8();
+    let sw = rotational_sweep_trace(&polys, v);
+    println!("S0 = {}", sw.initial_s_names());
+    for row in &sw.events { println!("{:<3} {:<22} {}", row.vertex, row.s_names(), row.actions()); }
+}
+```
+
+```text title="cargo run -p roadmap --example three_obstacle_gvd  ·  --example sweep_table"
+meet point (2.000, 1.500) clearance 2.500
+edge [0, 2]: parabola (210 samples, length 4.18)      y = 2 − x²/8,  x ≤ 2
+edge [0, 1]: line (127 samples, length 2.51)          x = 2,  y < 1.5
+edge [1, 2]: parabola (210 samples, length 4.17)      y = 2 − (x−4)²/8,  x ≥ 2
+tangent along P1|W at the meet point: slope -0.500
+Four: nearest ridge cell to (2, 1.5) at (2.125, 1.125), 64 ridge cells
+Eight: nearest ridge cell to (2, 1.5) at (2.125, 1.625), 86 ridge cells
+S0 = {E4, E2, E8, E6}
+v3  {E4, E3, E8, E6}      Delete E2. Add E3.
+v7  {E4, E3, E8, E7}      Delete E6. Add E7.
+v4  {E8, E7}              Delete E3. Delete E4.  ADD (v, v4)
+v8  {}                    Delete E7. Delete E8.  ADD (v, v8)
+v1  {E4, E1}              Add E4. Add E1.        ADD (v, v1)
+v5  {E4, E1, E8, E5}      Add E8. Add E5.
+v2  {E4, E2, E8, E5}      Delete E1. Add E2.
+v6  {E4, E2, E8, E6}      Delete E5. Add E6.
+```
+
+`meet_point_is_2_1p5` asserts the meet point to $10^{-9}$, the clearance, the tangent slope
+$-0.5$, that the traced samples satisfy the two parabola equations and $x = 2$ to $10^{-9}$, and
+that the 8-point grid ridge passes within one cell of $(2, 1.5)$. `sweep_table_matches_fig_5_8`
+asserts the initial list, the event order, every row of $S$, and that the added edges are exactly
+$(v, v_4), (v, v_8), (v, v_1)$. `sweep_equals_brute_force` compares the sweep with the $O(n^3)$
+definition at every vertex of fifty seeded polygon fields. `apartment_roadmaps` builds both
+roadmaps for disc-Rusty and answers fifty seeded queries, logging mean length and mean minimum
+clearance — $6.68$ m and $0.22$ m for the visibility graph, $10.70$ m and $0.48$ m for the GVD in
+the port's run — and asserting only the inequalities: the visibility path is never longer, the GVD
+path never less clear. The TypeScript port in `web/lib/roadmap/` runs the same ten checks, and
+every widget on this page is that port.
+
+<Callout type="info">
+Two things the port had to learn about grids. First, a wall lying exactly on the window's edge —
+the Apartment's shell — vanishes from a raster whose occupancy test is "centre within half a cell",
+because the centres are exactly half a cell away; with the shell gone the free space is unbounded,
+the feature transform is off by metres along the border, and the "GVD" is nonsense. The inflation is
+now a hair over half a cell. Second, the brushfire ridge of Chapter 7 names *obstacle components*,
+and the Apartment is one component; the GVD of a single nonconvex obstacle is empty until $SS_{ij}$
+asks for two distinct closest points, and the grid needs the Euclidean feature transform to ask it
+reliably. Neither is a bug in Choset; both are places where the discrete object needs the same
+refinement the continuous definition did.
+</Callout>
+
+## Putting it together: fifty queries, two highways
+
+The integration lab is the hook run to statistics. Both roadmaps are built once for disc-Rusty in
+the Apartment: the visibility graph on the walls inflated by $0.22$ m — $150$ nodes, built by the
+sweep — and the GVD from the $0.1$ m raster's feature ridge, $1{,}592$ cells in one connected
+component. Fifty seeded start–goal pairs at least two metres apart are answered on each: retract,
+ride, depart. Every pair is answered on both. The visibility path is shorter in every case and
+$6.68$ m on average; the GVD path is $10.70$ m on average and its minimum clearance, $0.48$ m, is
+more than twice the visibility path's $0.22$ m — which is Rusty's radius, exactly, because the
+shortest path touches the inflated walls. The check pins the means to two decimals and asserts
+the two inequalities pair by pair.
+
+Reach's half of the lab is the GVD of its configuration space: the Chapter 4 raster of the
+Workbench C-obstacle on $T^2$, run through the same feature transform with wrap-around adjacency,
+gives the skeleton of the free torus — the curves along which the arm stays as far from the block,
+the post and the shelf as it can in *joint* space. Exercise 6 builds it; Chapter 10 uses it.
+
+Three pointers close the chapter. The planar GVD is one-dimensional because one equation in two
+unknowns cuts out a curve; in $\mathbb{R}^3$ the same equation cuts out two-dimensional *sheets*,
+and the roadmap must be the intersection of sheets — the generalized Voronoi graph of Chapter 9,
+which also builds the GVD from range data with the tracer this chapter already used. Chapter 10's
+Morse decomposition takes the definition box literally: the cells of a coverage plan are the
+pieces between critical values of a sweep function. And Chapter 11 will call "sample near the GVD"
+medial-axis sampling, and will state the roadmap contract one more time, for a graph built by
+throwing darts.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Connectivity in the plane, and a counterexample in space">
+    Prove that the visibility graph is connected within each connected component of $\Qfree$
+    (Choset Ch. 5, Problem 1): show every point of the component sees some vertex, and that the
+    obstacle edges link the vertices of one obstacle while a line of sight between two obstacles
+    exists whenever the component is connected. Then give an example in $\mathbb{R}^3$ with one
+    box obstacle where the shortest path from start to goal bends on an *edge* of the box and is
+    therefore not a path in the visibility graph of its vertices (Problem 2).
+    <Hints>
+      <>For the plane: from any free point, sweep a ray until it hits an obstacle; which vertex does the hit edge give you?</>
+      <>For two obstacles in the same component, take a shortest path between a vertex of each and apply Derivation 1 to it.</>
+      <>In space, put the start and goal on opposite sides of a box, offset so the straight line pierces a face; the shortest detour wraps a box edge at a point that is not a vertex.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="The preimage theorem on a cone">
+    For $f(x, y, z) = x^2 + y^2 - z^2$ (Choset Problem 18): for which $c$ is $f^{-1}(c)$ a
+    manifold, of what dimension, and when is it connected? Explain why $c = 0$ fails, and relate
+    the failure to the definition of $SS_{ij}$: what plays the role of $\nabla d_i = \nabla d_j$?
+    <CheckAnswer
+      id="ch08.e2"
+      prompt="Along the GVD edge P1|W of the slab, at the meet point (2, 1.5), what is |∇d_P1 − ∇d_W|, the norm of the differential of G = d_P1 − d_W? (Three decimals.)"
+      answer={1.789}
+      tolerance={0.01}
+    >
+    $\nabla d_{P_1} = (2, 1.5)/2.5 = (0.8, 0.6)$ and $\nabla d_W = (0, -1)$, so $DG = (0.8, 1.6)$ with
+    norm $\sqrt{0.64 + 2.56} = \sqrt{3.2} \approx 1.789$ — comfortably nonzero, so $0$ is a regular
+    value there and the edge is a one-manifold with tangent $\perp (0.8, 1.6)$, slope $-0.5$. On the
+    cone, $c = 0$ fails because $Df = (2x, 2y, -2z)$ vanishes at the apex, which lies on the level
+    set; the apex is to the cone what a point with $\nabla d_i = \nabla d_j$ is to $S_{ij}$.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the meet point, then move the wall">
+    <Predict
+      id="ch08.e3"
+      question="In the Voronoi Carver, drag the wall from y = 4 to y = 6 (or set it in the disclosure). Before releasing: where does the meet point of the two pegs and the wall go?"
+      options={[
+        { label: 'To (2, 2.5)', because: 'Halfway between the pegs\' level and the wall sounds right but is not: the meet point is equidistant to a peg and the wall, √(4 + y²) = 6 − y, which gives 12y = 32, y = 8/3 ≈ 2.667, not 2.5.' },
+        { label: 'To (2, 8/3 ≈ 2.667), with clearance 10/3', correct: true, because: 'On x = 2 the distance to either peg is √(4 + y²) and to the wall is 6 − y; equating and squaring gives 4 + y² = 36 − 12y + y², so y = 32/12 = 8/3, and the clearance is 6 − 8/3 = 10/3 ≈ 3.333.' },
+        { label: 'It stays at (2, 1.5); only the parabolas move', because: 'The meet point is on all three edges at once, so it must move with the wall: the vertical edge x = 2 just gets longer.' },
+      ]}
+    >
+    Verify in the widget, then predict what happens as the wall goes to infinity: the parabolas
+    flatten, the meet point climbs without bound, and the diagram tends to the single vertical
+    bisector of the pegs — the ordinary Voronoi diagram of two points.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Which loop survives?">
+    In the Retract Candy, drop the green loop around the kitchen island (click just beside the
+    orange one) and another in the middle of room A. Predict which keeps a nonzero winding number
+    about the island after the retraction and why the "winding about the island" counters for a
+    loop can never disagree between $t = 0$ and $t = 1$ under gradient ascent — but can under
+    "retract to a point". Then explain, in one sentence each, why the straight-line map is still a
+    retraction, and what property it lacks.
+    <Hints>
+      <>A winding number is an integer that depends continuously on the loop as long as the loop never touches the point it winds about. What would have to happen for it to change?</>
+      <>Gradient ascent of D never decreases D, so no point of a loop can enter an obstacle along the way. A straight line to a far point can.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="Reduced graphs for nonconvex polygons">
+    Implement `reduced` for nonconvex polygons using the local-convexity test of §5.1.1: at a
+    reflex vertex no line is tangent, so every edge there is dropped, while at a convex vertex the
+    tangency test is the one for convex obstacles. Property-test on 100 seeded worlds that contain
+    L-shaped and U-shaped obstacles that the shortest-path length from start to goal on the reduced
+    and full graphs agree, and record how many edges the reduction removes.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="The sensor-based GVD, end to end">
+    Implement Choset's §5.2.5 construction with Rusty's Chapter 3 range sensor: access the GVD by
+    `retract` driven by the local minima of the scan (Chapter 7's `SensorDistance`), trace edges
+    with `trace_edge` on $G = d_i - d_j$ with the two smallest local minima standing in for
+    $d_i$ and $d_j$, detect a meet point as "a sudden change in one of the two closest obstacles",
+    build the graph incrementally — mark the direction you came from, explore every new edge from
+    each meet point, turn around at boundary points — and compare the edge count with `exact` on a
+    room of the Apartment. Chapter 9 does this in $\mathbb{R}^3$; the planar version is three pages.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 5, §5.0–5.2, is this chapter's source: Definition 5.0.2, the visibility graph and Algorithm 5 with Fig. 5.8 and Table 5.1, the GVD through F_ij and SS_ij, Lemma 5.2.1, the deformation-retract argument, the preimage theorem (Theorem 5.2.2) and the three constructions of §5.2.5."
+  />
+  <Reference
+    authors="Lozano-Pérez, T. and Wesley, M. A."
+    year={1979}
+    title="An Algorithm for Planning Collision-Free Paths Among Polyhedral Obstacles"
+    venue="Communications of the ACM 22(10), 560–570"
+    doi="10.1145/359156.359164"
+    note="The visibility graph as a motion-planning roadmap, with the shortest-path argument of Derivation 1 and the observation that it fails in three dimensions."
+  />
+  <Reference
+    authors="Lozano-Pérez, T."
+    year={1983}
+    title="Spatial Planning: A Configuration Space Approach"
+    venue="IEEE Transactions on Computers C-32(2), 108–120"
+    doi="10.1109/TC.1983.1676196"
+    note="The C-obstacles on which the visibility graph lives: the inflated walls of this chapter's Apartment are its Minkowski sums for a disc."
+  />
+  <Reference
+    authors="Choset, H. and Burdick, J."
+    year={2000}
+    title="Sensor-Based Exploration: The Hierarchical Generalized Voronoi Graph"
+    venue="International Journal of Robotics Research 19(2), 96–125"
+    doi="10.1177/02783640022066770"
+    note="The GVD and its three-dimensional successor as roadmaps built from range data by gradient ascent and edge tracing — the sensor-based construction of §5.2.5 in full, and Chapter 9's subject."
+  />
+  <Reference
+    authors="Aurenhammer, F."
+    year={1991}
+    title="Voronoi Diagrams — A Survey of a Fundamental Geometric Data Structure"
+    venue="ACM Computing Surveys 23(3), 345–405"
+    doi="10.1145/116873.116880"
+    note="The survey behind the polygonal construction: bisectors of points, lines and segments, the size bounds, and the sweep and divide-and-conquer algorithms that the exact kernel the Rust crate delegates to implements."
+  />
+  <Reference
+    authors="Danielsson, P.-E."
+    year={1980}
+    title="Euclidean Distance Mapping"
+    venue="Computer Graphics and Image Processing 14(3), 227–248"
+    doi="10.1016/0146-664X(80)90054-4"
+    note="The vector distance transform: propagating each pixel's nearest obstacle pixel under the Euclidean distance, which the grid GVD uses to apply the SS_ij refinement to the Apartment's connected walls."
+  />
+  <Reference
+    authors="Hatcher, A."
+    year={2002}
+    title="Algebraic Topology"
+    venue="Cambridge University Press"
+    url="https://pi.math.cornell.edu/~hatcher/AT/ATpage.html"
+    note="Chapter 0 defines homotopy, retraction and deformation retraction exactly as used here, and §1.1 the fundamental group; the standard reference for the fact that a deformation retraction induces an isomorphism on π₁."
+  />
+</References>

@@ -1,0 +1,42 @@
+# --- Dependencies and build output -------------------------------------------
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+.source/
+
+# --- LaTeX -------------------------------------------------------------------
+# chapters/*.tex are generated from the web edition by `make convert`.
+pr-latex/chapters/*.tex
+pr-latex/build/*.log
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# --- Reference material ------------------------------------------------------
+# Third-party textbooks used as baselines while writing. They are copyrighted
+# and large, so they are kept locally rather than committed. See README.
+Resource/
+
+# --- Environment -------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# --- Scratch -----------------------------------------------------------------
+/tmp/
+*.tmp
+__pycache__/
+*.pyc

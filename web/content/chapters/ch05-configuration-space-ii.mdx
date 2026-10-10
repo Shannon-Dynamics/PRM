@@ -1,0 +1,1079 @@
+---
+title: "Configuration Space II: Topology, Manifolds, and Rigid Bodies"
+description: What "the edges are identified" means, why every planner needs a distance, an interpolation and a sampler that respect it, and the Manifold trait that makes the compiler enforce the difference between a torus and the plane.
+chapter: 5
+part: PART I
+partTitle: Foundations — Robots, Worlds, and Configuration Space
+difficulty: Intermediate
+readingTime: 55 min
+quote: It is not surprising that people once believed the world was flat — they were only looking at their neighborhoods!
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §3.4.1
+---
+
+import { TorusUnwrapper } from '@/components/ch/ch05/torus-unwrapper';
+import { RotationZoo } from '@/components/ch/ch05/rotation-zoo';
+import { AtlasOfTheCircle } from '@/components/ch/ch05/atlas-of-the-circle';
+import { FrameComposer } from '@/components/ch/ch05/frame-composer';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Say precisely what it means for two configuration spaces to be "the same" — homeomorphic, diffeomorphic — and tell the torus from the plane by a topological invariant',
+    'Define manifolds, charts and atlases, and show with Choset\'s four charts why the circle has no global coordinate',
+    'Write a metric, a geodesic interpolation and a uniform sampler for S¹, T², SE(2) and SO(3), and verify the metric axioms',
+    'Compose rigid-body transforms by subscript cancellation, and tell a body-frame displacement from a world-frame one',
+    'Explain gimbal lock as a lost chart, and why unit quaternions need four charts but never lose one',
+    'Implement all of it behind one Rust trait, Manifold, that every planner from Chapter 6 on is generic over',
+  ]}
+  prerequisites={[
+    'The configuration types of Chapter 2: T2 for Reach, Pose2 for Rusty, HitchCfg',
+    'Chapter 4: the unwrapped torus, C-obstacles, and Reach\'s Jacobian J(q)',
+    'Open and closed sets, continuity, the chain rule (Choset App. B, C — reviewed as needed)',
+  ]}
+>
+[Chapter 4](/chapters/ch04-configuration-space-i) drew Reach's configuration space as a square with
+amber blobs and kept saying "the edges are identified." This chapter says what that means, why a
+planner must care, and how to make the compiler enforce it.
+
+The reason not to skip Choset's most abstract pages is concrete. Every planner in the rest of this
+book needs three things from a configuration space: a *distance* between two configurations, an
+*interpolation* between them, and a way to *sample* them. All three are wrong if you pretend the
+torus $T^2$ is the plane $\mathbb{R}^2$, or that $\SEtwo$ is $\mathbb{R}^3$ — not wrong by a
+little, wrong by the width of the whole space, as the first worked example shows with two numbers.
+The cure is one sentence, and it is a Rust trait: **a configuration space is a manifold — local
+coordinates, usually no global ones — so a planner must be written against the operations the
+manifold provides, `dist`, `interpolate`, `sample`, and never against the coordinates.**
+
+Along the way the chapter collects what Choset's §3.4–3.6 and Appendices B, C and E say about
+mappings, charts, connectedness, compactness, metric spaces, matrix groups and rotations, keeps
+the examples that carry the pedagogy — the circle, the ellipse and the racetrack; the four charts
+of $S^1$; the three frames $A$, $B$, $C$ worked by hand — and closes by reading Reach's Jacobian
+as the differential $D\varphi$, a linear map that does not care which chart you used.
+</Overview>
+
+## The problem: a path in two pieces
+
+Here is the Chapter 4 picture of Reach's configuration space again — the square $[-\pi, \pi]^2$
+with the C-obstacles of three disc obstacles on the Workbench — and a purple path between two
+configurations. On the square the path is two disconnected pieces. Watch the square fold.
+
+<Deferred>
+  <TorusUnwrapper />
+</Deferred>
+
+When the square has become a doughnut the two pieces are one curve, and a short one. Nothing
+about the configurations changed; the picture of the space changed, from a *chart* to the *space*.
+The readout underneath says the same thing in numbers. For the default endpoints the chart's
+Euclidean distance is about six, the torus distance well under one, and the difference is entirely
+the seam: the path crosses the dashed edge where $\theta_1 = \pi$ becomes $\theta_1 = -\pi$.
+
+Three things in the widget are the whole chapter.
+
+**The seam is an artifact of the chart, not a feature of the space.** The square is one way of
+assigning two numbers to a configuration of a two-joint arm. It is a good way almost everywhere
+and a bad way along four edges, and a planner that works with the numbers inherits the bad edges.
+Choset's §3.4.2 names what the square is — a *chart* — and what the torus needs instead — an
+*atlas*.
+
+**Distance belongs to the space.** `dist` in the readout is $d_{T^2}$, the metric this chapter
+defines on the torus. It is shorter than the chart distance exactly when the short way crosses a
+seam. Chapter 11's nearest-neighbor queries, Chapter 12's tree extensions and Chapter 13's rewiring
+radii all call this function, and all of them would quietly plan around a wall that does not exist
+if they called the chart's distance instead.
+
+**Joint limits change the topology.** Switch them on. The square stops wrapping, the surface on the
+right is a disc, and the component count in the readout changes: the band of C-obstacle that cut
+the square into two components, which the torus had glued back into one, now separates them for
+good. Choset's §3.4.3 says this in one line — *compact and noncompact spaces cannot be
+diffeomorphic* — and the lab at the end of the chapter measures it.
+
+<KeyIdea title="The one sentence version">
+A configuration space is a manifold: locally like $\mathbb{R}^k$, usually with no global
+coordinates. A planner must ask the space for distances, interpolations and samples, and must
+never do arithmetic on the coordinates — because every chart has a seam, and only the space knows
+where it is.
+</KeyIdea>
+
+## Building intuition
+
+### An angle is not a number
+
+Start with the simplest manifold that is not a Euclidean space: the circle $S^1$, the
+configuration space of one revolute joint. Choset's §3.4.2 covers it with four charts — the open
+half-circles $U_1 = \{x_2 > 0\}$, $U_2 = \{x_2 < 0\}$, $U_3 = \{x_1 > 0\}$, $U_4 = \{x_1 < 0\}$,
+each coordinatized by whichever Cartesian coordinate varies monotonically on it. The widget hands
+a point from chart to chart.
+
+<Deferred>
+  <AtlasOfTheCircle />
+</Deferred>
+
+Every point of the circle lies in at least one chart — the four domains *cover*. Wherever a point
+lies in two, both coordinates exist and are related by a smooth function, the *transition map*; on
+$U_1 \cap U_3$ it is $\varphi_1 \circ \varphi_3^{-1}(z) = \sqrt{1 - z^2}$, drawn at lower right.
+That smoothness is what lets a planner, or a derivative, pass from one chart to the next without a
+jolt. The two-chart angle atlas is the one `S1` uses in code: the angle measured from $+x$ on the
+circle minus $(-1, 0)$, and the angle measured from $-x$ on the circle minus $(1, 0)$, whose
+transition map is a translation by $\pi$.
+
+Then try the single-chart attempt, $\theta \in [0, 2\pi)$. It assigns a number to every point, and
+it is not a chart: drag through $\theta = 0$ and the coordinate tears from $6.28$ to $0$. A chart's
+domain has to be *open*, so that every point has a neighborhood on which the map is continuous, and
+no neighborhood of $(1, 0)$ maps continuously to an interval. Chapter 4's "single angle in
+$[0, 2\pi)$" was a chart with a seam, not an atlas, and the seam is where its arithmetic lies.
+
+### A transform is not a position plus an angle
+
+The second intuition is about rigid bodies. Choset's §3.5.1 works one example completely — three
+frames $A$, $B$, $C$ on a unit grid and a point $w$ — and it is the one place in his book where the
+group $\SEtwo$ can be checked by hand. The widget keeps his numbers as its reset state.
+
+<Deferred>
+  <FrameComposer />
+</Deferred>
+
+Two rules generate everything in the readout. *Subscript cancellation*: $T_{AB}\,T_{BC} = T_{AC}$,
+and $T_{BC}\,w_C = w_B$ — the inner subscripts annihilate, and the result is the outer pair. And
+*non-commutativity*: the same transform $T_1$ multiplied on the right of $T_{AB}$ moves frame $B$
+in its own coordinates (a *body-frame* transformation, $B'$), multiplied on the left it moves $B$
+in $A$'s coordinates (a *world-frame* transformation, $B''$), and the two frames land in different
+places. Autoplay sweeps $T_1$'s heading so you can watch $B'$ and $B''$ diverge; reset returns to
+Choset's $T_1$ and the two placements $(-2, -1, 0)$ and $(2, 1, 0)$. A pose is an element of a
+group. The order of multiplication is the whole content.
+
+The third intuition — that gimbal lock is a missing chart — waits for the rotation section, where
+it has its own widget.
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: '\\phi : S \\to T,\\; \\phi(S),\\; \\phi^{-1}(T)', meaning: 'a mapping; its image; the preimage of a set' },
+    { sym: '(U, \\phi);\\; \\psi \\circ \\phi^{-1}', meaning: 'a chart — an open U ⊂ Q with a diffeomorphism φ onto an open set of ℝᵏ — and a transition map between two charts' },
+    { sym: 'B_\\epsilon(p),\\; \\operatorname{nbhd}(p);\\; C^0, C^k, C^\\infty', meaning: 'open ball; neighborhood; continuous, k times continuously differentiable, smooth' },
+    { sym: 'T = \\begin{bmatrix} R & p \\\\ 0 & 1 \\end{bmatrix},\\; T_{AB},\\; w_A', meaning: 'a homogeneous transform; frame B expressed in A; the point w in A\'s coordinates' },
+    { sym: 'd_{S^1},\\; d_{T^2},\\; d^{w}_{SE(2)},\\; d_{SO(3)}', meaning: 'the chapter\'s metrics; w is the rotation weight in metres per radian', note: 'w has no canonical value' },
+    { sym: '(\\phi, \\theta, \\psi)', meaning: 'Z-Y-Z Euler angles (Choset §3.6)' },
+    { sym: 'T_q\\Q,\\; D\\varphi_q : T_q\\Q \\to T_{\\varphi(q)}M', meaning: 'tangent space (informal here, formal in Chapter 20); the differential of the forward map' },
+  ]}
+/>
+
+### Mappings: onto, one-to-one, and the two kinds of "the same"
+
+Let $\phi : S \to T$ be a mapping. It is **surjective** (onto) if $\phi(S) = T$, **injective**
+(one-to-one) if $\phi(s_1) = \phi(s_2)$ forces $s_1 = s_2$, and **bijective** if both. A bijection
+has an inverse everywhere on $T$, and this is what lets us move back and forth between a
+configuration space, whose geometry may be complicated, and a Euclidean space, whose geometry is
+not. Choset's example: $\sin : (-\pi/2, \pi/2) \to (-1, 1)$ is bijective; $\sin : \mathbb{R} \to
+[-1, 1]$ is only surjective.
+
+<KeyIdea title="Definition 3.4.1 and 3.4.2 — homeomorphism, diffeomorphism">
+A bijection $\phi : S \to T$ with $\phi$ and $\phi^{-1}$ both continuous is a **homeomorphism**,
+and $S$, $T$ are **homeomorphic**. A bijection with $\phi$ and $\phi^{-1}$ both smooth ($C^\infty$)
+is a **diffeomorphism**, and $S$, $T$ are **diffeomorphic**. Every diffeomorphism is a
+homeomorphism; the converse fails.
+</KeyIdea>
+
+The converse fails on Choset's three curves (his figure 3.12): the unit circle
+$M_c = \{x^2 + y^2 = 1\}$, the ellipse $M_e = \{x^2/4 + y^2 = 1\}$, and the *racetrack* $M_r$ —
+two half-circles of radius one joined by straight segments, $f_r(x,y) = 0$ with
+
+$$
+f_r(x, y) =
+\begin{cases}
+x - 1 & -1 \le y \le 1,\; x > 0 \\
+(y+1)^2 + x^2 - 1 & y < -1 \\
+(y-1)^2 + x^2 - 1 & y > 1 \\
+x + 1 & -1 \le y \le 1,\; x < 0 .
+\end{cases}
+$$
+
+All three are homeomorphic: radial projection $\phi(x, y) = (x, y)/\sqrt{x^2 + y^2}$ carries the
+ellipse onto the circle and is continuous both ways. The circle and ellipse are diffeomorphic — that
+same $\phi$ is smooth both ways. But no diffeomorphism reaches the racetrack: its curvature jumps
+at $(\pm 1, \pm 1)$, where straight meets round, and a diffeomorphism would have to carry the
+circle's constant curvature onto it smoothly. Topology sees one closed curve; differential
+structure sees two kinds.
+
+### Neighborhoods, and what "locally" means
+
+A **neighborhood** of a point $p$ in a metric space is any set $U \ni p$ such that every point of
+$U$ has an open ball $B_\epsilon(p') = \{p'' : d(p', p'') < \epsilon\}$ inside $U$; an open ball is
+itself a neighborhood. $S$ is **locally diffeomorphic** to $T$ if every point of $S$ has a
+neighborhood diffeomorphic to an open subset of $T$. The sphere is locally diffeomorphic to the
+plane — which is Choset's remark about the flat earth in this chapter's epigraph — and not
+globally: there is no bijection from the sphere onto the plane that is continuous both ways.
+
+The two robots of Chapter 4 sit on either side of this distinction. A disc translating in the plane
+has configuration space $\mathbb{R}^2$, globally diffeomorphic to its workspace by the identity. The
+two-joint arm has $T^2$, which is *locally* diffeomorphic to $\mathbb{R}^2$ — every configuration
+has a neighborhood that looks like a patch of the plane — and not globally, because $T^2$ is
+compact and $\mathbb{R}^2$ is not (§3.4.3 below). Give the arm strict joint limits
+$\theta_i^\ell < \theta_i < \theta_i^u$ and its configuration space becomes an open rectangle,
+which *is* globally diffeomorphic to $\mathbb{R}^2$: stretch each open interval over the line with
+$\tan$. Joint limits are not a detail. They change the topology.
+
+### Manifolds, charts, atlases
+
+<KeyIdea title="Definitions 3.4.3–3.4.5 — manifold, chart, C∞-related charts, atlas">
+A set $S$ is a **$k$-dimensional manifold** if it is locally homeomorphic to $\mathbb{R}^k$: every
+point has a neighborhood homeomorphic to an open set of $\mathbb{R}^k$. A **chart** is a pair
+$(U, \phi)$ with $U$ open in $S$ and $\phi$ a diffeomorphism from $U$ onto an open set of
+$\mathbb{R}^k$; $\phi^{-1}$ is a *parameterization*. Two charts $(U, \phi)$, $(V, \psi)$ are
+**$C^\infty$-related** if the transition maps $\psi \circ \phi^{-1}$ and $\phi \circ \psi^{-1}$
+are smooth on the images of $U \cap V$. A family of pairwise $C^\infty$-related charts whose
+domains cover $S$ is an **atlas**, also called the *differentiable structure*; $S$ with an atlas is a
+**differentiable manifold**.
+</KeyIdea>
+
+The configuration spaces this book plans in are all differentiable manifolds, and the
+parameterizations of Chapter 4 — "the configuration of the arm is $(\theta_1, \theta_2)$" — were
+charts without the name. When no single chart covers the space, as for the torus, there are three
+options (Choset §3.5): use one chart anyway and suffer its seam; use an atlas; or *embed* the space
+in a higher-dimensional Euclidean space with constraints — the unit circle in $\mathbb{R}^2$, the
+doughnut in $\mathbb{R}^3$, rotation matrices in $\mathbb{R}^9$. The code in this chapter uses all
+three, each where it is best.
+
+<Derivation title="S¹ needs at least two charts, and Choset's four suffice" result="\{(U_i, \phi_i)\}_{i=1}^4 \text{ is an atlas}">
+**Statement.** No single chart covers $S^1$. The charts $U_1 = \{x_2 > 0\}, \phi_1 = x_1$;
+$U_2 = \{x_2 < 0\}, \phi_2 = x_1$; $U_3 = \{x_1 > 0\}, \phi_3 = x_2$; $U_4 = \{x_1 < 0\},
+\phi_4 = x_2$, with parameterizations $\phi_1^{-1}(z) = (z, \sqrt{1 - z^2})$,
+$\phi_2^{-1}(z) = (z, -\sqrt{1 - z^2})$, $\phi_3^{-1}(z) = (\sqrt{1 - z^2}, z)$,
+$\phi_4^{-1}(z) = (-\sqrt{1 - z^2}, z)$, form an atlas.
+
+**Step 1 — one chart is impossible.** A single chart would be a homeomorphism from $S^1$ onto an
+open subset of $\mathbb{R}$, which is a union of open intervals; being the image of a connected set
+it is one interval. Removing a point from an open interval disconnects it; removing a point from
+$S^1$ does not. A homeomorphism preserves connectedness of the complement of a point, so none
+exists.
+
+**Step 2 — cover.** Every point of $S^1$ has $x_1 \ne 0$ or $x_2 \ne 0$, so lies in some $U_i$.
+Each $U_i$ is open, each $\phi_i$ is the restriction of a coordinate projection, a diffeomorphism
+onto $(-1, 1)$ with the inverse shown.
+
+**Step 3 — the transition maps.** $U_1 \cap U_2 = U_3 \cap U_4 = \emptyset$, so there are four
+overlaps to check, each a quarter-circle. On $U_1 \cap U_3$, $\phi_1 \circ \phi_3^{-1}(z) =
+\sqrt{1 - z^2}$ for $z \in (0, 1)$ and $\phi_3 \circ \phi_1^{-1}(z) = \sqrt{1 - z^2}$ for
+$z \in (0, 1)$. The other three overlaps give $\pm\sqrt{1 - z^2}$ on $(-1, 0)$ or $(0, 1)$.
+
+**Step 4 — smoothness.** $\sqrt{1 - z^2}$ is smooth on any open subinterval of $(-1, 1)$ — the
+only non-smooth points, $z = \pm 1$, are excluded because the overlaps are open quarter-circles.
+Hence the charts are pairwise $C^\infty$-related and the four form an atlas. $\blacksquare$
+
+*Two charts suffice* (Choset problem 3.9): $V_1 = S^1 \setminus \{(-1, 0)\}$ with the angle from
+$+x$ in $(-\pi, \pi)$, and $V_2 = S^1 \setminus \{(1, 0)\}$ with the angle from $-x$. Their
+transition map is $z \mapsto z \pm \pi$ on each component of the overlap: a translation, with
+derivative $1$. This is the atlas `S1` uses, and the derivative-one fact is what makes the Jacobian
+chart-independent in the last derivation of this chapter.
+</Derivation>
+
+### Connectedness and compactness
+
+A manifold is **connected** if any two of its points are joined by a path. $\mathbb{R}^n$, $S^n$,
+$T^n$ are; so are $\SOthree$ and $\SEtwo$. Obstacles break $\Qfree$ into **connected components**,
+its maximal connected subsets, and the first fact every planner must respect is that there is no
+solution when $\qstart$ and $\qgoal$ lie in different components. The Torus Unwrapper's component
+count is this definition evaluated on a raster.
+
+A space is **compact** if it is a closed and bounded subset of some $\mathbb{R}^n$. $[0, 1]$ is
+compact and $[0, 1)$ is not; $S^n$, $T^n$ and $\SOthree$ are compact; $\mathbb{R}^n$ and $\SEtwo$
+are not. Products of compact spaces are compact, and a non-compact product $M_1 \times M_2$ with
+$M_1$ compact has $M_1$ as its *compact factor* — $\SEtwo \cong \mathbb{R}^2 \times S^1$ has $S^1$.
+Two facts matter for planning: compact and non-compact spaces are never diffeomorphic, which is the
+invariant that separates $T^2$ from $\mathbb{R}^2$; and a sampler can be uniform on a compact space
+but needs a box on a non-compact one, which is why `Se2::sample` takes bounds and `S1::sample` does
+not.
+
+<Derivation title="Joint limits change the topology" result="T^2 \not\cong \mathbb{R}^2,\quad (\theta^\ell, \theta^u)^2 \cong \mathbb{R}^2">
+**Statement.** The two-joint arm's configuration space $T^2$ is not diffeomorphic to
+$\mathbb{R}^2$; with strict joint limits it becomes an open rectangle, which is.
+
+**Step 1.** Continuous images of compact sets are compact. $T^2$ is compact (a closed, bounded
+subset of $\mathbb{R}^3$ via the doughnut embedding) and $\mathbb{R}^2$ is unbounded, so no
+continuous bijection carries one onto the other — let alone a diffeomorphism.
+
+**Step 2.** With limits $\theta_i^\ell < \theta_i < \theta_i^u$, each joint ranges over an open
+interval and the space is the open rectangle $(\theta_1^\ell, \theta_1^u) \times (\theta_2^\ell,
+\theta_2^u)$.
+
+**Step 3.** $t \mapsto \tan\!\big(\pi \tfrac{t - \theta^\ell}{\theta^u - \theta^\ell} - \tfrac{\pi}{2}\big)$
+is a diffeomorphism from $(\theta^\ell, \theta^u)$ onto $\mathbb{R}$, and a product of
+diffeomorphisms is a diffeomorphism, so the rectangle is diffeomorphic to $\mathbb{R}^2$.
+$\blacksquare$
+
+*Closed limits* $\theta_i^\ell \le \theta_i \le \theta_i^u$ give a compact space again — but a
+manifold *with boundary*, which Choset's §3.4.4 warns is not a manifold in the sense above. And some
+one-degree-of-freedom parallel mechanisms have a configuration space shaped like a figure eight,
+which is no manifold at all: at the crossing there are two distinct motion directions. "If you
+cannot show it to be a manifold, it may not be."
+</Derivation>
+
+### Metric spaces, and the contract for `dist`
+
+<KeyIdea title="Definition C.2.1 — metric">
+A **metric** on a set $M$ is a function $d : M \times M \to \mathbb{R}_{\ge 0}$ with, for all
+$m_1, m_2, m_3$: (1) *definiteness*, $d(m_1, m_2) = 0$ iff $m_1 = m_2$; (2) *symmetry*,
+$d(m_1, m_2) = d(m_2, m_1)$; (3) the *triangle inequality*, $d(m_1, m_3) \le d(m_1, m_2) +
+d(m_2, m_3)$. The open balls of a metric generate a topology, and two metrics are equivalent when
+each ball of one contains a ball of the other.
+</KeyIdea>
+
+Non-negativity is not an axiom; it follows: $0 = d(m_1, m_1) \le d(m_1, m_2) + d(m_2, m_1) =
+2 d(m_1, m_2)$. A function $f : S \to T$ between metric spaces is **continuous** (Definition C.4.1)
+when preimages of open sets are open, equivalently when for every $\epsilon > 0$ there is a
+$\delta > 0$ with $d(x, s) < \delta \Rightarrow d(f(x), f(s)) < \epsilon$. A path is a $C^0$ map
+$c : [0, 1] \to \Qfree$; a trajectory must be $C^k$ for $k \ge 1$ so that velocity exists.
+
+Here are the four metrics this chapter ships, with the chart's wrong answer written beside each
+right one. The seam example from the hook: angles $a = 0.1$ and $b = 6.2$ radians.
+
+<LinkedMath>
+$$
+d_{S^1}(a, b) = \min\big(|a - b|,\; 2\pi - |a - b|\big)
+\qquad
+d_{S^1}(0.1, 6.2) = 2\pi - 6.1 = \htmlClass{term-path}{0.1832}
+\quad\text{(chart: } |a - b| = 6.1\text{)}
+$$
+</LinkedMath>
+
+The geodesic midpoint `interpolate(a, b, 0.5)` goes the short way, *downward* from $0.1$ by half of
+$0.1832$: it lands at $\htmlClass{term-path}{0.0084}$ after wrapping, not at the chart midpoint
+$3.15$. On the torus, with $p = (0.1, 3.0)$ and $q = (6.2, 3.5)$:
+
+$$
+d_{T^2}(p, q) = \sqrt{d_{S^1}(0.1, 6.2)^2 + d_{S^1}(3.0, 3.5)^2} = \sqrt{0.1832^2 + 0.5^2} = \mathbf{0.5325}.
+$$
+
+On $\SEtwo$ the metric needs an *exchange rate* $w$ between metres and radians, and with
+$w = 0.5\ \mathrm{m/rad}$ the distance from $(0, 0, 0)$ to $(1, 0, \pi)$ is
+
+$$
+d^{w}_{SE(2)} = \sqrt{\Delta x^2 + \Delta y^2 + w^2\, d_{S^1}(\theta, \theta')^2}
+= \sqrt{1 + 0.25\pi^2} = \mathbf{1.8621}.
+$$
+
+On $\SOthree$ the distance between two rotations is the angle of the rotation that carries one to
+the other, $d_{SO(3)}(R, R') = \arccos\big((\operatorname{tr}(R^{\mathsf T} R') - 1)/2\big)$, which
+is also the axis–angle $\theta$ of $R^{\mathsf T} R'$ (App. E.3) and, for unit quaternions,
+$2\arccos|\langle Q, Q' \rangle|$.
+
+<Derivation title="The chapter's metrics are metrics, and interpolate follows geodesics" result="d_{S^1}, d_{T^2}, d^w_{SE(2)}, d_{SO(3)} \text{ satisfy C.2.1}">
+**Statement.** Each of the four functions above satisfies Definition C.2.1, and `interpolate(t)`
+moves along the shortest arc at constant speed: $d(a, \gamma(t)) = t\, d(a, b)$.
+
+**Step 1 — $S^1$ is a quotient.** Identify $S^1$ with $\mathbb{R}/2\pi\mathbb{Z}$. For classes
+$[a], [b]$ define $d([a], [b]) = \min_{k} |a - b + 2\pi k|$, the shortest representative of the
+difference — which is exactly $\min(|a-b|, 2\pi - |a-b|)$ for representatives in a window of width
+$2\pi$. Definiteness and symmetry are inherited from $|\cdot|$. For the triangle inequality pick
+$k_1, k_2$ attaining the two minima on the right; then $a - c + 2\pi(k_1 + k_2)$ is *some*
+representative of $[a] - [c]$, so $d([a],[c]) \le |a - b + 2\pi k_1| + |b - c + 2\pi k_2|$.
+
+**Step 2 — products.** For metrics $d_1, d_2$, the function $\sqrt{d_1^2 + d_2^2}$ is a metric:
+definiteness and symmetry are immediate, and the triangle inequality is Minkowski's inequality for
+the Euclidean norm applied to the vectors $(d_1(a,b), d_2(a,b))$ and $(d_1(b,c), d_2(b,c))$, using
+the triangle inequalities of $d_1$ and $d_2$ componentwise. This gives $d_{T^2}$, $d_{T^n}$, and
+$d^w_{SE(2)}$ for any $w > 0$ (a positive scalar multiple of a metric is a metric).
+
+**Step 3 — the weight has no canonical value.** Scaling $w$ changes which pose is "nearer": with
+$w = 0.5$ a half-turn in place costs $1.57$ m-equivalents, with $w = 2$ it costs $6.28$. Both are
+metrics; neither is right. Chapter 11 measures what a PRM does as $w$ varies, and this book never
+hides $w$ in a default.
+
+**Step 4 — $\SOthree$.** $d(R, R')$ is the angle $\theta \in [0, \pi]$ of the relative rotation
+$R^{\mathsf T}R'$. Definiteness: $\theta = 0$ iff $R^{\mathsf T}R' = I$. Symmetry: $R'^{\mathsf T}R$
+is the inverse rotation, same angle. Triangle inequality: composing a rotation by $\alpha$ with a
+rotation by $\beta$ yields a rotation by at most $\alpha + \beta$ (the angle is the geodesic
+distance on the unit 3-sphere of quaternions, folded by the double cover, and great-circle distance
+on a sphere satisfies the triangle inequality). The quaternion form $2\arccos|\langle Q, Q'\rangle|$
+is the same number because $\langle Q, Q' \rangle = \cos(\theta/2)$ up to sign, and the absolute
+value is what identifies $Q$ with $-Q$.
+
+**Step 5 — geodesics.** On $S^1$, $\gamma(t) = a + t\,\operatorname{wrap}(b - a)$ moves along the
+shorter arc with $d(a, \gamma(t)) = t |\operatorname{wrap}(b-a)| = t\,d(a,b)$. On a product, the
+componentwise geodesic is the geodesic of the $\ell^2$ product metric because the factors do not
+interact. On $\SOthree$, spherical linear interpolation between $Q$ and the sign-flipped $\pm Q'$
+nearer to $Q$ traverses the shorter great-circle arc at constant speed. $\blacksquare$
+
+*The antipodal ambiguity.* At $d_{S^1} = \pi$ exactly, or $\theta = \pi$ on $\SOthree$, the
+geodesic is not unique. `S1::interpolate` takes the representative $+\pi$ that `wrap` returns —
+counter-clockwise — and `So3::interpolate` the sign-flipped endpoint; both deterministic, both
+documented, neither hidden.
+</Derivation>
+
+### Embeddings: $SO(n)$ and $SE(n)$
+
+The alternative to an atlas is an embedding with constraints. A rotation in $\mathbb{R}^3$ is a
+$3 \times 3$ matrix whose columns are the body axes $\tilde x, \tilde y, \tilde z$ expressed in a
+stationary frame: nine numbers, six constraints (three unit lengths, three orthogonalities), three
+degrees of freedom.
+
+<KeyIdea title="§3.5.1 — the matrix groups">
+$$
+SO(n) = \{R \in \mathbb{R}^{n \times n} : R R^{\mathsf T} = I,\ \det R = 1\},
+\qquad
+SE(n) = \left\{ \begin{bmatrix} R & p \\ 0 & 1 \end{bmatrix} : R \in SO(n),\ p \in \mathbb{R}^n \right\}.
+$$
+Both are groups under matrix multiplication and smooth submanifolds of $\mathbb{R}^{m^2}$ — Lie
+groups, in Choset's footnote: the group operation and inversion are $C^\infty$. $\dim SO(2) = 1$,
+$\dim SO(3) = 3$, $\dim SE(2) = 3$, $\dim SE(3) = 6$. $R^{\mathsf T} = R^{-1}$.
+</KeyIdea>
+
+A matrix in $SE(n)$ is used three ways (§3.5.1): to *represent* a configuration — then it is a
+*frame*; to *change the reference frame* of a configuration or a point; and to *displace* one —
+then it is a *transform*. The three frames of the Frame Composer are Choset's figure 3.17 restricted
+to the plane, with $T_{AB}$ having $R = \mathrm{rot}(\pi)$, $p = (-2, 0)$ and $T_{BC}$ having
+$R = \mathrm{rot}(-\pi/2)$, $p = (-4, -1)$.
+
+<Derivation title="SE(n) composes by subscript cancellation; body versus world transformations" result="T_{AB}T_{BC} = T_{AC},\quad T_{AB}T_1 \ne T_1 T_{AB}">
+**Statement.** $T_{AB}T_{BC} = T_{AC}$ changes the frame in which $C$ is expressed; $w_A = T_{AB}
+w_B$ changes a point's frame; $T_{AB} w_A$ *displaces* the point by the motion that carries $A$ to
+$B$; and for a transform $T_1$, $T_{AB}T_1$ acts in $B$'s frame (body) while $T_1 T_{AB}$ acts in
+$A$'s (world), with different results.
+
+**Step 1 — block multiply.**
+$$
+\begin{bmatrix} R_1 & p_1 \\ 0 & 1 \end{bmatrix}
+\begin{bmatrix} R_2 & p_2 \\ 0 & 1 \end{bmatrix}
+=
+\begin{bmatrix} R_1 R_2 & R_1 p_2 + p_1 \\ 0 & 1 \end{bmatrix}.
+$$
+$R_1 R_2 \in SO(n)$ since $(R_1R_2)(R_1R_2)^{\mathsf T} = I$ and determinants multiply, so $SE(n)$
+is closed under the product. The inverse is
+$T^{-1} = \begin{bmatrix} R^{\mathsf T} & -R^{\mathsf T}p \\ 0 & 1 \end{bmatrix}$, as one checks by
+multiplying. With the identity, $SE(n)$ is a group.
+
+**Step 2 — the constraint count.** $R \in SO(3)$ has $9$ entries and $6$ independent constraints,
+so $\dim SO(3) = 3$; adding $p$ gives $\dim SE(3) = 6$, the six degrees of freedom of a rigid body
+in space. In the plane, $\dim SO(2) = 1$ and $\dim SE(2) = 3$.
+
+**Step 3 — the micro-example.** With $T_{AB} = (x, y, \theta) = (-2, 0, \pi)$ and
+$T_{BC} = (-4, -1, -\pi/2)$:
+$R_{AC} = \mathrm{rot}(\pi)\,\mathrm{rot}(-\pi/2) = \mathrm{rot}(\pi/2)$ and
+$p_{AC} = R_{AB}\,p_{BC} + p_{AB} = (4, 1) + (-2, 0) = (2, 1)$, so
+$T_{AC} = (2, 1, \pi/2)$, Choset's $\begin{bmatrix} 0 & -1 & 2 \\ 1 & 0 & 1 \end{bmatrix}$. The
+point $w_C = (-2, 1)$: $w_B = R_{BC} w_C + p_{BC} = (1, 2) + (-4, -1) = (-3, 1)$ and
+$w_A = R_{AB} w_B + p_{AB} = (3, -1) + (-2, 0) = (1, -1)$, both as in his text. Displacing instead:
+$T_{AB} w_A = (-3, 1)$ — the subscripts do not cancel, and the result is a *new* point in $A$'s
+frame, rotated about $A$'s origin by $R_{AB}$ and translated by $p_{AB}$ (figure 3.18).
+
+**Step 4 — the two orderings.** With $T_1 = (0, 1, \pi)$:
+$T_{AB} T_1 = \begin{bmatrix} R_{AB}R_1 & R_{AB}p_1 + p_{AB} \\ 0 & 1 \end{bmatrix} = (-2, -1, 0)$
+rotates $B$ about *its own* origin by $R_1$ then translates by $p_1$ *in the original $B$ frame*;
+$T_1 T_{AB} = \begin{bmatrix} R_1 R_{AB} & R_1 p_{AB} + p_1 \\ 0 & 1 \end{bmatrix} = (2, 1, 0)$
+rotates $B$ about *$A$'s* origin and translates in $A$. They differ because matrix multiplication
+does not commute. $n$ body-frame transformations stack on the right, $T_{AB}T_1 T_2 \cdots T_n$;
+world-frame ones on the left, $T_n \cdots T_2 T_1 T_{AB}$. $\blacksquare$
+
+*Choset problem 3.23.* $\SEtwo$ and $\mathbb{R}^2 \times SO(2)$ with the product operation
+$(x_1, R_1)(x_2, R_2) = (x_1 + x_2, R_1 R_2)$ are homeomorphic as spaces — the same three
+coordinates — but not isomorphic as groups: the product group is commutative and $\SEtwo$ is not.
+`Pose2::compose` is $\SEtwo$'s product, with the $R_1 p_2$ coupling; the commutative one is what you
+get by adding poses componentwise, which is wrong for a robot.
+</Derivation>
+
+### $D\varphi$ is chart-independent; the Jacobian is its matrix
+
+Chapter 4 computed Reach's Jacobian $J(q) = \partial\varphi/\partial q$ for the forward map
+$\varphi : T^2 \to \mathbb{R}^2$. Appendix C.5 calls the same matrix the **differential** $D\varphi$
+and adds the one footnote that matters here: the differential is really a linear map from the
+tangent space of the domain to the tangent space of the range, $D\varphi_q : T_q\Q \to
+T_{\varphi(q)}M$, and the matrix is its expression in charts. Along a curve $c(t)$ in $\Q$,
+$\tfrac{d}{dt}\varphi(c(t)) = D\varphi_{c(t)}\,\dot c(t)$ — velocities are columns, pushed forward
+by $J$. Forces live in the cotangent space and are rows, pulled back by $J^{\mathsf T}$ (Choset's
+remark on p. 486), which is why Chapter 7 will write $\tau = J^{\mathsf T} F$.
+
+<Derivation title="Dφ is chart-independent; the Jacobian is its matrix" result="D(\varphi \circ h) = D\varphi \cdot Dh,\quad Dh = I \text{ for the angle atlas}">
+**Statement.** Under a change of chart $h$, the matrix of $D\varphi$ transforms by the chain rule
+$D(\varphi \circ h) = D\varphi \cdot Dh$. For the torus's angle atlas the transition maps are
+translations by $2\pi$, $Dh = I$, and Chapter 4's $J$ is the same matrix in every chart.
+
+**Step 1 — the differential along curves.** Let $c : \mathbb{R} \to \Q$ be smooth and set
+$x(t) = \varphi(c(t))$. Then $\dot x = \tfrac{\partial \varphi}{\partial q}\big|_{c(t)}\,\dot c =
+D\varphi_{c(t)}\,\dot c(t)$: $D\varphi$ is the linear map that takes the velocity of the
+configuration to the velocity of the image.
+
+**Step 2 — the chain rule (C.5).** If the curve is given in $y$-coordinates and
+$h$ maps $y$-coordinates to $x$-coordinates, $\tfrac{d}{dt}(\varphi \circ h \circ c) =
+D_h\varphi \cdot D_c h \cdot \dot c$. Choset's Example C.5.1 is the worked check: $c(t) = (2, 2\pi t)$
+in polar coordinates, $h$ polar-to-Cartesian, $g(x) = x_1$, and the chain rule gives
+$[1\ 0]\begin{bmatrix}\cos 2\pi t & -2\sin 2\pi t \\ \sin 2\pi t & 2\cos 2\pi t\end{bmatrix}
+\begin{bmatrix} 0 \\ 2\pi \end{bmatrix} = -4\pi \sin 2\pi t$, which direct differentiation of
+$2\cos 2\pi t$ confirms.
+
+**Step 3 — the torus.** The transition maps of the angle atlas are $h(\theta_1, \theta_2) =
+(\theta_1 \pm 2\pi, \theta_2)$ and the like, with $Dh = I$. So the matrix of $D\varphi_q$ is the
+same $J(q)$ whichever chart the configuration is read in; shifting $\theta_1$ by a full turn changes
+nothing — not the entries, not the singularities. At Choset's $q = (\pi/4, \pi/2)$ with
+$L_1 = L_2 = 1$ and $\dot q = (1, 0)$:
+$$
+J(q)\dot q = \begin{bmatrix} -\sqrt2 & -\sqrt2/2 \\ 0 & -\sqrt2/2 \end{bmatrix}\begin{bmatrix} 1 \\ 0 \end{bmatrix}
+= \begin{bmatrix} -\sqrt 2 \\ 0 \end{bmatrix} = \begin{bmatrix} -1.4142 \\ 0 \end{bmatrix},
+$$
+and `dphi_chart_independent` asserts the matrix is unchanged, to machine precision, under
+$\theta_1 \mapsto \theta_1 + 2\pi$. $\blacksquare$
+</Derivation>
+
+### Rotations in three dimensions, briefly
+
+Everything above generalizes from $SO(2)$ to $\SOthree$ except the coordinates. Nine matrix entries
+with six constraints leave three degrees of freedom, so $\SOthree$ is a three-dimensional manifold
+and can be *locally* parameterized by three numbers — Euler angles — but, just as for the circle,
+not globally.
+
+Choset's choice is **Z-Y-Z Euler angles** $(\phi, \theta, \psi)$ (§3.6): rotate about $z$ by
+$\phi$, then about the new $y$ by $\theta$, then about the new $z$ by $\psi$, so that
+
+$$
+R = R_{z,\phi} R_{y,\theta} R_{z,\psi} =
+\begin{bmatrix}
+c_\phi c_\theta c_\psi - s_\phi s_\psi & -c_\phi c_\theta s_\psi - s_\phi c_\psi & c_\phi s_\theta \\
+s_\phi c_\theta c_\psi + c_\phi s_\psi & -s_\phi c_\theta s_\psi + c_\phi c_\psi & s_\phi s_\theta \\
+-s_\theta c_\psi & s_\theta s_\psi & c_\theta
+\end{bmatrix}
+\qquad (3.6\text{–}3.8).
+$$
+
+<Deferred>
+  <RotationZoo />
+</Deferred>
+
+<Derivation title="Euler angles lose a chart; quaternions provide an atlas" result="U_{\mathrm{Euler}} = \{R : R_{33} \ne \pm 1\};\quad \{U_i\}_{i=0}^3 \text{ cover } SO(3)">
+**Statement.** The Z-Y-Z map is a chart only on $\{R : R_{33} \ne \pm 1\}$. At $R_{33} = 1$ only
+$\phi + \psi$ is determined (Choset eq. E.2, E.9). Unit quaternions $Q = (\cos\tfrac\theta2,
+n\sin\tfrac\theta2)$ cover $\SOthree$ with four charts $U_i = \{|q_i| \text{ largest}\}$.
+
+**Step 1 — the collapse.** Put $\theta = 0$ in (3.8). Then $c_\theta = 1$, $s_\theta = 0$ and
+$$
+R = \begin{bmatrix} c_{\phi+\psi} & -s_{\phi+\psi} & 0 \\ s_{\phi+\psi} & c_{\phi+\psi} & 0 \\ 0 & 0 & 1 \end{bmatrix}
+\qquad (\mathrm{E.2}),
+$$
+a rotation about $z$ by $\phi + \psi$: infinitely many $(\phi, \psi)$ pairs give the same $R$, and
+only $\phi + \psi = \operatorname{atan2}(R_{21}, R_{11})$ is defined (E.9). The same happens at
+$R_{33} = -1$, where $\theta = \pi$ and only $\phi - \psi$ survives (E.10–E.11). Off those two
+rotations, $\theta = \operatorname{atan2}(\sqrt{1 - R_{33}^2}, R_{33})$,
+$\phi = \operatorname{atan2}(R_{23}, R_{13})$, $\psi = \operatorname{atan2}(R_{32}, -R_{31})$
+(E.3, E.5, E.6) invert the map smoothly, so it is a chart there. *Gimbal lock* is the name for
+having driven off this chart; nothing mechanical is involved.
+
+**Step 2 — unit quaternions.** For a rotation by $\theta$ about a unit axis $n$,
+$Q = (\cos\tfrac\theta2, n_x\sin\tfrac\theta2, n_y\sin\tfrac\theta2, n_z\sin\tfrac\theta2)$ (E.26)
+has $\|Q\|^2 = \cos^2\tfrac\theta2 + \sin^2\tfrac\theta2\,(n_x^2 + n_y^2 + n_z^2) = 1$ (E.27), and
+the matrix $R(Q)$ of (E.28) is a rotation; $Q$ and $-Q$ give the same $R$ — the double cover — and
+quaternion multiplication is rotation composition.
+
+**Step 3 — four charts cover.** Some component of a unit quaternion has the largest magnitude, at
+least $\tfrac12$. On $U_i = \{|q_i| \ge |q_j| \ \forall j\}$ (interiors, to make them open) the map
+$\varphi_i(Q) = (q_j / |q_i|)_{j \ne i}$ is a smooth bijection onto an open subset of
+$\mathbb{R}^3$, and the $U_i$ cover. Where an Euler chart ends, the quaternion simply moves to a
+different $U_i$ — which is what the Rotation Zoo's smooth quaternion curve shows while $\phi$ and
+$\psi$ swing. $\blacksquare$
+
+*Kept for Appendix B:* the full inverse (E.3–E.11), roll–pitch–yaw (E.12) and its lock at pitch
+$\pm\pi/2$, the axis–angle matrix (E.18) and the chart $\varphi(R) = \theta k$ on
+$\{\operatorname{tr} R \ne \pm 1\}$ (E.20–E.21), the quaternion product and conjugate (E.31–E.35).
+The exponential and logarithm maps that turn axis–angle into a Lie-group coordinate, and the
+$\boxplus/\boxminus$ operators estimators need, are the sister book's
+[Chapter 3](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch03-geometry-of-motion),
+whose `So3` the Rust `exp`/`log` of Exercise 6 reuses.
+</Derivation>
+
+One more honesty item about $\SOthree$, because Chapter 11's samplers depend on it. *Uniform on
+$\SOthree$* means uniform with respect to the Haar measure, the one invariant under rotation. A
+normalized Gaussian 4-vector is uniform on the quaternion 3-sphere and therefore Haar-uniform on
+$\SOthree$. Uniform *Euler angles* are not: the rotation angle of a Haar-uniform rotation has
+density $(1 - \cos\theta)/\pi$ on $[0, \pi]$, mean $\pi/2 + 2/\pi = 2.2074$, and only
+$(0.5 - \sin 0.5)/\pi = 0.65\%$ of rotations lie within half a radian of the identity; drawing
+$(\phi, \theta, \psi)$ uniformly puts about three times that mass near the identity. `So3::sample`
+is the Gaussian version, and a check pins both numbers.
+
+## The algorithm
+
+This chapter's algorithms are operations, not planners: the three methods a manifold must
+provide, and the first generic planner-shaped function built on them.
+
+<Algorithm
+  name="GEODESIC-PATH(M, a, b, n)"
+  inputs="a manifold M with dist and interpolate, endpoints a, b ∈ M, a step count n"
+  outputs="n + 1 configurations along the shortest geodesic from a to b"
+  complexity="O(n · dim M)"
+>
+1. for $i = 0, 1, \dots, n$ do
+2. &nbsp;&nbsp;&nbsp;&nbsp;$t \leftarrow i / n$
+3. &nbsp;&nbsp;&nbsp;&nbsp;$q_i \leftarrow M.\mathrm{interpolate}(a, b, t)$ &nbsp;&nbsp;— the short way, by the metric's own geodesic
+4. return $(q_0, q_1, \dots, q_n)$ &nbsp;&nbsp;— with $q_0 = a$, $q_n = b$, and $M.\mathrm{dist}(a, q_i) = t_i\, M.\mathrm{dist}(a, b)$
+</Algorithm>
+
+The per-manifold operations, in the order the Rust implements them:
+
+<Algorithm
+  name="S1 · dist, interpolate, sample"
+  inputs="angles a, b ∈ (−π, π]; a parameter t ∈ [0, 1]; a seeded Rng"
+  outputs="a distance in [0, π]; an angle on the short arc; a uniform angle"
+  complexity="O(1)"
+>
+1. $\mathrm{dist}(a, b) \leftarrow |\operatorname{wrap}(a - b)|$ &nbsp;&nbsp;— $= \min(|a-b|,\, 2\pi - |a-b|)$
+2. $\mathrm{interpolate}(a, b, t) \leftarrow \operatorname{wrap}\big(a + t \cdot \operatorname{wrap}(b - a)\big)$ &nbsp;&nbsp;— antipodal tie: $\operatorname{wrap}$ returns $+\pi$, counter-clockwise
+3. $\mathrm{sample}() \leftarrow \mathrm{Uniform}(-\pi, \pi)$
+4. $T^n$: apply 1–3 componentwise; $\mathrm{dist} \leftarrow \sqrt{\sum_i d_{S^1}(a_i, b_i)^2}$
+5. $\SEtwo$ with weight $w$: $\mathrm{dist} \leftarrow \sqrt{\Delta x^2 + \Delta y^2 + w^2 d_{S^1}(\theta, \theta')^2}$; straight in $(x, y)$, short way in $\theta$; sample a box for $(x, y)$ and $\mathrm{Uniform}(-\pi, \pi)$ for $\theta$
+</Algorithm>
+
+<Algorithm
+  name="SO3 · dist, slerp, Haar sample"
+  inputs="unit quaternions Q, Q′; t ∈ [0, 1]; a seeded Rng"
+  outputs="the rotation angle between them; the geodesic rotation; a Haar-uniform rotation"
+  complexity="O(1)"
+>
+1. $d \leftarrow \langle Q, Q' \rangle$; if $d < 0$ then $Q' \leftarrow -Q'$, $d \leftarrow -d$ &nbsp;&nbsp;— the double cover: $-Q'$ is the same rotation, nearer on $S^3$
+2. $\mathrm{dist} \leftarrow 2\arccos d$, computed as $4\,\operatorname{atan2}(\|Q - Q'\|, \|Q + Q'\|)$ &nbsp;&nbsp;— $\arccos$ near 1 loses eight digits
+3. $\omega \leftarrow \arccos d$; $\mathrm{slerp}(t) \leftarrow \dfrac{\sin((1-t)\omega)}{\sin\omega}Q + \dfrac{\sin(t\omega)}{\sin\omega}Q'$, normalized; linear blend when $\omega \approx 0$
+4. $\mathrm{sample}() \leftarrow (g_0, g_1, g_2, g_3)/\|g\|$ with $g_i \sim \mathcal N(0, 1)$ &nbsp;&nbsp;— uniform on $S^3$, hence Haar on $\SOthree$
+5. Euler Z-Y-Z: if $|R_{33}| = 1$ return $\mathrm{Err}(\mathrm{GimbalLock})$ carrying $\phi \pm \psi$; else (E.3, E.5, E.6)
+</Algorithm>
+
+Line 2 of the $\SOthree$ box is a numerical honesty item worth a sentence: the first implementation
+of `dist` used $2\arccos d$ directly, and `dist(Q, Q)` came out as $6 \times 10^{-8}$, which failed
+the definiteness check. The half-angle identity $\arccos x = 2\operatorname{atan2}(\sqrt{1-x},
+\sqrt{1+x})$ gives the same number to full precision, and a metric that is not definite to machine
+precision breaks every equality test built on it.
+
+## Implementation in Rust
+
+The trait is the chapter. Everything else is four implementations of it, a product, and one
+generic function.
+
+```rust title="crates/manifold/src/lib.rs"
+use core::prob::Rng;
+
+/// THE OWNED ARTIFACT. Every planner from Chapter 6 on is generic over this trait
+/// and never touches coordinates directly. `DIM` is the manifold dimension — the
+/// number of local coordinates — not the embedding dimension (3 for SO(3), not 9).
+pub trait Manifold: Copy + PartialEq + core::fmt::Debug {
+    const DIM: usize;
+    /// Sampling box for non-compact factors; `()` for compact spaces, which have
+    /// a uniform distribution of their own and need no box.
+    type Bounds;
+
+    /// A metric in the sense of Definition C.2.1 — property-tested, not assumed.
+    fn dist(&self, other: &Self) -> f64;
+    /// The geodesic from `self` to `other` at `t ∈ [0, 1]`, taken the short way.
+    fn interpolate(&self, other: &Self, t: f64) -> Self;
+    /// Uniform with respect to the natural measure: Lebesgue on boxes, Haar on groups.
+    fn sample(rng: &mut Rng, bounds: &Self::Bounds) -> Self;
+}
+
+/// The first generic planner-shaped function in the book: a geodesic local path.
+/// Chapter 11's `trait Steer` defaults to exactly this.
+pub fn geodesic_path<M: Manifold>(a: &M, b: &M, n: usize) -> Vec<M> {
+    (0..=n).map(|i| a.interpolate(b, i as f64 / n as f64)).collect()
+}
+```
+
+`S1` is a newtype around an `f64`, and the newtype is the point: the constructor wraps, so no
+value outside $(-\pi, \pi]$ can exist, and the metric and interpolation never see a seam.
+
+```rust title="crates/manifold/src/s1.rs" {12-14}
+use core::f64::consts::{PI, TAU};
+
+/// S¹ as a wrapped angle. The chart is (−π, π]; the type guarantees the representative.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct S1(f64);
+
+impl S1 {
+    /// Wrap into (−π, π]. This is the only way to build an S1, so the invariant holds everywhere.
+    pub fn new(theta: f64) -> Self {
+        let mut x = (theta + PI).rem_euclid(TAU);
+        if x <= 0.0 { x += TAU; }
+        S1(x - PI)
+    }
+    pub fn angle(self) -> f64 { self.0 }
+}
+
+impl Manifold for S1 {
+    const DIM: usize = 1;
+    type Bounds = ();
+
+    /// min(|a − b|, 2π − |a − b|): the quotient metric of ℝ by 2πℤ.
+    fn dist(&self, o: &Self) -> f64 {
+        let d = (self.0 - o.0).abs();
+        d.min(TAU - d)
+    }
+
+    /// Travel the short way. At the antipode wrap() returns +π: deterministic, documented.
+    fn interpolate(&self, o: &Self, t: f64) -> Self {
+        S1::new(self.0 + t * S1::new(o.0 - self.0).0)
+    }
+
+    fn sample(rng: &mut Rng, _: &()) -> Self {
+        S1::new(rng.uniform(-PI, PI))
+    }
+}
+```
+
+The torus is a product of circles, and $\SEtwo$ is the ported `Pose2` with a weight attached. Note
+what `Se2` is *not*: it does not redefine the pose type. `Pose2::compose`, `::inverse` and `::act`
+already exist from Chapter 2 (the sister book derived them); this chapter only adds the planner's
+view of them.
+
+```rust title="crates/manifold/src/{torus.rs, se2.rs}" {25-27}
+/// Tⁿ as an array of circles, with the ℓ² product metric. Reach's `T2` from Chapter 2
+/// is `Torus<2>` through a `From` impl, so no code in `cspace` changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Torus<const N: usize>(pub [S1; N]);
+
+impl<const N: usize> Manifold for Torus<N> {
+    const DIM: usize = N;
+    type Bounds = ();
+    fn dist(&self, o: &Self) -> f64 {
+        self.0.iter().zip(&o.0).map(|(a, b)| a.dist(b).powi(2)).sum::<f64>().sqrt()
+    }
+    fn interpolate(&self, o: &Self, t: f64) -> Self {
+        let mut out = *self;
+        for i in 0..N { out.0[i] = self.0[i].interpolate(&o.0[i], t); }
+        out
+    }
+    fn sample(rng: &mut Rng, _: &()) -> Self {
+        Torus(core::array::from_fn(|_| S1::sample(rng, &())))
+    }
+}
+
+/// SE(2) is the ported Pose2. The metric needs an exchange rate between metres and
+/// radians, and that rate has no canonical value — so it is a field, never a default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Se2 { pub pose: Pose2, pub w: f64 }
+
+impl Manifold for Se2 {
+    const DIM: usize = 3;
+    type Bounds = Aabb; // sampling box for (x, y); θ is uniform on S¹
+
+    fn dist(&self, o: &Self) -> f64 {
+        let dth = S1::new(self.pose.theta).dist(&S1::new(o.pose.theta));
+        (self.pose.x - o.pose.x).hypot(self.pose.y - o.pose.y).hypot(self.w * dth)
+    }
+    fn interpolate(&self, o: &Self, t: f64) -> Self {
+        let th = S1::new(self.pose.theta).interpolate(&S1::new(o.pose.theta), t);
+        Se2 { w: self.w, pose: Pose2 {
+            x: self.pose.x + t * (o.pose.x - self.pose.x),
+            y: self.pose.y + t * (o.pose.y - self.pose.y),
+            theta: th.angle(),
+        } }
+    }
+    fn sample(rng: &mut Rng, b: &Aabb) -> Self {
+        Se2 { w: 0.0, pose: Pose2 { x: rng.uniform(b.min.x, b.max.x), y: rng.uniform(b.min.y, b.max.y),
+                                    theta: rng.uniform(-PI, PI) } }
+    }
+}
+```
+
+`So3` wraps `nalgebra`'s `UnitQuaternion`, which already gives the product, the conjugate, and
+`slerp`. What the chapter adds is the metric with the double cover accounted for, Haar sampling,
+and the Euler inverse that *returns an error* at the lost chart instead of a number.
+
+```rust title="crates/manifold/src/so3.rs" {14-21,34-40}
+use nalgebra::{Quaternion, SVector, UnitQuaternion};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct So3(pub UnitQuaternion<f64>);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GimbalLock { /// The one quantity that survives at R₃₃ = ±1: φ + ψ (or φ − ψ).
+                        pub sum: f64 }
+
+impl So3 {
+    /// Z-Y-Z Euler angles, eqs. E.3, E.5, E.6, on the chart {R₃₃ ≠ ±1}. Off the chart
+    /// there is no answer, and the type says so.
+    pub fn euler_zyz(&self) -> Result<[f64; 3], GimbalLock> {
+        let r = self.0.to_rotation_matrix();
+        let r33 = r[(2, 2)].clamp(-1.0, 1.0);
+        if 1.0 - r33.abs() < 1e-9 {
+            let sum = if r33 > 0.0 { r[(1, 0)].atan2(r[(0, 0)]) }        // E.9: φ + ψ
+                      else { (-r[(0, 1)]).atan2(-r[(0, 0)]) };          // E.11: φ − ψ
+            return Err(GimbalLock { sum });
+        }
+        let theta = (1.0 - r33 * r33).sqrt().atan2(r33);
+        Ok([r[(1, 2)].atan2(r[(0, 2)]), theta, r[(2, 1)].atan2(-r[(2, 0)])])
+    }
+
+    /// Eqs. E.19–E.21: axis and angle, θ ∈ [0, π], with the sign fixed by w ≥ 0.
+    pub fn axis_angle(&self) -> (SVector<f64, 3>, f64) {
+        let q = if self.0.w < 0.0 { -self.0.into_inner() } else { self.0.into_inner() };
+        let angle = 2.0 * q.w.clamp(-1.0, 1.0).acos();
+        let v = q.imag();
+        let n = v.norm();
+        (if n < 1e-12 { SVector::z() } else { v / n }, angle)
+    }
+}
+
+impl Manifold for So3 {
+    const DIM: usize = 3;
+    type Bounds = ();
+
+    /// 2·acos|⟨q, q′⟩|, via 4·atan2(‖q − q′‖, ‖q + q′‖) after a sign flip: the same angle,
+    /// but acos near 1 loses eight digits and a metric must be definite to machine precision.
+    fn dist(&self, o: &Self) -> f64 {
+        let (a, mut b) = (self.0.into_inner(), o.0.into_inner());
+        if a.dot(&b) < 0.0 { b = -b; }
+        4.0 * (a - b).norm().atan2((a + b).norm())
+    }
+    /// Spherical linear interpolation toward the nearer of ±q′ — the short way on S³.
+    fn interpolate(&self, o: &Self, t: f64) -> Self {
+        let b = if self.0.dot(&o.0) < 0.0 { UnitQuaternion::new_unchecked(-o.0.into_inner()) } else { o.0 };
+        So3(self.0.slerp(&b, t))
+    }
+    /// Haar-uniform: a normalized Gaussian 4-vector is uniform on S³.
+    fn sample(rng: &mut Rng, _: &()) -> Self {
+        let q = Quaternion::new(rng.normal(), rng.normal(), rng.normal(), rng.normal());
+        So3(UnitQuaternion::from_quaternion(q))
+    }
+}
+
+/// A × B with the ℓ² product metric — SE(2) × S¹ for Hitch, Chapter 14's composites.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Product<A: Manifold, B: Manifold>(pub A, pub B);
+```
+
+### The type system knows that $T^2 \ne SE(2)$
+
+The compile error is a feature. Choset's §3.7 lists the configuration spaces of common robots and
+then a list of inequalities — $S^1 \times S^1 \times S^1 \ne SO(3)$, $SE(2) \ne \mathbb{R}^3$,
+$SE(3) \ne \mathbb{R}^6$ — that a planner written against coordinates cannot see. One written
+against `Manifold` cannot *fail* to see them:
+
+```rust title="crates/manifold/tests/ui/mix_spaces.rs (checked by trybuild: must NOT compile)"
+use manifold::{geodesic_path, Se2, Torus};
+
+fn main() {
+    let q_reach: Torus<2> = reach_home();          // Reach lives on T²
+    let rusty: Se2 = Se2 { pose: rusty_pose(), w: 0.5 }; // Rusty lives on SE(2)
+    let _path = geodesic_path(&q_reach, &rusty, 10);
+    //                                  ^^^^^^ error[E0308]: mismatched types
+    //                                  expected `&Torus<2>`, found `&Se2`
+}
+```
+
+`trybuild` asserts that this file fails to compile with exactly that message. There is no runtime
+check anywhere in the planners for "are these two configurations in the same space?", because
+there does not need to be.
+
+### The worked example, and its printed output
+
+```rust title="crates/manifold/examples/seams.rs"
+fn main() {
+    let (a, b) = (S1::new(0.1), S1::new(6.2));
+    println!("S1 dist(0.1, 6.2) = {:.4}  chart |a-b| = {:.4}  midpoint = {:.4} (chart midpoint {:.4})",
+        a.dist(&b), (0.1f64 - 6.2).abs(), a.interpolate(&b, 0.5).angle(), (0.1 + 6.2) / 2.0);
+    let (p, q) = (Torus([S1::new(0.1), S1::new(3.0)]), Torus([S1::new(6.2), S1::new(3.5)]));
+    println!("T2 dist = {:.4}", p.dist(&q));
+    let w = 0.5;
+    let (o, r) = (Se2 { pose: Pose2::new(0.0, 0.0, 0.0), w }, Se2 { pose: Pose2::new(1.0, 0.0, PI), w });
+    println!("SE2 (w=0.5) dist((0,0,0),(1,0,π)) = {:.4}", o.dist(&r));
+}
+```
+
+```text title="cargo run -p manifold --example seams"
+S1 dist(0.1, 6.2) = 0.1832  chart |a-b| = 6.1000  midpoint = 0.0084 (chart midpoint 3.1500)
+T2 dist = 0.5325
+SE2 (w=0.5) dist((0,0,0),(1,0,π)) = 1.8621
+```
+
+```text title="cargo run -p manifold --example frames"
+T_AC = Pose2 { 2, 1, 1.5708 }  w_B = (-3, 1)  w_A = (1, -1)  body: (-2,-1,0)  world: (2,1,0)  Dφ·(1,0) = (-1.4142, 0)
+```
+
+The tests beside these examples are the chapter's contract. `s1_seam_distance`,
+`s1_midpoint_short_way`, `t2_distance` and `se2_weighted_distance` assert the four numbers against
+their closed forms to $10^{-12}$; `choset_frames` asserts $T_{AC}$, $w_B$, $w_A$ and the body/world
+placements exactly; `metric_axioms` is a `proptest` asserting definiteness, symmetry and the
+triangle inequality on 10,000 seeded triples for each of `S1`, `Torus<2>`, `Se2` and `So3`;
+`interpolate_geodesic` asserts the endpoints and $d(a, \gamma(t)) = t\,d(a, b)$ to $10^{-9}$;
+`euler_gimbal_lock` asserts `Err(GimbalLock)` at $R_{33} = 1$ with the right $\phi + \psi$ and an
+exact round trip elsewhere; `so3_dist_is_angle` asserts `dist` equals the axis–angle of
+$R^{\mathsf T}R'$; `dphi_chart_independent` asserts the Jacobian is unchanged under a $2\pi$ chart
+shift. The TypeScript port in `web/lib/manifold/` runs the same checks — every widget on this page
+is that port, and every number printed above was produced by it.
+
+<Callout type="info">
+Why the weight $w$ is a field and not a constant: with $w = 0.5$ the two poses in the example are
+$1.86$ apart; with $w = 2$ they are $6.36$ apart and a half-turn in place costs more than driving
+six metres. Both are metrics. Which one a PRM should use depends on the robot and the task, and
+Chapter 11 measures the consequences. Hiding $w$ in a default would hide a modelling decision.
+</Callout>
+
+## Putting it together: components on the square and on the torus
+
+The integration lab turns §3.4.3 into a measured quantity. Take Chapter 4's raster of Reach's
+C-space on the Workbench — here a $48 \times 48$ grid over $[-\pi, \pi]^2$ for the arm among three
+disc obstacles, built inside this chapter's module because the general raster lands with Chapter 4 —
+and count connected components of the free cells twice: once as a square, with 4-connectivity and
+no wrapping, and once as a torus, with the opposite edges identified.
+
+The square has **2** components; the torus has **1**. One of the discs lies within reach of the
+first link, and a first-link collision does not care about $\theta_2$, so its C-obstacle is a band
+across the whole chart. The band cuts the square in two. On the torus the two halves meet through
+the seam at $\theta_1 = \pm\pi$, and `seam_connection` finds the closest pair of cells that the
+square separates and the torus joins: two cells at $d_{T^2} = 0.2618$ — two raster cells apart —
+whose chart distance is $6.0214$. That is the purple path of the hook, measured.
+
+Monotonicity is the invariant the lab asserts: identifying edges can only *merge* components, never
+split them, so the torus count is at most the square count, on every raster. With joint limits
+$|\theta_i| < 3.0$ the outermost ring of cells is forbidden, the seam becomes a wall, and both
+counts are **2**: the topology changed, and the count noticed.
+
+The last thread to tie is Chapter 4's Jacobian. At $q = (\pi/4, \pi/2)$ the matrix of
+$D\varphi_q$ sends $\dot q = (1, 0)$ to $(-\sqrt2, 0) = (-1.4142, 0)$, Choset's Example 3.8.1, and
+shifting $\theta_1$'s chart by $2\pi$ changes no entry by more than $10^{-15}$. The Jacobian is the
+matrix of a chart-independent linear map between tangent spaces; Chapter 20 makes tangent spaces
+formal and Chapter 7 uses $J^{\mathsf T}$ to pull forces back from the workspace to the joints.
+
+Everything downstream is now generic. Chapter 6 builds graphs whose edge costs are `dist`; Chapter 7
+needs the tangent spaces this chapter named informally; Chapter 11's kd-tree splits on
+`Chart::coords` with `periodic` axes and its samplers call `sample`; Chapters 12–14's tree planners
+and composite spaces are generic over `Manifold`; Chapter 17 needs $\SOthree$'s inertia; Chapters
+20–21 live in $\SEtwo$ as the car's group. None of them will do arithmetic on coordinates.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={1} title="Two charts for the circle, two for the sphere">
+    Find two charts for $S^1$ and prove they form an atlas (Choset problem 3.9). Then explain why
+    latitude–longitude is not a global chart on $S^2$ — what happens at the poles, and along the
+    date line? — and exhibit a two-chart atlas for the sphere (problem 3.10). Which chart does
+    `manifold::S1` use, and where does its domain end?
+    <Hints>
+      <>A chart's domain must be open and the map must be a diffeomorphism onto an open set of ℝᵏ. The two angle charts of Derivation 1 each omit one point.</>
+      <>At a pole every longitude names the same point: the map is not injective there. Along the date line the longitude jumps by 2π: not continuous. Neither can be fixed by changing the convention.</>
+      <>Stereographic projection from the north pole covers everything but the pole; from the south pole, everything but the south pole. The transition map is inversion in the unit circle, smooth away from the origin.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Homeomorphic, not isomorphic">
+    Show that $\SEtwo$ and $\mathbb{R}^2 \times SO(2)$ with the product operation
+    $(x_1, R_1)(x_2, R_2) = (x_1 + x_2, R_1 R_2)$ are homeomorphic as spaces but not isomorphic as
+    groups (Choset problem 3.23). Which one is commutative? Which one is `Pose2::compose`? Give a
+    concrete pair of planar motions for which the two products disagree, and say which product
+    describes what Rusty actually does.
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the seam, then verify">
+    <Predict
+      id="ch05.e3"
+      question="In the Torus Unwrapper, place the path endpoints at (θ₁, θ₂) = (−3.0, 0) and (3.0, 0). Before reading the readout: what is dist, and where does the purple path cross the seam?"
+      options={[
+        { label: 'dist ≈ 6.0, no seam crossing: the path runs straight across the square', because: 'That is the chart distance. The torus distance is the shorter of the two arcs on each circle factor, and |−3.0 − 3.0| = 6.0 is longer than 2π − 6.0 = 0.283.' },
+        { label: 'dist ≈ 0.28, crossing the θ₁ = ±π seam', correct: true, because: 'Right. d_{S¹}(−3.0, 3.0) = 2π − 6.0 = 0.2832, with θ₂ unchanged, so d_{T²} = 0.2832 and the geodesic goes through θ₁ = π ≡ −π. On the square it is two short stubs at opposite edges; on the torus one short curve.' },
+        { label: 'dist ≈ 3.0, crossing both seams', because: 'Only θ₁ differs between the endpoints; θ₂ = 0 on both, so the θ₂ seam is never approached.' },
+      ]}
+    >
+    Now turn joint limits on with $|\theta_1| < 3.1$. The endpoints are still legal
+    configurations, but the space is an open rectangle: no path may cross the seam, so the shortest
+    legal path is the long way across the square at chart distance $6.0$ — and the component count
+    changes, because the band of C-obstacle that the seam had bypassed now separates the two halves.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Read the lost chart">
+    In the Rotation Zoo, scrub to the frame where $R_{33}$ is closest to $1$ and read $\phi$ and
+    $\psi$. Predict their sum from the quaternion readout using eq. (E.9),
+    $\phi + \psi = \operatorname{atan2}(R_{21}, R_{11})$ with $R_{21} = 2(q_1 q_2 + q_0 q_3)$ and
+    $R_{11} = 2(q_0^2 + q_1^2) - 1$ from (E.28); verify against the dashed curve. Then explain why a
+    controller that commands $\dot\phi$ and $\dot\psi$ separately misbehaves there, and what it
+    should command instead.
+    <CheckAnswer
+      id="ch05.e4"
+      prompt="With the default motion (miss = 0.08 rad), what is the smallest value R₃₃ reaches, to four decimals?"
+      answer={0.9968}
+      tolerance={0.003}
+    >
+    The body $z$-axis passes within $0.08$ rad of the world $z$-axis, so
+    $R_{33} = \cos\theta_{\min} = \cos 0.08 = 0.9968$. The Euler polar angle $\theta$ never reaches
+    zero, so the chart is never *lost* — but the swing of $\phi$ and $\psi$ is already nearly a
+    half-turn each, in opposite directions, over a short interval. Near a lost chart the coordinate
+    velocities blow up even though the body's angular velocity is constant; command the angular
+    velocity, or the quaternion rate, instead.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="The sphere is not the torus">
+    Implement `Manifold` for the sphere $S^2$ as a unit vector in $\mathbb{R}^3$: great-circle
+    `dist`, `slerp` as `interpolate`, and a uniform `sample` (normalize a Gaussian 3-vector).
+    Property-test the metric axioms and the geodesic property as `metric_axioms` does. Then write a
+    test that takes identical-looking coordinates $(\theta_1, \theta_2)$, interprets them once as a
+    point of `Torus<2>` and once — via latitude and longitude — as a point of your `S2`, and asserts
+    that `dist` to a second such pair *differs*. Make the test's name say what it proves:
+    $T^2 \ne S^2$.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Exponential coordinates">
+    Add `exp`/`log` to `Se2` and `So3`, reusing the sister book's `Pose2` exponential and
+    `nalgebra`'s quaternion logarithm, and implement a second interpolation
+    $\gamma(t) = a \cdot \exp\!\big(t \log(a^{-1} b)\big)$. Show with a test that on $\SEtwo$ it
+    coincides with the chart-based `interpolate` only when the translation and rotation are
+    decoupled — straight-line translation with constant heading — and report the maximum
+    discrepancy in `dist` over 1,000 seeded pairs otherwise, as a function of $w$. The micro-Lie
+    theory paper in the references is the map for this exercise.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="§3.4–3.6 and Appendices B, C and E are this chapter's source: the definitions in their order, the circle/ellipse/racetrack, the four charts of S¹, the three-frame example pinned by the tests, and the Euler-angle inverse."
+  />
+  <Reference
+    authors="Lozano-Pérez, T."
+    year={1983}
+    title="Spatial Planning: A Configuration Space Approach"
+    venue="IEEE Transactions on Computers C-32(2), 108–120"
+    doi="10.1109/TC.1983.1676196"
+    note="The paper that made configuration space the planner's space; the C-obstacles on the torus in the hook descend from its figures."
+  />
+  <Reference
+    authors="Shoemake, K."
+    year={1985}
+    title="Animating Rotation with Quaternion Curves"
+    venue="ACM SIGGRAPH Computer Graphics 19(3), 245–254"
+    doi="10.1145/325334.325242"
+    note="Spherical linear interpolation — the geodesic on SO(3) that So3::interpolate implements — and the case for quaternions over Euler angles, made with the gimbal-lock argument this chapter repeats."
+  />
+  <Reference
+    authors="Solà, J., Deray, J., and Atchuthan, D."
+    year={2018}
+    title="A micro Lie theory for state estimation in robotics"
+    venue="arXiv:1812.01537"
+    url="https://arxiv.org/abs/1812.01537"
+    note="The exponential-coordinates view of SE(2) and SO(3) that Exercise 6 asks for, written for roboticists; the ⊞/⊟ operators the sister book uses come from here."
+  />
+  <Reference
+    authors="Lynch, K. M. and Park, F. C."
+    year={2017}
+    title="Modern Robotics: Mechanics, Planning, and Control"
+    venue="Cambridge University Press"
+    url="http://modernrobotics.org"
+    note="Chapter 3 is the fullest modern treatment of SO(3), SE(3), exponential coordinates and the body/world distinction, by one of Choset's co-authors."
+  />
+  <Reference
+    authors="Lee, J. M."
+    year={2012}
+    title="Introduction to Smooth Manifolds"
+    venue="Springer, Graduate Texts in Mathematics 218, 2nd edition"
+    doi="10.1007/978-1-4419-9982-5"
+    note="Where to go when 'locally homeomorphic to ℝᵏ' is not enough: charts, atlases, tangent spaces and the differential done properly, in the notation this chapter borrows."
+  />
+  <Reference
+    authors="Thrun, S., Burgard, W., and Fox, D."
+    year={2005}
+    title="Probabilistic Robotics"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262201629/probabilistic-robotics/"
+    note="The sister volume's source; its Chapter 3 web treatment of SE(2) as a Lie group, with exp/log and ⊞/⊟, is the cross-link this chapter defers to for rotation machinery."
+  />
+</References>

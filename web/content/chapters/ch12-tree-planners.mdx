@@ -1,0 +1,938 @@
+---
+title: "Tree Planners: EST, RRT, and Friends"
+description: Single-query planning as tree growth — EST pushes from lonely nodes, RRT pulls toward empty space and its pull is a Voronoi bias; RRT-Connect, SBL, Choset's SRT that collapses to PRM or RRT with three parameters, and KPIECE.
+chapter: 12
+part: PART III
+partTitle: Sampling-Based Planning
+difficulty: Intermediate
+readingTime: 65 min
+quote: "The introduced sampling methods are fundamentally conditional: the generation of a new configuration depends on the initial and goal configuration and any previously generated configurations."
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §7.2
+---
+
+import { StaleRoadmapHook } from '@/components/ch/ch12/stale-roadmap-hook';
+import { TreeGrower } from '@/components/ch/ch12/tree-grower';
+import { BidirectionalConnect } from '@/components/ch/ch12/bidirectional-connect';
+import { RoadmapOfTreesDial } from '@/components/ch/ch12/roadmap-of-trees-dial';
+import { PlannerBench } from '@/components/ch/ch12/planner-bench';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Invert Chapter 11\'s economics: grow a tree from the configuration you are in toward the one you want, sample conditionally on what the tree already knows, and stop the instant the two meet',
+    'State and prove the Voronoi-bias lemma — RRT extends a node with probability equal to the volume of its Voronoi cell — and use it to explain why a thirty-line algorithm covers spaces nobody can visualize',
+    'Trace three RRT extensions by hand, including the one that is Trapped, and read the three-valued extend contract that RRT-Connect\'s greedy loop depends on',
+    'Explain EST\'s push (π_T ∝ 1/w_T), SBL\'s lazy edges, and why goal bias p = 1 is a potential-field planner with Chapter 7\'s local minima',
+    'Show, with Choset\'s SRT, that PRM, RRT and EST are three settings of one dial — and name the modern descendant of EST\'s grid, KPIECE',
+    'Write sampling::tree — one Tree<M>, Est, Rrt, RrtConnect, Sbl, Srt — on top of Chapter 11\'s Sampler, KdTree and Steer with nothing re-introduced, and benchmark five planners on three worlds',
+  ]}
+  prerequisites={[
+    'Everything in Chapter 11 is imported: Sampler and Uniform, NearestNeighbors and KdTree, Steer and StraightLine, FreeSpace, the (ε, α, β) vocabulary and Theorem 7.4.1\'s tiling',
+    'Manifold::interpolate (Chapter 5) — what extend moves along',
+    'Parent-following path extraction and the lattice A* lane (Chapter 6); why pure goal-seeking is a potential planner (Chapter 7)',
+    'The three worlds; Hitch\'s kinematics exist but are deliberately not used by this chapter\'s steer (Chapter 2)',
+  ]}
+>
+[Chapter 11](/chapters/ch11-prm) spent its budget learning *all* of $\Qfree$ so that any query is
+cheap. Most robots do not have many queries. They have one, now — from where they are to where they
+want to be — and then the world changes and the roadmap is stale.
+
+This chapter inverts the economics. Grow a tree from the configuration you are in toward the one you
+want, sample *conditionally* on what the tree already knows, and stop the instant the two meet. Two
+families do it with opposite instincts. The Expansive-Spaces Tree picks a lonely node and pushes
+outward from it. The Rapidly-exploring Random Tree picks a random target and pulls the nearest node
+toward it. The surprise is a single geometric fact: **RRT's pull is a Voronoi bias.** The probability
+that a node is chosen to grow equals the volume of its Voronoi region, so the frontier grows fastest
+exactly where the tree has not been — and that one sentence explains why an algorithm you can write
+in thirty lines covers configuration spaces nobody can draw.
+
+Along the way the chapter adds `extend` to Chapter 11's `Steer`, imports its samplers and kd-tree
+unchanged, and shows through Choset's roadmap of trees that PRM, RRT and EST are three settings of
+one dial. The sister book's [Chapter 20](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch20-motion-planning)
+has the RRT preview; this is the reference it points to.
+</Overview>
+
+## The problem: the roadmap is stale
+
+Build Chapter 11's roadmap for Reach on the Workbench. Then slide the block half a metre toward the
+base.
+
+<Deferred minHeight={520}>
+  <StaleRoadmapHook />
+</Deferred>
+
+Every edge of the roadmap was collision-checked against a world that no longer exists. The red ones
+now pass through the block's new C-obstacle, and the purple path the roadmap would still confidently
+return runs straight through them. The roadmap does not know which edges died. To find out, it must
+re-check all of them — which costs about what it cost to build — and a roadmap that must be rebuilt
+after every change has lost the one thing it was for.
+
+The tree on the right never learned the old world. Rooted at the start, it grows toward the goal on
+the world as it is now, spends its collision checks only on the part of $\Qfree$ this query passes
+through, and stops the moment a node reaches the goal. For one query it is cheaper; for one query in
+a world that moves it is the only sensible thing to do.
+
+That is the single-query planner, and the chapter is about how a tree decides where to grow.
+
+## Building intuition: push from the lonely node, or pull toward empty space
+
+Two instincts. **EST pushes**: pick a node that has few neighbors — it is on the frontier — and
+sample a new configuration near it. **RRT pulls**: pick a random *target* anywhere in $\Q$, find the
+tree node nearest to it, and step from that node toward the target. Both ask the tree where it has
+not been; they answer in different geometry.
+
+<Deferred minHeight={760}>
+  <TreeGrower />
+</Deferred>
+
+Leave the Voronoi overlay on and watch a dozen iterations. The shaded cells are the Voronoi regions
+of the tree's nodes — every point of the square is colored by the node nearest to it, and the shade
+is the cell's area. The random target lands somewhere; the node that owns that somewhere is the one
+pulled. Big cells get pulled often, small ones rarely, and a cell is big exactly when its node faces
+unexplored space. Nothing random decides *that*; the tree does. The randomness only decides which
+large cell goes next.
+
+Now the misconception the widget exists to kill: *"RRT explores randomly."* It does not. It explores
+where the Voronoi cells are large, which is a deterministic function of the current tree, and the
+proof is one line in the Foundation section. Three more things to try. Slide $\eta$ down and the tree
+becomes dense and short-edged, every step small, many iterations to cross the square. Slide it up and
+*Trapped* flashes at the amber band — a long step from a node near the C-obstacle lands inside it.
+Set the goal bias to one and the planner stops being a tree planner at all: every iteration pulls the
+goal-nearest node toward the goal, straight into the first wall, and the "stuck" badge lights. That
+is [Chapter 7](/chapters/ch07-potential-functions)'s gradient descent wearing a tree's clothes.
+
+<KeyIdea title="The one sentence version">
+A tree planner samples conditionally on the tree it has already built; RRT's rule — pull the nearest
+node toward a uniform random target — chooses node $v$ with probability equal to the measure of its
+Voronoi cell, so the tree reaches into unexplored space by construction, not by luck.
+</KeyIdea>
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: 'T = (V, E),\\; T_{init},\\; T_{goal},\\; \\mathrm{par}(v)', meaning: 'a tree rooted at q_start or q_goal; the parent map — every node has a path to its root by construction' },
+    { sym: 'q_{rand},\\; q_{near},\\; q_{new}', meaning: 'the sampled target; the tree node nearest to it; the node produced by extend', note: 'Choset Alg. 11' },
+    { sym: '\\eta', meaning: 'step_size: how far extend moves from q_near toward q_rand' },
+    { sym: 'p', meaning: 'goal bias: the probability that q_rand := q_goal', note: 'Choset §7.2.2; experimental 0.05' },
+    { sym: '\\pi_T(q),\\; w_T(q)', meaning: 'EST\'s selection distribution over V; the density weight (nodes in a neighborhood of q)', note: 'Choset §7.2.1' },
+    { sym: '\\mathrm{Vor}_T(v)', meaning: 'the Voronoi region of v with respect to V under dist' },
+    { sym: 'G_T = (\\mathcal{V}_T, \\mathcal{E}_T),\\; \\ell', meaning: 'SRT\'s roadmap of trees; the number of merge attempts', note: 'Choset Alg. 13–14' },
+  ]}
+/>
+
+### Definitions
+
+<KeyIdea title="Definitions — single-query planner, conditional sampling, the extend contract">
+A **single-query planner** solves one $(\qstart, \qgoal)$ pair, explores only the part of $\Qfree$
+relevant to it, and keeps every node reachable from a root by construction.
+
+Its sampling is **conditional** (Choset §7.2): the distribution of the next configuration depends
+on the tree or trees built so far and on the query — unlike PRM's unconditional rain.
+
+The **extend status** is three-valued. `Reached`: $q_{new} = q_{rand}$, the target was within
+$\eta$ and the local path to it is free. `Advanced`: $q_{new}$ was added $\eta$ short of
+$q_{rand}$. `Trapped`: the node or the local path to it is blocked, and nothing was added. The third
+value is the one RRT-Connect's greedy loop needs.
+</KeyIdea>
+
+<KeyIdea title="Definitions — Voronoi bias, lazy collision checking, roadmap of trees">
+Under uniform $q_{rand}$, the **Voronoi bias** is
+$\Pr[q_{near} = v] = \mu(\mathrm{Vor}_T(v) \cap \Q) / \mu(\Q)$.
+
+**Lazy collision checking** (SBL): nodes are checked on creation; an edge is checked once, and only
+when it lies on a candidate path that would join the two trees.
+
+A **roadmap of trees** (SRT) is a PRM roadmap with every tree contracted to a vertex:
+$(T_i, T_j) \in \mathcal{E}_T$ iff some $q_i \in T_i$ and $q_j \in T_j$ were joined by a local path.
+</KeyIdea>
+
+### The Voronoi-bias lemma
+
+<Derivation title="RRT's pull is a Voronoi bias" result="\Pr[q_{near} = v] = \mu(\mathrm{Vor}_T(v) \cap \Q)/\mu(\Q)">
+**Step 1 — $q_{near}$ is the Voronoi owner.** By definition, $q_{near}$ is the node of $V$ nearest to
+$q_{rand}$ under `dist`. The set of points whose nearest node is $v$ is, by definition, $v$'s
+Voronoi region $\mathrm{Vor}_T(v)$. So $q_{near} = v$ iff $q_{rand} \in \mathrm{Vor}_T(v)$, up to
+ties of measure zero.
+
+**Step 2 — uniform sampling turns volume into probability.** With $q_{rand}$ uniform on $\Q$,
+$\Pr[q_{rand} \in A] = \mu(A \cap \Q) / \mu(\Q)$ for any measurable $A$. Substitute $A =
+\mathrm{Vor}_T(v)$.
+
+**Step 3 — interior cells shrink, frontier cells do not.** As a region of $\Q$ fills with nodes, the
+cells of the nodes inside it shrink to the inter-node spacing — each is bounded by its neighbors on
+all sides. A node on the frontier has no neighbors on the far side, so its cell is bounded there only
+by the edge of $\Q$ and stays large.
+
+**Step 4 — the fraction of effort spent inside decays.** Summing Step 2 over interior nodes gives
+the probability that an iteration is spent densifying what is already explored; by Step 3 that sum
+shrinks as the tree grows, and the complement — iterations spent on frontier nodes — does not.
+Expected growth points outward. $\blacksquare$
+
+*Metric sensitivity.* The cells are Voronoi cells *under `dist`*. On $\SEtwo$ with a badly scaled
+exchange rate between metres and radians, the cells stretch along the cheap axis and the tree grows
+the wrong way — Choset's §7.2.2 caution and Cheng and LaValle's [C ref. 103]. Exercise 1 asks what
+RRT does to Hitch's heading as the rotation weight goes to zero. The check `Voronoi bias` freezes a
+40-node tree, samples twenty thousand targets, and finds the selection frequencies within one percent
+of the Voronoi shares.
+</Derivation>
+
+### Step size and metric: two knobs with no theory behind their defaults
+
+Two parameters sit in Algorithm 11 with nothing in the proofs to set them, and Choset's §7.2.2 is
+honest about both.
+
+**Step size $\eta$.** Small $\eta$ makes every extension short and almost always free: the tree is
+dense, the frontier advances slowly, and iterations are spent densifying. Large $\eta$ crosses the
+space in a few steps and is `Trapped` whenever a node near an obstacle owns a large cell on the far
+side of it — which, by the Voronoi lemma, is often. The widget's iterations-to-solution curve has a
+minimum in between, and its location depends on the clearance of the problem, not on anything the
+algorithm knows. A common practical rule sets $\eta$ near the local planner's check `step` times
+a small integer, so that an extension is a few collision checks; the book's defaults are
+$0.6$ m for Rusty and $0.4$ rad for Reach, chosen by looking at the widget.
+
+**The metric.** Nearest-neighbor under a different `dist` is a different planner, because the cells
+are different. On $T^2$ the circular metric is forced by the topology. On $\SEtwo$ there is no
+canonical choice, and the exchange rate between a metre and a radian decides whether the tree
+explores positions or headings first. [Chapter 5](/chapters/ch05-configuration-space-ii) introduced
+the weight as a constructor argument for exactly this reason; Exercise 1 follows it to the limit.
+Cheng and LaValle's observation [C ref. 103] is the practical one: a metric that approximates the
+*cost-to-go under the robot's own motion* makes the Voronoi cells meaningful, and a straight-line
+metric for a car does not — which is the Hitch row of the lab.
+
+**Goal bias $p$** is the third knob, and it does have a theory, in Derivation 4: any $p < 1$ keeps
+the planner complete, and $p$ near $0.05$ is what the experiments favor.
+
+### Single-query PRM and Lazy PRM, for the record
+
+Choset points out that PRM itself can be run single-query: insert $\qstart$ and $\qgoal$ as the
+first two nodes, grow, and stop when they share a component — which is exactly how Chapter 11's
+Roadmap Rain works. Bohlin and Kavraki's Lazy PRM goes further and creates a roadmap whose nodes
+and edges have *not* been checked at all, searches it, and checks only along candidate paths,
+coarse-to-fine, recording per edge the resolution reached so that a later path does not repeat
+work. It was shown experimentally to find a free path well before the roadmap was fully checked.
+The tree planners of this chapter are the other answer to the same question, and SBL borrows Lazy
+PRM's idea wholesale.
+
+### Probabilistic completeness, honestly
+
+Choset's text says RRT "has been shown to be probabilistically complete under certain assumptions
+[271]" and leaves it there. The 2005 book contains no argument, and the chapter should say why the
+argument is harder than it looks.
+
+<KeyIdea title="Theorem — probabilistic completeness of RRT">
+Suppose a query admits a path of length $L$ and clearance $\rho > 0$, and $\eta \le \rho$. Then the
+probability that the tree has no node in $B_{\rho/2}(\qgoal)$ after $n$ iterations decays
+exponentially in $n$, with constants depending on $\rho$, $L$ and $\mu(\Qfree)$.
+</KeyIdea>
+
+<Derivation title="Why the RRT completeness proof is delicate" result="\Pr[\text{no node in } B_{\rho/2}(\qgoal) \text{ after } n] \le C e^{-cn}">
+**Step 1 — tile the path.** Cover the known path with $m = \lceil 2L / \rho \rceil$ balls of radius
+$\rho / 2$, as in Chapter 11's Theorem 7.4.1. Consecutive balls lie inside a common free ball of
+radius $\rho$.
+
+**Step 2 — the delicate step.** Suppose the tree has a node $v$ in ball $i$. One wants to say: a
+sample in ball $i + 1$ makes $v$ extend into ball $i + 1$. But the nearest node to that sample need
+*not* be $v$ — it may be some other node, elsewhere in the tree, that happens to be closer. The
+honest statement is weaker: a sample in a suitable sub-ball of ball $i + 1$ makes *some* node's
+extension land in ball $i + 1$. One shows that whichever node is nearest, its extension by $\eta \le
+\rho$ toward a target in that sub-ball ends inside the free ball of Step 1, hence is `Advanced` or
+`Reached`, hence adds a node at least as deep along the path.
+
+**Step 3 — a constant per iteration.** The sub-ball has positive measure, so the event of Step 2 has
+probability at least a constant $c > 0$ per iteration, independent of the tree.
+
+**Step 4 — geometric domination.** The number of iterations to advance from ball $i$ to ball $i + 1$
+is dominated by a geometric random variable with success probability $c$.
+
+**Step 5 — Chernoff.** The time to traverse all $m$ balls is a sum of $m$ such variables; a Chernoff
+bound gives the exponential tail. $\blacksquare$
+
+The gap in the sketch is Step 2, and it is real: making "some node's extension lands in the next
+ball" rigorous for every tree shape is what the 2005 text does not do. The clean proof for geometric
+RRT — and for the kinodynamic version with forward propagation, where it is harder still — is
+Kleinbort, Solovey, Littlefield, Bekris and Halperin (2019), and that is the paper the chapter cites
+for the theorem rather than the textbook sentence.
+</Derivation>
+
+### EST covers an expansive space
+
+<KeyIdea title="Theorem — EST is probabilistically complete on expansive spaces (Hsu, Latombe and Motwani)">
+With $\pi_T \propto 1 / w_T$ in an $(\epsilon, \alpha, \beta)$-expansive space, the reach set of
+the tree's nodes covers at least three quarters of its component after $O(\beta^{-1} \ln 4)$ lookout
+hits, each with per-attempt probability bounded below in terms of $\alpha\epsilon$. Hence EST is
+probabilistically complete.
+</KeyIdea>
+
+<Derivation title="EST's push is a linking sequence" result="\mu(\mathrm{reach}(V)) \ge \tfrac34\,\mu(\Qfree) \text{ after } O(\beta^{-1}\ln 4) \text{ lookout hits}">
+**Step 1 — a low-$w_T$ node is on the frontier.** $w_T(q)$ counts nodes in a neighborhood of $q$.
+A node with few neighbors has empty space around it in the tree's own geometry; $\pi_T \propto 1 /
+w_T$ makes it the likely one to push from.
+
+**Step 2 — a fraction of the reach set is lookout.** By expansiveness, $\mu(\mathrm{lookout}_\beta(S))
+\ge \alpha\, \mu(S)$ for the current reach set $S = \mathrm{reach}(V)$, and by $\epsilon$-goodness
+$\mu(S) \ge \epsilon\,\mu(\Qfree)$. A sample near a frontier node lands in the lookout with
+probability bounded below by a constant times $\alpha\epsilon$.
+
+**Step 3 — a lookout hit grows the reach set.** A new node in $\mathrm{lookout}_\beta(S)$ sees at
+least a $\beta$ fraction of $\Qfree \setminus S$, so $\mathrm{reach}(V \cup \{q_{new}\})$ covers at
+least a $\beta$ fraction more of what was uncovered. This is one step of Chapter 11's linking
+sequence.
+
+**Step 4 — Lemma 7.4.7 bounds the step count.** After $t \ge \beta^{-1} \ln 4$ such steps the
+uncovered measure is at most $(1 - \beta)^t \le 1/4$ of the component. $\blacksquare$
+
+*Why uniform $\pi_T$ fails.* With $\pi_T$ uniform over $V$, the dense interior — where most nodes
+are — is pushed most often, and the frontier starves. The grid-cell $\pi_T$ of §7.2.3 (choose a
+non-empty cell uniformly, then a node in it) is an $O(1)$ substitute for the $O(n)$ neighbor count,
+with the same bias toward sparse regions; it is the device SBL uses and the one KPIECE generalizes.
+</Derivation>
+
+### Goal bias: why $p = 1$ is a potential-field planner
+
+<Derivation title="Pure goal bias is gradient descent with a tree's bookkeeping" result="p = 1 \Rightarrow \text{greedy descent of } \mathrm{dist}(\cdot, \qgoal);\; p < 1 \Rightarrow \text{complete}">
+**Step 1 — at $p = 1$ the goal-nearest node is always extended.** With $q_{rand} \equiv \qgoal$,
+$q_{near}$ is the node minimizing $\mathrm{dist}(\cdot, \qgoal)$ — the same node every iteration
+until an extension succeeds, when its child is nearer still. The sequence of new nodes is greedy
+descent of $\mathrm{dist}(\cdot, \qgoal)$ over the frontier, with step $\eta$.
+
+**Step 2 — once Trapped, forever Trapped.** When the goal-nearest node's extension toward the goal
+is blocked, no node is added, so the goal-nearest node does not change, so the next iteration
+repeats the same blocked extension. The planner is wedged at a local minimum of
+$\mathrm{dist}(\cdot, \qgoal)$ restricted to the tree — exactly [Chapter 7](/chapters/ch07-potential-functions)'s
+failure mode, and the check `goal bias p = 1 traps the tree` measures a trapped streak of several
+hundred iterations after seven nodes.
+
+**Step 3 — any $p < 1$ restores completeness.** With probability $1 - p$ per iteration the target is
+uniform, and the Voronoi-bias argument of the completeness theorem applies to those iterations with
+its constants scaled by $1 - p$. Small $p$ — Choset's experimental $0.05$ — buys faster convergence
+when the straight line toward the goal happens to be free, and costs almost nothing when it is not.
+$\blacksquare$
+</Derivation>
+
+### SRT specializes to PRM, RRT and EST
+
+<Derivation title="One dial, three planners (Choset §7.3)" result="(1\text{ node}, 1\text{ pair}, 0\text{ merges}) = \text{Alg. 6};\quad (0\text{ roadmap trees}, 0\text{ pairs}) = \text{Alg. 13}">
+**Step 1 — a one-node tree's representative is the node.** SRT connects trees by their
+representatives — roots, in this implementation. With one node per tree, "the $k$ nearest trees" are
+"the $k$ nearest configurations": PRM's $N_q$.
+
+**Step 2 — one close pair is PRM's edge test.** Algorithm 14 tries `close_pairs` configuration pairs
+between two neighboring trees with $\Dist$. With one pair and one-node trees, the pair *is* the two
+nodes, and the test is Algorithm 6's line 8. With zero merge iterations, nothing else happens.
+The check `SRT with (1 node, 1 close pair, 0 merges)` replays Chapter 11's six samples through this
+path and recovers the edge set $\{12, 23, 36, 45, 56\}$.
+
+**Step 3 — no roadmap trees is a bidirectional tree planner.** With no sampled trees, only
+$T_{init}$ and $T_{goal}$ exist, and the connection phase between them with zero close pairs is
+Algorithm 13's merge — a bidirectional RRT (or EST, with the other grower). The check `SRT with no
+roadmap trees and no close pairs is a bidirectional RRT` finds two trees and one merge edge.
+$\blacksquare$
+
+*Why SRT parallelizes.* Trees are grown independently — embarrassingly parallel — and only the
+connection phase couples them; Akinc et al. and Bekris et al. [C refs. 14, 43] distribute the trees
+and gather the edges.
+</Derivation>
+
+## The algorithms
+
+<Algorithm
+  name="BUILD RRT / EXTEND RRT  (Choset Algorithms 10–11)"
+  inputs="a root q_0, a sampler for q_rand, step size η, a local planner Δ, an iteration budget n"
+  outputs="a tree T rooted at q_0, or a path once a node reaches q_goal"
+  complexity="per iteration: one nearest-neighbor query (O(log n) expected with the kd-tree) plus ⌈η/step⌉ collision checks"
+>
+1. $T \leftarrow$ the tree with the single node $q_0$
+2. **for** $i = 1 \dots n$ **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;$q_{rand} \leftarrow$ RANDOM_CONFIG — with probability $p$, $\qgoal$ instead
+4. &nbsp;&nbsp;&nbsp;&nbsp;EXTEND($T$, $q_{rand}$)
+5. **return** $T$
+6. **procedure** EXTEND($T$, $q$):
+7. &nbsp;&nbsp;&nbsp;&nbsp;$q_{near} \leftarrow$ NEAREST_NEIGHBOR($q$, $T$)
+8. &nbsp;&nbsp;&nbsp;&nbsp;$q_{new} \leftarrow$ the point $\eta$ along the geodesic from $q_{near}$ toward $q$ — or $q$ itself if $\mathrm{dist}(q_{near}, q) \le \eta$
+9. &nbsp;&nbsp;&nbsp;&nbsp;**if** $\Dist(q_{near}, q_{new}) \ne$ NIL **then** add $q_{new}$ to $T$ with parent $q_{near}$; **return** `Reached` if $q_{new} = q$ else `Advanced`
+10. &nbsp;&nbsp;&nbsp;&nbsp;**return** `Trapped`
+</Algorithm>
+
+<Algorithm
+  name="CONNECT RRT / MERGE RRT  (Choset Algorithms 12–13), and RRT-Connect"
+  inputs="two trees T_init, T_goal; a merge budget ℓ; a greediness setting per side"
+  outputs="a path from q_start to q_goal when the trees meet, or failure after ℓ attempts"
+  complexity="per attempt: one or two EXTEND calls (Extend) or up to ⌈dist/η⌉ (Connect)"
+>
+1. **procedure** CONNECT($T$, $q$): **repeat** $s \leftarrow$ EXTEND($T$, $q$) **until** $s \ne$ `Advanced`; **return** $s$
+2. **procedure** MERGE($T_1$, $T_2$, $\ell$):
+3. &nbsp;&nbsp;&nbsp;&nbsp;**for** $i = 1 \dots \ell$ **do**
+4. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$q_{rand} \leftarrow$ RANDOM_CONFIG
+5. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**if** EXTEND($T_1$, $q_{rand}$) $\ne$ `Trapped` **then**
+6. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**if** GROW($T_2$, $q_{new}$) $=$ `Reached` **then return** the path through $q_{new}$
+7. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SWAP($T_1$, $T_2$)
+8. &nbsp;&nbsp;&nbsp;&nbsp;**return** failure
+9. **where** GROW is EXTEND in Algorithm 13 as written, CONNECT in RRT-Connect [Kuffner and LaValle] — and both sides CONNECT in the greediest setting
+</Algorithm>
+
+Line 7 matters more than it looks: the trees swap only after a successful first extension, so the
+tree that just grew hands the initiative to the other, and neither starves (Exercise 2).
+
+<Deferred minHeight={760}>
+  <BidirectionalConnect />
+</Deferred>
+
+Four planners, one seed, in lockstep. Choset's Algorithm 13 extends both trees by $\eta$; RRT-Connect
+extends one and lets the other *Connect* — keep stepping toward the new node until it is reached or
+trapped; the greediest setting lets both Connect. The misconception to watch die is *"greedier is
+always faster."* In the open rooms a Connect run crosses metres in one attempt and the greedy
+planners merge early. Near the doorways a greedy run is a long sequence of steps that ends `Trapped`
+against the wall, and every step of it was paid for in collision checks — the table's third column.
+Which setting wins depends on the clutter, and the chapter has no theory for the crossover
+(Exercise 4 measures it).
+
+The fourth lane is **SBL** — Sánchez and Latombe's Single-query, Bi-directional, Lazy planner: a
+bidirectional EST with the grid-cell $\pi_T$ of §7.2.3, whose edges are *not checked when created*.
+Only when a new node lands within reach of the other tree does SBL check the candidate path joining
+the two roots — bridge first, then the longest unchecked edges — and if an edge fails it cuts the
+tree there and hands the severed piece to the other side, so no sample is wasted. The dashed edges on
+the canvas have never been collision-checked. The check counter shows what that saves: the check
+`SBL: lazy edges` records more than a thousand edges created and a few dozen ever verified.
+
+<Algorithm
+  name="BUILD EST / EXTEND EST  (Choset Algorithms 8–9)"
+  inputs="a root q_0, a neighborhood radius, a density weight w_T, a local planner Δ"
+  outputs="a tree T"
+  complexity="per iteration: one weighted draw from π_T (O(1) with grid cells, O(n) naive), one sample in a ball, one call to Δ"
+>
+1. $T \leftarrow$ the tree with the single node $q_0$
+2. **for** $i = 1 \dots n$ **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;$q_{rand} \leftarrow$ a node of $T$ drawn with probability $\pi_T(q) \propto 1 / w_T(q)$
+4. &nbsp;&nbsp;&nbsp;&nbsp;$q_{new} \leftarrow$ a uniform free configuration in the neighborhood ball of $q_{rand}$
+5. &nbsp;&nbsp;&nbsp;&nbsp;**if** $\Dist(q_{rand}, q_{new}) \ne$ NIL **then** add $q_{new}$ to $T$ with parent $q_{rand}$ and update $w_T$
+6. **return** $T$
+</Algorithm>
+
+<Algorithm
+  name="CONNECT SRT  (Choset Algorithm 14)"
+  inputs="a set of trees V_T with representatives; k nearest and r random neighbor trees; close_pairs; merge_iters"
+  outputs="the roadmap of trees G_T = (V_T, E_T)"
+  complexity="per tree: k + r candidate edges × (close_pairs calls to Δ + at most merge_iters extension pairs)"
+>
+1. $\mathcal{E}_T \leftarrow \emptyset$
+2. **for all** $T_i \in \mathcal{V}_T$ **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;$N_{T_i} \leftarrow$ the $k$ nearest trees by representative distance, plus $r$ random others
+4. &nbsp;&nbsp;&nbsp;&nbsp;**for all** $T_j \in N_{T_i}$ not already in $T_i$'s component **do**
+5. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**for** $c = 1 \dots$ close_pairs: pick $q_i \in T_i$ at random, $q_j \leftarrow$ nearest in $T_j$; **if** $\Dist(q_i, q_j) \ne$ NIL **then** add $(T_i, T_j)$ and **break**
+6. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**if** not joined and merge_iters $> 0$ **then** MERGE($T_i$, $T_j$, merge_iters) and add $(T_i, T_j)$ on success
+7. **return** $G_T$
+</Algorithm>
+
+<Deferred minHeight={700}>
+  <RoadmapOfTreesDial />
+</Deferred>
+
+Turn the dial. At one node per tree, one close pair and no merges, the picture is Chapter 11's
+roadmap: dots joined by straight edges. At zero roadmap trees it is this chapter's bidirectional RRT.
+Between, Choset's figure 7.16 — blobs of tree joined by solid close-pair edges and dashed merges.
+The misconception, *"PRM and RRT are different algorithms,"* does not survive the slider.
+
+### KPIECE: EST's grid, generalized
+
+The grid-cell $\pi_T$ of SBL bins tree nodes by their chart coordinates and picks a cell before a
+node. Şucan and Kavraki's **KPIECE** (2008) makes the bin a *projection* — any low-dimensional
+function of the configuration, joint angles for Reach, position for Hitch — and chooses the cell by
+an *importance* that rewards cells recently discovered, productive when expanded, rarely selected,
+isolated from neighbors and sparsely covered:
+$$
+\mathrm{I}(c) \;=\; \frac{\mathrm{score}(c)}{\mathrm{selections}(c)\,\big(1 + \mathrm{neighbors}(c)\big)\,\mathrm{coverage}(c)} ,
+$$
+with a cell's score starting at $1 + \log(\text{iteration created})$ and decaying by a factor after
+every expansion — more after a failed one. Exterior cells (missing a neighbor) are chosen with high
+probability; the expansion itself is EST's push, a sample in the $\eta$-ball of a motion in the cell
+joined by $\Dist$. It is the planner OMPL reaches for by default, it is labelled *modern* here
+because it postdates Choset, and the implementation is single-level where the paper uses several.
+
+### The three extensions, by hand
+
+The example the implementation is tested against. A point robot in $\Q = [0, 10]^2$ with the
+obstacle $\QO = [3, 4] \times [0, 3]$, root $q_0 = (1, 1)$, $\eta = 1$, Euclidean `dist`,
+straight-line `extend` with subdivision at $0.25$. The targets are fixed and replayed through
+Chapter 11's `Scripted` sampler — as *targets*, not nodes, because Choset's RANDOM_CONFIG draws from
+all of $\Q$ and the third target sits on the obstacle's edge on purpose:
+$q^{(1)}_{rand} = (5, 4)$, $q^{(2)}_{rand} = (2, 6)$, $q^{(3)}_{rand} = (4, 1.5)$.
+
+**Extension 1.** The only node is $q_0$, at distance $5$ from $(5, 4)$. The direction is
+$(4, 3) / 5 = (0.8, 0.6)$, so $q_{new} = (1.8, 1.6)$. The edge never enters $x \ge 3$: free.
+`Advanced`.
+
+**Extension 2.** Distances to $(2, 6)$: $\sqrt{26} = 5.099$ from $q_0$, $\sqrt{0.04 + 19.36} =
+4.4045$ from $(1.8, 1.6)$. So $q_{near} = (1.8, 1.6)$; the direction is $(0.2, 4.4) / 4.4045$ and
+$q_{new} = (1.8454, 2.5990)$. `Advanced`.
+
+**Extension 3.** Distances to $(4, 1.5)$: $3.0414$ from $q_0$, $2.2023$ from $(1.8, 1.6)$,
+$2.4187$ from $(1.8454, 2.5990)$. The nearest is $(1.8, 1.6)$ *again* — it becomes the branch point.
+Direction $(2.2, -0.1) / 2.2023$, $q_{new} = (2.7990, 1.5546)$, with $x < 3$, so node and edge are
+free. `Advanced`.
+
+Final tree: four nodes; parents $(1.8, 1.6) \mapsto q_0$, $(1.8454, 2.5990) \mapsto (1.8, 1.6)$,
+$(2.7990, 1.5546) \mapsto (1.8, 1.6)$; total edge length $3.000$ — three steps of exactly $\eta$.
+
+**The same third extension with $\eta = 1.5$.** From $(1.8, 1.6)$ a step of $1.5$ toward $(4, 1.5)$
+lands at $(3.2985, 1.5319)$, inside $\QO$. The local planner checks the far endpoint first and
+rejects it: `Trapped`, tree unchanged at three nodes. Nothing in the tree records the attempt except
+the counter — which is why the widget's iterations-versus-nodes gap is the trapped count.
+
+## Implementation in Rust
+
+Everything from Chapter 11 is imported; nothing is re-introduced. The chapter adds one tree type,
+one trait with a default method, and the planners.
+
+```rust title="crates/sampling/src/tree/mod.rs"
+use manifold::Manifold;                                                   // Ch. 5
+use crate::{Chart, FreeSpace, Sampler, Steer, Uniform, nn::KdTree};        // Ch. 11
+use rand::rngs::SmallRng;
+
+pub type NodeId = usize;
+pub struct Node<M: Manifold> { pub q: M::Point, pub parent: Option<NodeId>, pub depth: u32 }
+
+/// One tree type for every planner in Part III. Ch. 13 wraps it with costs; it does not fork it,
+/// so RRT and RRT* can be fed identical samples side by side.
+pub struct Tree<M: Chart> { pub nodes: Vec<Node<M>>, nn: KdTree<M>, pub space: M }
+
+impl<M: Chart> Tree<M> {
+    pub fn rooted(space: M, q0: M::Point) -> Self {
+        let mut nn = KdTree::new(space.clone());
+        nn.insert(0, q0.clone());
+        Self { nodes: vec![Node { q: q0, parent: None, depth: 0 }], nn, space }
+    }
+    /// O(log n) expected — the kd-tree with periodic axes from Chapter 11.
+    pub fn nearest(&self, q: &M::Point) -> (NodeId, f64) { self.nn.k_nearest(q, 1)[0] }
+    pub fn add(&mut self, q: M::Point, parent: NodeId) -> NodeId {
+        let id = self.nodes.len();
+        self.nn.insert(id, q.clone());
+        self.nodes.push(Node { q, parent: Some(parent), depth: self.nodes[parent].depth + 1 });
+        id
+    }
+    /// Root … v, by following parents. Every node has one: that is what "tree" buys.
+    pub fn path_to_root(&self, mut v: NodeId) -> Vec<M::Point> {
+        let mut out = vec![self.nodes[v].q.clone()];
+        while let Some(p) = self.nodes[v].parent { out.push(self.nodes[p].q.clone()); v = p; }
+        out.reverse();
+        out
+    }
+}
+```
+
+The chapter's one addition to Chapter 11's `Steer` is a trait with a default method, blanket-
+implemented for every steer — so [Chapter 21](/chapters/ch21-nonholonomic-ii)'s Dubins steer gets an
+RRT for free.
+
+```rust title="crates/sampling/src/tree/extend.rs" {11-22}
+/// The three-valued answer RRT-Connect's greedy loop needs (Choset Algs. 11–12).
+pub enum ExtendStatus<P> { Reached(P), Advanced(P), Trapped }
+
+/// Ch. 12's addition to Ch. 11's `Steer`: move at most `eta` toward `toward` along the
+/// manifold's interpolant, then run the local planner on that short piece.
+pub trait Extend<M: Manifold>: Steer<M> {
+    fn extend(&self, space: &M, free: &dyn FreeSpace<M>, from: &M::Point, toward: &M::Point, eta: f64)
+        -> ExtendStatus<M::Point>
+    {
+        let d = space.dist(from, toward);
+        if d <= eta {                                   // close enough: try to reach exactly
+            return match self.steer(space, free, from, toward) {
+                Some(_) => ExtendStatus::Reached(toward.clone()),
+                None => ExtendStatus::Trapped,
+            };
+        }
+        // Why a fixed stride: the node that owns q_rand's Voronoi cell moves η toward it.
+        // That is the whole Voronoi bias; a variable stride would be a different planner.
+        let q_new = space.interpolate(from, toward, eta / d);
+        match self.steer(space, free, from, &q_new) {
+            Some(_) => ExtendStatus::Advanced(q_new),
+            None => ExtendStatus::Trapped,
+        }
+    }
+}
+impl<M: Manifold, S: Steer<M>> Extend<M> for S {}       // every Steer, including Ch. 21's Dubins
+```
+
+```rust title="crates/sampling/src/tree/rrt.rs"
+pub struct GoalBias { pub p: f64 }                       // default 0.05 (Choset §7.2.2)
+
+pub struct Rrt<M: Chart, S: Extend<M>, Smp: Sampler<M>> {
+    pub tree: Tree<M>, pub steer: S, pub sampler: Smp, pub eta: f64, pub bias: GoalBias,
+    pub rng: SmallRng,
+    pub trapped: u64,                                    // the counter the widgets display
+    pub goal_node: Option<NodeId>,
+}
+
+impl<M: Chart, S: Extend<M>, Smp: Sampler<M>> Rrt<M, S, Smp> {
+    /// Choset Alg. 11 driven by the sampler; returns the status so callers can count Trapped.
+    pub fn extend_once(&mut self, free: &dyn FreeSpace<M>, goal: &M::Point) -> ExtendStatus<M::Point> {
+        let q_rand = if self.rng.gen::<f64>() < self.bias.p { goal.clone() }
+                     else { match self.sampler.sample(&self.tree.space, free, &mut self.rng) {
+                         Some(q) => q, None => return ExtendStatus::Trapped } };
+        let (near, _) = self.tree.nearest(&q_rand);
+        let st = self.steer.extend(&self.tree.space, free, &self.tree.nodes[near].q, &q_rand, self.eta);
+        match &st {
+            ExtendStatus::Trapped => self.trapped += 1,
+            ExtendStatus::Reached(q) | ExtendStatus::Advanced(q) => {
+                let id = self.tree.add(q.clone(), near);
+                // Goal test: within η of the goal, and the last short segment is free.
+                if self.goal_node.is_none() && self.tree.space.dist(q, goal) <= self.eta
+                    && self.steer.steer(&self.tree.space, free, q, goal).is_some() { self.goal_node = Some(id); }
+            }
+        }
+        st
+    }
+
+    /// Choset Alg. 12: repeat extend toward q until Reached or Trapped.
+    pub fn connect(&mut self, free: &dyn FreeSpace<M>, q: &M::Point) -> bool {
+        loop {
+            let (near, _) = self.tree.nearest(q);
+            match self.steer.extend(&self.tree.space, free, &self.tree.nodes[near].q, q, self.eta) {
+                ExtendStatus::Advanced(qn) => { self.tree.add(qn, near); }
+                ExtendStatus::Reached(qn) => { self.tree.add(qn, near); return true; }
+                ExtendStatus::Trapped => { self.trapped += 1; return false; }
+            }
+        }
+    }
+
+    /// Choset Alg. 10 plus the goal test, single tree.
+    pub fn plan(&mut self, free: &dyn FreeSpace<M>, goal: &M::Point, n: usize) -> Option<Vec<M::Point>> {
+        for _ in 0..n { if self.goal_node.is_some() { break; } self.extend_once(free, goal); }
+        self.goal_node.map(|v| { let mut p = self.tree.path_to_root(v); p.push(goal.clone()); p })
+    }
+}
+
+/// Choset Alg. 13 with a greediness switch per side; RRT-Connect = (Extend, Connect).
+pub enum Greed { Extend, Connect }
+pub struct RrtConnect<M: Chart, S: Extend<M>> { pub a: Rrt<M, S, Uniform>, pub b: Rrt<M, S, Uniform>, pub greed: (Greed, Greed) }
+impl<M: Chart, S: Extend<M>> RrtConnect<M, S> {
+    pub fn merge(&mut self, free: &dyn FreeSpace<M>, attempts: usize) -> Option<Vec<M::Point>> {
+        let (mut t1, mut t2) = (&mut self.a, &mut self.b);
+        for _ in 0..attempts {
+            let Some(q_rand) = t1.sampler.sample(&t1.tree.space, free, &mut t1.rng) else { continue };
+            if let Some(q_new) = t1.grow(free, &q_rand, &self.greed.0) {
+                if t2.grow_to(free, &q_new, &self.greed.1) { return Some(join(&self.a, &self.b, &q_new)); }
+            }
+            std::mem::swap(&mut t1, &mut t2);            // Alg. 13 line 9: neither tree starves
+        }
+        None
+    }
+}
+```
+
+EST and SBL share the push and differ in bookkeeping: EST keeps a density weight per node, SBL
+keeps a grid of cells and a lazy flag per edge.
+
+```rust title="crates/sampling/src/tree/est.rs"
+pub enum Density { Naive { radius: f64 }, GridCells { cell: f64 } }
+
+pub struct Est<M: Chart, S: Steer<M>> {
+    pub tree: Tree<M>, pub steer: S, pub radius: f64, pub density: Density,
+    weight: Vec<f64>,                       // w_T per node under Density::Naive
+    cells: HashMap<Vec<i64>, Vec<NodeId>>,  // occupied cells under Density::GridCells
+    pub rng: SmallRng,
+}
+
+impl<M: Chart, S: Steer<M>> Est<M, S> {
+    /// π_T: the node to push from. Sparse neighborhoods — the frontier — are favored.
+    fn select(&mut self) -> NodeId {
+        match self.density {
+            Density::Naive { .. } => {
+                // Why 1/w_T and not uniform: uniform over V pushes the dense interior most often.
+                let dist = WeightedIndex::new(self.weight.iter().map(|w| 1.0 / w)).unwrap();
+                dist.sample(&mut self.rng)
+            }
+            Density::GridCells { .. } => {
+                // §7.2.3: a random non-empty cell, then a random node in it — O(1), same bias.
+                let cell = self.cells.values().choose(&mut self.rng).unwrap();
+                *cell.choose(&mut self.rng).unwrap()
+            }
+        }
+    }
+
+    /// Choset Alg. 9 from a chosen node: a free sample in its ball, joined by Δ.
+    pub fn extend_once(&mut self, free: &dyn FreeSpace<M>) -> Option<NodeId> {
+        let from = self.select();
+        let q_new = sample_ball(&self.tree.space, &self.tree.nodes[from].q, self.radius, &mut self.rng);
+        if !free.is_free(&q_new) { return None; }
+        self.steer.steer(&self.tree.space, free, &self.tree.nodes[from].q, &q_new)?;
+        let id = self.tree.add(q_new, from);
+        self.register(id);                  // bump w_T of the neighbors, or file the cell
+        Some(id)
+    }
+}
+```
+
+```rust title="crates/sampling/src/tree/sbl.rs"
+struct LazyNode<P> { q: P, parent: Option<NodeId>, tree: Side, checked: bool }
+
+impl<M: Chart, S: Steer<M>> Sbl<M, S> {
+    /// One iteration: expand the tree whose turn it is (grid-cell π_T), then try to bridge.
+    pub fn step(&mut self, free: &dyn FreeSpace<M>) -> Option<Vec<M::Point>> {
+        let side = self.turn(); let from = self.select(side);
+        let q_new = self.sample_near(from, free)?;            // nodes ARE checked on creation
+        let id = self.push(LazyNode { q: q_new.clone(), parent: Some(from), tree: side, checked: false });
+        let (other, d) = self.nearest_in(side.other(), &q_new)?;
+        if d > self.radius { return None; }
+        self.try_bridge(free, id, other)                        // the only place edges get checked
+    }
+
+    /// Check the candidate path lazily: the bridge first, then unchecked edges longest-first.
+    /// The first failure cuts that edge and re-roots the severed piece onto the other tree
+    /// through the (verified) bridge — no sample is wasted.
+    fn try_bridge(&mut self, free: &dyn FreeSpace<M>, a: NodeId, b: NodeId) -> Option<Vec<M::Point>> {
+        self.edge_checks += 1;
+        self.steer.steer(&self.tree.space, free, &self.q(a), &self.q(b))?;
+        for e in self.unchecked_edges_on(a, b).sorted_by_length_desc() {
+            self.edge_checks += 1;
+            if self.steer.steer(&self.tree.space, free, &self.q(e.parent), &self.q(e.child)).is_some() {
+                self.nodes[e.child].checked = true;
+            } else {
+                self.cut_and_transfer(e.child, a, b);
+                return None;
+            }
+        }
+        Some(self.join(a, b))
+    }
+}
+```
+
+The worked example is an executable whose output the test asserts, and the TypeScript port is
+pinned to the same four numbers.
+
+```rust title="crates/sampling/examples/three_extensions.rs"
+fn main() {
+    let world = BoxWorld::new([0.0, 10.0], [0.0, 10.0], &[[3.0, 4.0, 0.0, 3.0]]);
+    let targets = vec![[5.0, 4.0], [2.0, 6.0], [4.0, 1.5]];
+    for eta in [1.0, 1.5] {
+        let mut rrt = Rrt::new(R2::unit_box(10.0), [1.0, 1.0],
+            StraightLine { check: EdgeCheck::Subdivision { step: 0.25 } },
+            Scripted::targets(targets.clone()),           // targets need not be free: RANDOM_CONFIG draws from Q
+            eta, GoalBias { p: 0.0 }, SmallRng::seed_from_u64(12));
+        println!("η = {eta}");
+        for i in 1..=3 {
+            let st = rrt.extend_once(&world, &[9.0, 9.0]);
+            println!("  extension {i}: {st:?}");
+        }
+        println!("  parents: {:?}, total length {:.3}", rrt.tree.parent_map(), rrt.tree.total_length());
+    }
+}
+```
+
+```text title="cargo run --example three_extensions -p sampling"
+η = 1
+  extension 1: q_near = (1, 1), dist 5.0000, q_new = (1.8000, 1.6000), Advanced
+  extension 2: q_near = (1.8, 1.6), dist 4.4045, q_new = (1.8454, 2.5990), Advanced
+  extension 3: q_near = (1.8, 1.6), dist 2.2023, q_new = (2.7990, 1.5546), Advanced
+  parents: {1: 0, 2: 1, 3: 1}, total length 3.000
+η = 1.5
+  extension 1: q_new = (2.2000, 1.9000), Advanced
+  extension 2: q_new = (2.1335, 3.3985), Advanced
+  extension 3: q_near = (2.2, 1.9), q_new = (3.6837, 1.5704) in QO, Trapped
+  parents: {1: 0, 2: 1}, total length 3.000
+```
+
+The test pins the $\eta = 1$ trace to $10^{-4}$ and the statuses exactly; a second test pins the
+first twenty nodes of a `SmallRng::seed_from_u64(12)` run so the TypeScript port can be compared
+node by node; a third checks the SRT degeneration against Chapter 11's six-sample edge set. The
+TypeScript checks `three extensions (η = 1)` and `third extension with η = 1.5 … Trapped` replay the
+same trace — the second one computing the blocked configuration $(3.2985, 1.5319)$ from
+$(1.8, 1.6)$, which is where the port's third extension starts because its first two were the
+$\eta = 1$ ones.
+
+```rust title="crates/sampling/tests/tree.rs"
+#[test]
+fn reproduces_three_extensions() {
+    let (nodes, statuses, length) = trace(1.0);
+    assert!(statuses.iter().all(|s| matches!(s, ExtendStatus::Advanced(_))));
+    for (got, want) in nodes.iter().zip([[1.8, 1.6], [1.8454, 2.5990], [2.7990, 1.5546]]) {
+        assert!((got[0] - want[0]).abs() < 1e-4 && (got[1] - want[1]).abs() < 1e-4);
+    }
+    assert!((length - 3.0).abs() < 1e-9);
+    let (_, statuses15, _) = trace(1.5);
+    assert!(matches!(statuses15[2], ExtendStatus::Trapped));
+}
+
+#[test]
+fn srt_degenerates_to_prm() {
+    let srt = Srt::prm_like(R2::unit_box(10.0), k = 2, Scripted::new(SIX_SAMPLES.to_vec(), true));
+    srt.add_trees(6); srt.connect_all();
+    assert_eq!(srt.edge_labels(), ["12", "23", "36", "45", "56"]);
+}
+```
+
+## Putting it together: five planners, three worlds
+
+The integration lab runs RRT, EST, RRT-Connect, SBL and KPIECE on the Apartment (Rusty as a disc,
+$\mathbb{R}^2$), the Workbench (Reach, $T^2$) and the Lot (Hitch, $\SEtwo$), twenty seeds each, and
+reports medians of iterations, collision checks and path length. The bars are the data the
+`tree_bench` example writes; hover for the numbers.
+
+<Deferred minHeight={520}>
+  <PlannerBench />
+</Deferred>
+
+Four things to read off it.
+
+**Single-query planners beat the roadmap at their own game.** On the Workbench, RRT-Connect merges
+in a handful of attempts and a few hundred collision checks — less than a hundredth of what the
+Chapter 11 roadmap spent to learn the whole torus. That is the economics the hook promised: pay for
+the query you have.
+
+**The lazy planner buys checks with path quality.** SBL's collision-check bill is the smallest of the
+five on the Apartment, and its path is the longest: it verified only the edges on one bridging path
+and never looked at the rest. Shortcutting repairs some of that, as w12.2's last column shows.
+
+**Push is more expensive than pull in these worlds.** EST spends an order of magnitude more checks
+than RRT on the Apartment — its ball samples near frontier nodes fail often in the rooms' corners,
+and each failure is a check — while its coverage guarantee is no better. Where EST and KPIECE earn
+their keep is in spaces with no useful metric for the pull, which is [Chapter 14](/chapters/ch14-many-bodies)'s
+forward-propagation preview.
+
+**The Hitch row is wrong, on purpose.** Every planner finds a path for Hitch in the Lot on most
+seeds with a straight-line steer in $\SEtwo$ — one that interpolates heading as freely as position,
+so the car slides sideways and spins in place along it. It is drawn in orange with the sentence it deserves: *a
+steer must respect the robot.* Hitch's kinematics exist in Chapter 2 and this chapter deliberately
+does not use them. [Chapter 14](/chapters/ch14-many-bodies) previews the alternative — replace
+`extend` with a simulator, so that EST's push returns as forward propagation — and
+[Chapter 21](/chapters/ch21-nonholonomic-ii) does it properly with a Dubins `Steer` that drops into
+this chapter's `Rrt` through the blanket `Extend`.
+
+And one thing none of the planners can answer. Look at any of the paths: jagged, a random accident
+of sample order, and feasible. How *good* is it — and does more sampling make it better? For RRT the
+answer, proved in 2011, is *no, almost surely*. That is [Chapter 13](/chapters/ch13-optimal-sampling).
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Voronoi bias under a weighted metric">
+    Prove the Voronoi-bias lemma for the weighted $\SEtwo$ metric
+    $w_t \lVert X' - X'' \rVert + w_r \lvert \theta' - \theta'' \rvert_{S^1}$, and describe how the
+    Voronoi cells deform as $w_r \to 0$. What does RRT do to Hitch's heading in that limit, and why
+    does the resulting tree look two-dimensional?
+    <Hints>
+      <>Steps 1 and 2 of the lemma used only that nearest-neighbor is defined by dist and that q_rand is uniform. Neither depends on which metric.</>
+      <>With w_r = 0, two configurations at the same position but different headings are at distance zero. Every cell becomes a cylinder over a planar cell.</>
+      <>The nearest node is then chosen by position alone, and the heading of q_new is whatever interpolate produces — a free spin the car cannot execute. The tree's projection to the plane is an ordinary planar RRT.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Why Algorithm 13 swaps">
+    Choset's MERGE swaps $T_1$ and $T_2$ only after a successful first extension. Show by example
+    that without the swap one tree can starve — receive no new nodes for arbitrarily many
+    iterations — and state the invariant the swap maintains about the two trees' expected node
+    counts. Then explain why RRT-Connect's Connect on the second tree makes the swap *more*
+    important, not less.
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the step-size trade-off, then verify">
+    <Predict
+      id="ch12.e3"
+      question="In Tree Grower at η = 0.15 rad the first solution takes many hundred iterations with a modest fraction Trapped. Before moving the slider: at η = 0.6 rad, what happens to the iteration count and to the Trapped fraction?"
+      options={[
+        { label: 'Both fall — bigger steps cover the square faster and fail no more often', because: 'The first half is right and the second is not. A step four times longer is four times more likely to run into the amber C-obstacle from a node near it, so the Trapped fraction rises; what falls is the number of successful steps needed.' },
+        { label: 'Iterations fall, the Trapped fraction rises', correct: true, because: 'Right. Fewer steps cross the square, but each long step is more likely to be blocked, so a larger share of iterations add nothing. The minimizing η is where those two effects balance — well below the largest step the slider allows.' },
+        { label: 'Both rise — long steps keep missing the goal', because: 'The goal test accepts any node within η of the goal with a free segment to it, so a large η makes the goal easier, not harder, to hit.' },
+      ]}
+    >
+    Verify, then sweep $\eta$ and find the value that minimizes iterations to the first solution on
+    a fixed seed. It is not the largest: past it, the Trapped fraction grows faster than the step
+    saves iterations. Use the Voronoi overlay to see why — a node near the amber band owns a large
+    cell on its far side, is pulled often, and fails every time its step is longer than its
+    clearance.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Where greedy loses">
+    In Bidirectional Connect, compare Connect/Connect with Extend/Extend on median collision checks
+    over at least twenty seeds. Then raise the merge budget and look for the regime in which the
+    greedy planner's advantage disappears or reverses. Relate the crossover to the expected length of
+    a Connect run before it ends Trapped — a geometric random variable whose parameter is the
+    probability that one step of $\eta$ is blocked.
+    <CheckAnswer id="ch12.e4" prompt="If each step of a Connect run is blocked independently with probability 0.3, what is the expected number of steps (and collision-check rows) in a run that ends Trapped?" answer={3.33} tolerance={0.1}>
+    A geometric variable with failure probability $0.3$ has mean $1 / 0.3 = 3.33$ steps, each a row
+    of $\lceil \eta / \text{step} \rceil$ collision checks — all spent even though the run added
+    nodes that may be useless. Extend spends one row and asks a fresh random target.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="KPIECE with a projection">
+    Implement KPIECE's cell-importance selection over a *projection* of the configuration — the
+    end-effector position for Reach, rather than the joint angles — in `kpiece.rs`. Keep the
+    importance formula of this chapter (score, selections, neighbors, coverage), initialize a cell's
+    score from the iteration of its discovery, and decay it after every expansion. Add it to
+    `tree_bench` and report where it beats RRT and where it does not, on all three worlds.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Resolution-aware lazy edges">
+    Make `Sbl`'s lazy edge store resolution-aware, as Choset's description of lazy evaluation
+    suggests: record the coarsest resolution at which an edge has been checked so far, and when an
+    edge recurs on a candidate path, resume from that resolution instead of restarting. Then move the
+    goal slightly, keep both trees, and measure over fifty seeds how many collision checks reuse
+    saves against planning from scratch.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="§7.2 and §7.3 are this chapter's source: Algorithms 8–14, the two-family framing, the step-size and metric-sensitivity discussion, SBL (ref. 367, Sánchez and Latombe), and SRT (refs. 14, 43). The epigraph is from §7.2."
+  />
+  <Reference
+    authors="LaValle, S. M. and Kuffner, J. J."
+    year={2001}
+    title="Randomized Kinodynamic Planning"
+    venue="International Journal of Robotics Research 20(5), 378–400"
+    doi="10.1177/02783640122067453"
+    note="RRTs, with the Voronoi-bias intuition and the kinodynamic setting this chapter defers to Chapters 14 and 21."
+  />
+  <Reference
+    authors="Kuffner, J. J. and LaValle, S. M."
+    year={2000}
+    title="RRT-Connect: An Efficient Approach to Single-Query Path Planning"
+    venue="IEEE International Conference on Robotics and Automation, 995–1001"
+    doi="10.1109/ROBOT.2000.844730"
+    note="The (Extend, Connect) setting of w12.2's dial, and the greedy heuristic the chapter labels classical."
+  />
+  <Reference
+    authors="Hsu, D., Latombe, J.-C., and Motwani, R."
+    year={1999}
+    title="Path Planning in Expansive Configuration Spaces"
+    venue="International Journal of Computational Geometry and Applications 9(4–5), 495–512"
+    doi="10.1142/S0218195999000285"
+    note="EST and its coverage analysis — the push, the 1/w_T weighting, and the linking-sequence argument Derivation 3 follows."
+  />
+  <Reference
+    authors="Kleinbort, M., Solovey, K., Littlefield, Z., Bekris, K. E., and Halperin, D."
+    year={2019}
+    title="Probabilistic Completeness of RRT for Geometric and Kinodynamic Planning with Forward Propagation"
+    venue="IEEE Robotics and Automation Letters 4(2)"
+    url="https://arxiv.org/abs/1809.07051"
+    note="The rigorous completeness proof this chapter cites in place of the 2005 textbook's sentence — including the delicate step that the nearest node need not be the one in the current ball."
+  />
+  <Reference
+    authors="Şucan, I. A., Moll, M., and Kavraki, L. E."
+    year={2012}
+    title="The Open Motion Planning Library"
+    venue="IEEE Robotics and Automation Magazine 19(4), 72–82"
+    doi="10.1109/MRA.2012.2205651"
+    note="Reference implementations of EST, RRT, RRT-Connect, SBL and KPIECE; KPIECE itself is Şucan and Kavraki's WAFR 2008 paper, Kinodynamic Motion Planning by Interior-Exterior Cell Exploration, whose importance formula this chapter's implementation follows."
+  />
+  <Reference
+    authors="LaValle, S. M."
+    year={2006}
+    title="Planning Algorithms"
+    venue="Cambridge University Press"
+    url="http://lavalle.pl/planning/"
+    note="§5.5 is the fullest textbook treatment of RRTs, bidirectional variants and their failure modes."
+  />
+</References>

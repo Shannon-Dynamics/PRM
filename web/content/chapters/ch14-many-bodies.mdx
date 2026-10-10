@@ -1,0 +1,1032 @@
+---
+title: "Planning for Many Bodies: Multi-Robot, Manipulation, and Kinodynamic Previews"
+description: Composite configuration spaces and the robot–robot C-obstacle, decoupled and prioritized multi-robot planning and why both are incomplete, conflict-based search proved optimal on a grid, manipulation planning as transit and transfer modes on a manipulation graph, and a one-page preview of forward propagation for Hitch — plus OMPL and MoveIt as the systems in which Part III is infrastructure.
+chapter: 14
+part: PART III
+partTitle: Sampling-Based Planning
+difficulty: Advanced
+readingTime: 85 min
+quote: "Decoupled planning does not increase the dimensionality of the configuration space. It is incomplete, however, even when the algorithms used in both of its stages are complete."
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §7.5.2
+---
+
+import { CollideHook } from '@/components/ch/ch14/collide-hook';
+import { CompositeCSpace } from '@/components/ch/ch14/composite-cspace';
+import { PickAndPlace } from '@/components/ch/ch14/pick-and-place';
+import { HitchNoSteer } from '@/components/ch/ch14/hitch-no-steer';
+import { ConstraintTree } from '@/components/ch/ch14/constraint-tree';
+import { PointerBox } from '@/components/ch/ch14/pointer-box';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Build the composite configuration space of several bodies as a product manifold, and the composite free space as the lifted individual free spaces minus every pairwise robot–robot C-obstacle',
+    'Run Chapter 11–13\'s planners on the product unchanged, and account for the price: dimension adds, Theorem 7.4.1\'s sample count multiplies, and the pairwise checks grow like m²',
+    'State decoupled, prioritized and centralized multi-robot planning, and construct the swap instance on which the first two fail for every priority order while the third succeeds',
+    'Prove conflict-based search complete and optimal for sum-of-costs on a grid, trace it on the swap instance, and compare its constraint tree with a coupled A* over the joint state',
+    'Model manipulation as motion on a union of transit and transfer manifolds, build the manipulation graph of grasps at placements, and plan on it with a lazy two-level PRM',
+    'Preview planning with a simulator instead of a steer: a forward-propagated RRT for Hitch whose edges are drivable by construction — and say precisely what Chapter 21 adds',
+  ]}
+  prerequisites={[
+    'Chapter 2\'s Collision contract (a robot–robot query is the same geometric primitive as a robot–obstacle one), Hitch\'s kinematic update as a black box, Reach\'s forward kinematics and closed-form IK',
+    'Chapter 4: a disc–disc C-obstacle is a disc of radius r₁ + r₂',
+    'Chapter 5: Manifold and Chart; the Product construction and its ℓ² metric',
+    'Chapter 6: A* on a grid, with its tie-breaks — CBS\'s low level and the coordination search',
+    'Chapter 11: FreeSpace, Steer, PRM, Theorem 7.4.1\'s (1/ρ)^d and Theorem 7.4.3\'s asymmetric R; Chapter 12: Tree, extend, RRT and RRT-Connect',
+  ]}
+>
+Three chapters of sampling-based planning assumed one robot, one query, and one rigid notion of
+"free." This chapter removes those assumptions one at a time and finds that the machinery does not
+care. Two robots' configuration space is the product of theirs. A manipulated object is one more
+body, sometimes free and sometimes rigidly tied to a hand. A car that cannot be steered along a
+straight line can still grow a tree by *simulating* instead of steering. Every planner from
+[Chapter 11](/chapters/ch11-prm), [12](/chapters/ch12-tree-planners) and
+[13](/chapters/ch13-optimal-sampling) runs unchanged on a composite configuration space.
+
+What changes is the bill. The dimension of a composite space is the sum of the dimensions, and the
+sample count of Theorem 7.4.1 grows like $(1/\rho)^d$; the number of pairwise collision checks grows
+like $m^2$. Planning for many bodies is therefore mostly about *when to refuse to pay*: decouple the
+robots and coordinate their velocities, give them priorities, decompose the motion into modes, or —
+the modern answer — search over conflicts instead of over the joint space. Each of these refusals
+costs completeness or optimality somewhere, and this chapter is honest about where.
+
+Choset's §7.5 surveys these extensions in ten pages. Here multi-robot and manipulation planning get
+full treatment with running code; conflict-based search (2015) and the task-and-motion view (2021)
+are added because they changed practice; forward propagation gets exactly one page as Hitch's first
+planner — Chapter 21 owns the rest; and OMPL and MoveIt are named as the systems in which all of
+Part III is infrastructure. The sister book's
+[Chapter 23](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch23-mppi) makes the
+same "roll the simulator forward" move as this chapter's preview, in a different costume.
+</Overview>
+
+## The problem: two free paths are not a free plan
+
+Two Rustys in the Apartment. Rusty 1 wants to go from room A to room C; Rusty 2 wants the reverse.
+Each is handed to the single-robot planner of [Chapter 6](/chapters/ch06-graph-search) — A\* on the
+inflated lattice — and each gets back a path that touches no wall. Execute both at once.
+
+<Deferred minHeight={520}>
+  <CollideHook />
+</Deferred>
+
+They meet head-on in the corridor. Nothing in either planner was wrong; nothing in either planner
+could have been right. Each one checked its robot against the walls and never against the other
+robot, because the other robot was not a configuration it ever saw. The collision lives in a space
+neither planner searched: the set of *pairs* of configurations, where the second body is an obstacle
+that moves.
+
+That space is the product $\Q = \Q_1 \times \Q_2$, four-dimensional for two discs, and its obstacle
+has two parts. The lifted walls, which each robot already knew about, and a new set — the
+configurations where the two bodies overlap — which neither did. The hook, in numbers: at the
+composite configuration $q = (1.0, 1.0, 1.8, 1.4)$ in a corridor of height $2$, each disc of radius
+$0.5$ is $0.5$ clear of both walls, and their centers are $\sqrt{0.8^2 + 0.4^2} = 0.8944$ apart.
+Each robot's own check passes. The composite check does not: $0.8944 < 1.0$, a penetration of
+$0.1056$.
+
+## Building intuition: one space, many bodies
+
+### The amber hole that moves
+
+<Deferred minHeight={900}>
+  <CompositeCSpace />
+</Deferred>
+
+The top panel is two discs of radius $0.5$ in a corridor with one alcove, swapping ends. The
+bottom-left panel is robot 2's slice of the four-dimensional composite space: the two coordinates of
+robot 2, with robot 1 frozen where it is. Slate is where robot 2 alone would hit a wall — the
+Chapter 4 picture, a disc robot inflated against the corridor. Amber is new: the disc of radius
+$r_1 + r_2 = 1$ around robot 1, the robot–robot C-obstacle $\QO_{12}$ cut at robot 1's current
+position. Drag robot 1 and the amber hole follows. That is the whole difference between one robot
+and two: a C-obstacle that is a *function of the other robot's configuration*.
+
+At the default width of 3.2 radii the amber disc spans the corridor's full height. Below four radii
+of width the two discs cannot pass each other anywhere in the corridor, so whichever robot is in the
+corridor blocks it entirely, and the only resolution is the alcove: someone steps aside, the other
+passes, the first steps back out. Try the four planner chips.
+
+**Decoupled.** Plan each robot alone, then coordinate speeds along the two fixed paths. The
+bottom-right panel is the coordination diagram $[0,1]^2$ of path parameters: amber where the two
+bodies, each at its own parameter, overlap. A velocity schedule is a monotone path from $(0,0)$ to
+$(1,1)$ — neither robot drives backward along its path. Both paths planned alone are the corridor
+axis, so the obstacle is a band along the anti-diagonal $s_1 + s_2 \approx 1$, covering 39.0 percent
+of the square, and no monotone path crosses it. No wait of any length fixes this.
+
+**Prioritized 1→2 and 2→1.** Robot 1 plans alone in configuration–time space; robot 2 plans with
+robot 1 as a moving obstacle. Robot 1's trajectory is the axis, the alcove is of no use to a robot
+planning alone, and robot 2 finds no trajectory within its budget. Reverse the order and the same
+thing happens with the roles swapped. The prioritized planner fails in *both* orders.
+
+**Coupled.** RRT-Connect from [Chapter 12](/chapters/ch12-tree-planners) on the product $(\mathbb
+R^2)^2$, with a free-space predicate that checks each disc against the walls and then the pair
+against each other. It finds the detour: one robot into the alcove, the other past, the first out. On seed
+14 the trees merge at attempt 2562 with 60 nodes between them, after 3278 composite checks of which
+199 died on the pair term alone. The sample count is the price of four dimensions; the pair term is
+the price of two bodies. Both are reported, not hidden.
+
+The misconception this widget exists to kill: *"plan each robot separately and add a wait."* The
+swap problem has no wait that works. "Robot 1 waits in the alcove" is a different *path* for robot
+1, and only the composite space can express it.
+
+### Modes, not a bigger robot
+
+<Deferred minHeight={760}>
+  <PickAndPlace />
+</Deferred>
+
+Reach moves a puck from placement A to placement B on the Workbench. The puck is slate when it rests
+on the table and orange when the arm holds it, and the two colors are two different robots. With the
+puck at rest it is an obstacle, and the arm moves on a *transit* manifold: the amber region on the
+left torus is Reach's C-obstacle with one more body in the scene. With the puck held it is part of
+the robot, rigidly attached to the hand, and the arm moves on a *transfer* manifold: the amber region
+on the right torus is a different shape, because the robot has a different shape.
+
+Both manifolds have the dimension of the arm alone — two — inside a composite space of dimension
+four. The system can leave one only at a configuration that lies on both: the arm holding the puck
+*at* a placement, which is a grasp. The graph on the right has a node for every feasible
+(placement, grasp) pair and an edge for every transit (same placement, different grasp: a regrasp) or
+transfer (same grasp, different placement). A manipulation plan is a path in this graph.
+
+The headline slider adds grasps. With the front grasp alone, placement B — behind the bar — admits
+no grasp configuration at all, and the graph is disconnected: regrasping is impossible because there
+is only one grasp. With two grasps the graph is still disconnected if there is nowhere to set the
+puck down in between; add placement C and the plan is transit, transfer, transit, transfer — carry
+the puck from A to C with the front grasp, release, regrasp from the side, carry it to B. Grey dashed
+edges were never planned for real; only the four on the chosen path were, out of seven. That is the
+lazy two-level PRM of §7.5.3, and the counter is the number Exercise 4 asks about.
+
+The misconception killed: *"manipulation planning is path planning with a bigger robot."* It is a
+union of lower-dimensional manifolds, and switching happens only at their intersections.
+
+### Conflicts, not the joint space
+
+<Deferred minHeight={760}>
+  <ConstraintTree />
+</Deferred>
+
+A room with two pillars, three Rustys crossing from the west wall to the east wall in reversed order.
+The root of the tree plans every agent alone with Chapter 6's A\* over (cell, time). Expanding a
+node means finding the first conflict in its paths — two agents in one cell at one time, or swapping
+an arc — and spawning two children, each forbidding that cell to one of the two agents at that time,
+each re-planning only that agent. Nodes are popped in order of the sum of individual costs, so the
+first conflict-free node popped has the smallest sum any conflict-free plan can have.
+
+Watch the two numbers in the readout. On the three-agent room the constraint tree has three nodes
+and two expansions; a coupled A\* over the joint state, which must consider up to $5^3 = 125$ joint
+moves per expansion, generates 1412 successors to find the same cost. Slide to five agents: the tree
+grows to eleven nodes, while the joint search's branching factor is $3125$ and it is not run. The
+tree's size tracks *conflicts*, which in an apartment are few; the joint search's size tracks
+*agents*, exponentially.
+
+The misconception killed: *"optimal multi-agent paths require searching the joint space."*
+
+<KeyIdea title="The one sentence version">
+Every planner in Part III runs unchanged on a composite configuration space — only the price
+changes, and it is exponential in the number of bodies, so many-body planning is about when to
+refuse to pay it: decoupling, prioritization, modes, and conflict-based search.
+</KeyIdea>
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: '\\Q = \\Q_1 \\times \\dots \\times \\Q_m,\\; q = (q_1, \\dots, q_m)', meaning: 'composite configuration space of m bodies; dim 𝒬 = Σᵢ dim 𝒬ᵢ' },
+    { sym: '\\QO_i^{\\W},\\; \\QO_{ij}', meaning: 'robot–obstacle C-obstacle of body i, lifted to 𝒬; robot–robot C-obstacle {q : Rᵢ(qᵢ) ∩ Rⱼ(qⱼ) ≠ ∅}' },
+    { sym: 'c_i : [0,1] \\to \\Q_{free,i},\\; (s_1, \\dots, s_m) \\in [0,1]^m', meaning: 'individual paths; the coordination space of path parameters' },
+    { sym: '\\Q_i \\times [0, T]', meaning: 'configuration–time space for prioritized planning' },
+    { sym: '(a_i, a_j, v, t),\\; (a_i, v, t),\\; N,\\; \\mathrm{SIC}(N)', meaning: 'CBS conflict; constraint; constraint-tree node; its sum of individual costs' },
+    { sym: '\\mathcal G,\\; P,\\; \\mathcal M_{transit}(p),\\; \\mathcal M_{transfer}(g)', meaning: 'grasp set; stable placements; transit manifold (object fixed at p); transfer manifold (object rigidly attached by g)' },
+    { sym: 'MG', meaning: 'manipulation graph: nodes (p, g), edges transit/transfer paths' },
+    { sym: 'f : \\Q \\times U \\to \\Q,\\; U,\\; \\Delta t', meaning: "Choset's control function (state propagation); control set; propagation interval" },
+  ]}
+/>
+
+### Definitions
+
+<KeyIdea title="Definitions — composite free space, decoupling, coordination">
+**Composite free space.** With $\pi_i : \Q \to \Q_i$ the projections,
+<LinkedMath>
+$$
+\htmlClass{term-path}{\Qfree} \;=\; \bigcap_{i=1}^{m} \pi_i^{-1}\!\big(\Q_{free,i}\big)
+\;\setminus\; \bigcup_{i < j} \htmlClass{term-cobstacle}{\QO_{ij}},
+\qquad
+\htmlClass{term-cobstacle}{\QO_{ij}} = \{\, q : \htmlClass{term-robot}{R_i(q_i)} \cap \htmlClass{term-robot}{R_j(q_j)} \neq \emptyset \,\}.
+$$
+</LinkedMath>
+The individual free spaces, lifted, minus every pairwise interference.
+
+**Decoupled planning** (Kant and Zucker, [C ref. 219]). Plan each $c_i$ in $\Q_{free,i}$ alone;
+then choose velocities along the fixed paths so that no two robots collide. **Prioritized
+planning.** Plan the robots in a fixed order; each treats the robots before it as moving obstacles.
+**Centralized planning.** Plan once in $\Q$.
+
+**Coordination diagram.** For two robots, the subset of $[0,1]^2$ where $R_1(c_1(s_1))$ and
+$R_2(c_2(s_2))$ overlap. A monotone free path from $\mathbf 0$ to $\mathbf 1$ is a valid velocity
+schedule; monotone because a robot does not drive backward along its own path.
+</KeyIdea>
+
+<KeyIdea title="Definitions — conflict, constraint, transit, transfer, propagation">
+**Conflict and constraint** (CBS). A *vertex conflict* $(a_i, a_j, v, t)$: agents $a_i$ and $a_j$
+occupy cell $v$ at time $t$. An *edge conflict*: they traverse one arc in opposite directions between
+$t-1$ and $t$. A *constraint* $(a_i, v, t)$ forbids one agent one cell (or one arc) at one time.
+
+**Transit and transfer paths** (§7.5.3). A transit path is robot motion with the object at rest at
+a stable placement $p$; a transfer path is motion with the object grasped by $g$. Modes switch only
+at $\mathcal M_{transit}(p) \cap \mathcal M_{transfer}(g)$: a grasp configuration at a placement.
+
+**Forward propagation.** Producing $q' = f(q, u)$ by applying a control $u$ for $\Delta t$,
+instead of steering to a chosen $q'$. The relation $q\,R\,q'$ — "some $u$ drives $q$ to $q'$,
+collision-free" — is asymmetric and irreflexive.
+</KeyIdea>
+
+### Structure and price of the composite C-obstacle
+
+<KeyIdea title="Theorem (the pairwise C-obstacle of two discs)">
+For discs of radii $r_i, r_j$ with centers $p_i, p_j$, $\QO_{ij} = \{q : \|p_i - p_j\| < r_i + r_j\}$
+is a cylinder over a ball in the difference coordinate $p_i - p_j$: convex in that coordinate, of
+full dimension in $\Q$. In Theorem 7.4.1 with $d = \sum_i d_i$, the number of samples needed to tile
+a path of clearance $\rho$ grows like $(1/\rho)^d$.
+</KeyIdea>
+
+<Derivation title="Why two bodies cost a dimension, not a check" result="\QO_{ij} \text{ is a cylinder};\ \sigma\rho^d \text{ shrinks geometrically in } d">
+**Step 1 — Minkowski with both bodies moving.** Chapter 4 showed that a disc robot of radius $r$
+collides with a point obstacle iff its center is within $r$. Replace the point by a second disc of
+radius $r_j$: $R_i(q_i) \cap R_j(q_j) \neq \emptyset$ iff some point is within $r_i$ of $p_i$ and
+within $r_j$ of $p_j$, iff $\|p_i - p_j\| \le r_i + r_j$. The closed-set convention of Chapter 2 is
+kept: touching counts.
+
+**Step 2 — the cylinder.** The condition depends on $q$ only through $p_i - p_j$. In coordinates
+$(p_i - p_j,\ p_i + p_j,\ \text{everything else})$, $\QO_{ij}$ is a ball of radius $r_i + r_j$ in
+the first factor times the whole of the others. It is convex in the difference coordinate and has
+full dimension $d$ in $\Q$ — a four-dimensional region for two discs, not a surface.
+
+**Step 3 — the lifted walls.** $\pi_i^{-1}(\QO_i^{\W})$ is a cylinder in the complementary direction:
+robot $i$'s Chapter 4 C-obstacle times the other robots' entire spaces. $\Qfree$ is the complement
+of the union of both kinds of cylinder. Neither kind alone is the obstacle; their union is.
+
+**Step 4 — the exponential price.** Theorem 7.4.1 bounds PRM's failure probability by
+$\ell\,(1 - \sigma\rho^d)^n$ where $\sigma\rho^d$ is the measure of a ball of radius $\rho$ relative
+to $\mu(\Qfree)$ and $\ell \sim L/\rho$ balls tile the path. At fixed clearance $\rho < 1$,
+$\sigma\rho^d$ shrinks geometrically in $d$, so the samples needed for a fixed failure bound grow
+like $(1/\rho)^d$. For two Rustys $d = 4$; for three, $6$. The constant did not change; the
+exponent did.
+
+**Why a coupled path has less clearance.** In $\Q$ the clearance of a path is the minimum over all
+bodies and all pairs. A coupled path that threads two robots past each other has, at the passing
+moment, clearance about $\|p_1 - p_2\| - (r_1 + r_2)$, typically smaller than either robot's clearance
+to the walls. Smaller $\rho$, larger $(1/\rho)^d$: the two effects compound.
+
+**Polygons.** For polygonal bodies, $\QO_{ij}$ at fixed orientations is the Minkowski sum
+$R_i \oplus (-R_j)$ in the difference coordinate, computable with Chapter 4's star algorithm; the
+cylinder structure is unchanged.
+</Derivation>
+
+### Decoupled and prioritized planning are incomplete
+
+<KeyIdea title="Theorem (Choset §7.5.2, made concrete)">
+There are instances with a coupled solution on which no velocity coordination of independently
+planned paths succeeds, and on which prioritized planning fails for every priority order.
+</KeyIdea>
+
+<Derivation title="The swap instance" result="\text{no monotone path in } [0,1]^2;\ \text{no order works}">
+**Step 1 — the instance.** A corridor narrower than $2(r_1 + r_2)$, with one alcove in its north wall,
+and two robots that must swap ends. On the grid: a corridor one cell wide, seven cells long, with one
+alcove cell above the middle; robot 1 from cell $(0,0)$ to $(6,0)$, robot 2 the reverse.
+
+**Step 2 — the coordination diagram.** Each robot's individually shortest path is the corridor axis.
+Robot 1 at parameter $s_1$ is at $x = 0.8 + 4.4 s_1$; robot 2 at $x = 5.2 - 4.4 s_2$. They overlap when
+$|4.4(s_1 + s_2) - 4.4| < 1$, i.e. $|s_1 + s_2 - 1| < 0.227$: a band along the anti-diagonal from
+$(0,1)$ to $(1,0)$, which every monotone path from $(0,0)$ to $(1,1)$ must cross. The widget's raster
+finds the band occupies 39.0 percent of the square, every occupied cell within $|s_1 + s_2 - 1| < 0.25$,
+and A\* over the three monotone moves fails.
+
+**Step 3 — prioritized, both orders.** Plan robot 1 first: its path alone is the axis, and it occupies
+cell $x$ at time $x$ and then the far end forever. Robot 2 must traverse every corridor cell robot 1
+traverses, in the opposite direction, and the alcove is reachable only from the middle cell, which robot
+1 occupies at $t = 3$ — exactly when robot 2, having left at $t = 0$, would need it. On the grid the
+time-expanded A\* explores every (cell, time) pair to the horizon and finds nothing. Swap the priorities
+and the instance is its own mirror image.
+
+**Step 4 — what the coupled planner says.** One robot drives to the middle, steps into the alcove, waits
+while the other passes, steps out, continues. In the composite space this is one path; CBS finds it with a
+sum of costs of 15 — one robot's seven steps plus the other's eight — and the brute-force joint A\* agrees. Neither decoupled stage can express it: the
+velocity stage cannot change a path, and the prioritized stage never revisits robot 1.
+
+**Why decoupling stays useful.** Its dimension never grows — $m$ problems of dimension $d_i$, then a
+search in $[0,1]^m$ — and in most apartments robots do not need to swap in a corridor. Choset's
+remark is the honest summary: incomplete *"even when the algorithms used in both of its stages are
+complete."* CBS's contribution is to re-plan *paths*, not just velocities, and to do so only where a
+conflict demands it.
+</Derivation>
+
+### Conflict-based search is complete and optimal
+
+<KeyIdea title="Theorem (Sharon, Stern, Felner and Sturtevant 2015)">
+On a finite graph with unit-time moves and waits, conflict-based search returns a conflict-free
+joint plan minimizing the sum of individual costs whenever one exists.
+</KeyIdea>
+
+<Derivation title="Why the first conflict-free node popped is optimal" result="\mathrm{SIC}(\text{child}) \ge \mathrm{SIC}(\text{parent});\ \text{no solution is pruned}">
+**Step 1 — the low level.** For one agent under a set of constraints, Chapter 6's A\* over nodes
+$(v, t)$ with the five moves (four neighbors and a wait) to $(v', t+1)$, minus the constrained nodes and
+arcs, with the Manhattan heuristic — admissible on a 4-connected grid. Cost convention: a move or a
+wait away from the goal costs one; a wait at the goal costs nothing, so an agent that arrives and
+stays is charged exactly its arrival time. The goal is reached when the agent is at its goal cell at a
+time no later than which no constraint ever touches that cell again.
+
+**Step 2 — the high level.** Best-first search over a binary tree of constraint sets, keyed on
+$\mathrm{SIC}(N) = \sum_i \mathrm{cost}(\text{path}_i)$. The root has no constraints and every agent's
+individually optimal path.
+
+**Step 3 — expansion.** Pop the cheapest node $N$; scan its paths in time order for the first
+conflict. If there is none, return $N$'s paths.
+
+**Step 4 — splitting.** For a vertex conflict $(a_i, a_j, v, t)$ create two children, adding
+$(a_i, v, t)$ to one and $(a_j, v, t)$ to the other; for an edge conflict, the two directed arcs. In
+each child re-plan *only* the constrained agent under its own constraints; every other path is
+inherited. A child whose agent has no path is discarded.
+
+**Step 5 — nothing is pruned.** Any conflict-free solution has $a_i$ and $a_j$ not both at $v$ at
+$t$, so at least one of them satisfies the new constraint: every valid solution consistent with $N$ is
+consistent with at least one child. By induction from the root, every valid solution is consistent
+with some leaf frontier at all times.
+
+**Step 6 — the first pop is optimal and the search ends.** A child's constraint set contains its
+parent's, so the constrained agent's optimal cost cannot decrease: $\mathrm{SIC}$ is non-decreasing
+down the tree. Costs are integers. When a conflict-free node is popped with cost $c$, every node still
+in the open list has cost $\ge c$, and by Step 5 every valid solution is consistent with some open
+node, so none costs less than $c$. For completeness: the low level has a finite horizon, each
+constraint deletes one (cell, time) node of a finite graph, so the tree is finite and a solution
+consistent with the frontier is eventually popped.
+
+**Edge conflicts** are needed: two agents swapping an arc never share a cell. **Worst case** the tree
+is exponential in the number of conflicts. **Why it wins** in the apartment regime: conflicts there
+are few and local, and each one costs two low-level searches rather than a factor of $5$ in the
+branching of a joint search.
+</Derivation>
+
+### A manipulation plan is a path in a union of manifolds
+
+<KeyIdea title="Theorem (the structure of manipulation planning)">
+In the composite space of robot and object, feasible motions lie in
+$\bigcup_p \mathcal M_{transit}(p) \cup \bigcup_{g \in \mathcal G} \mathcal M_{transfer}(g)$, each of
+dimension $\dim \Q_{robot}$, and the problem is connectivity of the manipulation graph $MG$ whose nodes
+are the intersections $(p, g)$.
+</KeyIdea>
+
+<Derivation title="Transit, transfer, and the intersections between them" result="\text{dim} = \dim \Q_{robot};\ \text{switches only at } (p, g)">
+**Step 1 — transit.** An unheld object at a stable placement cannot move: its coordinates are
+frozen at $p$. The reachable set is $\Q_{robot} \times \{p\}$, of dimension $\dim \Q_{robot}$, with the
+object an obstacle in the robot's collision check.
+
+**Step 2 — transfer.** A held object's configuration is a fixed rigid transform of the hand's:
+$c_g(q) = \phi(q) \cdot g$ where $\phi$ is the robot's forward kinematics and $g$ the grasp. The
+reachable set is the graph $\{(q, c_g(q))\}$, again of dimension $\dim \Q_{robot}$, with the object
+part of the robot in the check.
+
+**Step 3 — switching.** Leaving a transit manifold for a transfer manifold requires the object to be
+at a placement *and* in the hand: $c_g(q) = p$. For Reach and a puck this is two equations in the two
+joint angles — solved in closed form by Chapter 2's `Reach::ik` on a virtual arm whose last link is the
+forearm extended to the puck's center. Up to two configurations per $(p, g)$.
+
+**Step 4 — the graph.** A sequence transit–grasp–transfer–release–transit is a path through $MG$;
+a regrasp is a transit edge between two grasps at one placement. Connectivity of $MG$ is necessary
+and, if every edge's lower-level planner is complete, sufficient.
+
+**Two-level FuzzyPRM** (Nielsen and Kavraki, [C ref. 335]) builds $MG$ first with every edge assigned
+a probability of being free from a few interpolated configurations, searches it, and plans for real
+only the edges on the candidate path — the lazy verification of Chapter 11, one level up. **aSyMov**
+[C ref. 170] used several specialized roadmaps to connect task-level AI planning to motion planning:
+proto-TAMP. The **task-and-motion view** (Garrett et al. 2021) is the generalization: symbolic actions
+are modes, their continuous parameters are grasps and placements, and the planner interleaves the
+search over the discrete structure with the search in the continuous space — which is exactly what
+the two levels of $MG$ do, for one object.
+</Derivation>
+
+### Steer-free planners inherit Theorem 7.4.3
+
+<KeyIdea title="Theorem (probabilistic completeness without a steer)">
+With $R = \{(q, q') : \exists u \in U,\ q' = f(q, u) \text{ and the propagated segment is free}\}$,
+Choset's abstract path-tiling theorem applies verbatim: the random incremental algorithm is
+probabilistically complete iff it succeeds with nonzero probability, and then its failure probability
+decays exponentially in the number of samples.
+</KeyIdea>
+
+<Derivation title="The proof never used symmetry" result="\Pr[\text{failure}] \le \ell e^{-pn}">
+**Step 1.** $R$ is measurable for a continuous $f$ and a closed obstacle set, which is all Theorem
+7.4.3 asks of the relation.
+
+**Step 2.** Choset, after the proof: *"the symmetry and reflexivity properties of the local planner
+were never used in the proof. In particular, the proof will still hold for an asymmetric and
+irreflexive local planner."* A car that can reach $q'$ from $q$ in $\Delta t$ cannot in general reach
+$q$ from $q'$; the relation is asymmetric, and the bound $\ell(1-p)^n \le \ell e^{-pn}$ does not care.
+
+**Step 3.** Sampling controls instead of configurations changes the measure $\mu$ over which the
+probability $p$ of hitting the next set is computed. The theorem allows any sampling distribution:
+"the sampling distribution is not necessarily uniform."
+
+**The preview stops here.** What $f$ *is* for Hitch, why it cannot be inverted into a `Steer`, and
+whether the car can reach every configuration at all — controllability — are Chapters 20 and 21.
+</Derivation>
+
+## The algorithm
+
+Three of this chapter's algorithms are Chapters 11–12's with a different space; the rest are new
+coordination schemes on top of them.
+
+<Algorithm
+  name="COMPOSITE PRM / RRT — Chapters 11–12 on the product"
+  inputs="m bodies with charts 𝒬ᵢ and Chapter 2 checkers; Δ, the sampler, η"
+  outputs="a roadmap or tree in 𝒬 = 𝒬₁ × ⋯ × 𝒬ₘ"
+  complexity="as Chapters 11–12 with d = Σ dᵢ; plus O(m²) pairwise checks per sample"
+>
+1. $\Q \leftarrow$ `CompositeSpace`$(\Q_1, \dots, \Q_m)$: dist is the $\ell^2$ combination, interpolate is componentwise
+2. $\Qfree \leftarrow$ `MultiBody`: **for each** $i$ check $R_i(q_i)$ against the world; **then for each** $i \lt j$ check the pair
+3. run BASIC PRM (C Alg. 6–7), RRT (C Alg. 10–12) or RRT-Connect (C Alg. 13) with no other change
+4. execute: all bodies move together along the composite path at a composite speed $v_{max}$
+</Algorithm>
+
+<Algorithm
+  name="PRIORITIZED PLANNING — Choset §7.5.2"
+  inputs="robots in a fixed order, starts, goals, horizon T, v_max"
+  outputs="one trajectory per robot, or failure at the first robot that finds none"
+  complexity="m single-robot plans in 𝒬ᵢ × [0, T]; incomplete"
+>
+1. $\mathcal O \leftarrow \emptyset$ (moving obstacles)
+2. **for** robot $i$ **in** order **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;grow an RRT in $\Q_i \times [0, T]$: $q_{rand}$ with $t_{rand}$; nearest among nodes with $t \lt t_{rand}$; advance $\le \eta_t$ in time and $\le v_{max}\,\Delta t$ in space; a segment is free iff clear of the world and of every $o \in \mathcal O$ at every sampled time
+4. &nbsp;&nbsp;&nbsp;&nbsp;near the goal: drive to it, then **rest until $T$ — that wait must also be free**
+5. &nbsp;&nbsp;&nbsp;&nbsp;**if** no trajectory within the budget **then return** failure at $i$
+6. &nbsp;&nbsp;&nbsp;&nbsp;$\mathcal O \leftarrow \mathcal O \cup \{\text{robot } i\text{'s trajectory}\}$ — never revisited
+</Algorithm>
+
+<Algorithm
+  name="ONE-ROBOT-AT-A-TIME EXTEND — C §7.5.2, after [C ref. 14]"
+  inputs="a tree node q_near in the composite space, q_rand"
+  outputs="q_new with as many robots advanced as could be, or NIL if none could"
+  complexity="m sequential extensions, cumulative collision checks"
+>
+1. $q_{new} \leftarrow q_{near}$
+2. **for** robot $i = 1 \dots m$ **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;move robot $i$ incrementally toward $q_{rand,i}$; check against the obstacles **and against robots $1 \dots i-1$ at their new positions**
+4. &nbsp;&nbsp;&nbsp;&nbsp;**if** collision **then** sample a new random target for robot $i$ alone and retry; keep the furthest free position
+5. **return** $q_{new}$ if any robot moved, else NIL — more expensive than one check of all robots at once, "considerably more effective in covering the space"
+</Algorithm>
+
+<Algorithm
+  name="CBS — Sharon et al. 2015, Algorithm 1"
+  inputs="grid, starts, goals"
+  outputs="conflict-free paths minimizing SIC, or failure"
+  complexity="low level O(|V|·T·log) per re-plan; high level exponential in conflicts in the worst case"
+>
+1. root: **for each** agent plan alone by A\* over (cell, time); $\mathrm{SIC} \leftarrow$ sum of costs; OPEN $\leftarrow \{\text{root}\}$
+2. **while** OPEN not empty **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;$N \leftarrow$ pop the node of least $\mathrm{SIC}$ (ties toward fewer conflicts)
+4. &nbsp;&nbsp;&nbsp;&nbsp;$C \leftarrow$ the first conflict in $N$'s paths; **if** none **then return** $N$'s paths
+5. &nbsp;&nbsp;&nbsp;&nbsp;**for each** agent $a$ of $C$ **do**
+6. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$N' \leftarrow N$ plus the constraint $(a, v, t)$ (or the arc); re-plan agent $a$ under its constraints
+7. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**if** $a$ has a path **then** push $N'$ with its $\mathrm{SIC}$
+8. **return** failure
+</Algorithm>
+
+<Algorithm
+  name="TWO-LEVEL MANIPULATION PRM — after Nielsen & Kavraki [C ref. 335]"
+  inputs="placements P, grasps 𝒢, the robot's start, the object's start and goal placements"
+  outputs="a sequence of transit and transfer paths, or 'MG disconnected'"
+  complexity="upper level over |P|·|𝒢| nodes; lower level a Chapter 12 planner per edge, lazily"
+>
+1. **nodes:** for each $(p, g)$ solve $c_g(q) = p$; keep configurations free in both $\mathcal M_{transit}(p)$ and $\mathcal M_{transfer}(g)$; add the robot's start as a free-hand node at $p_{start}$
+2. **edges:** transit between nodes sharing $p$; transfer between nodes sharing $g$; each with a belief = share of a few interpolated configurations that are free
+3. **repeat:** Dijkstra on $MG$ with weight $1 - \log(\text{belief})$ to any node at $p_{goal}$
+4. &nbsp;&nbsp;&nbsp;&nbsp;**for each** edge on the path not yet verified: RRT-Connect in that edge's mode; **if** it fails, delete the edge and go to 3
+5. **return** the verified path's segments, each tagged transit or transfer
+</Algorithm>
+
+<Algorithm
+  name="FORWARD-PROPAGATED RRT — classical [C ref. 270–272]; PREVIEW of Chapter 21"
+  inputs="q_init, the simulator f, control sampler over U, Δt, k controls per extension, goal region"
+  outputs="a tree whose every edge is a simulated motion; the controls along the path to the goal"
+  complexity="per iteration one nearest-neighbor query and k propagations; no steer, no extend"
+>
+1. $q_{rand} \leftarrow$ SAMPLE (goal with probability $p$); $q_{near} \leftarrow$ NEAREST$(T, q_{rand})$
+2. **for** $j = 1 \dots k$ **do** $u_j \leftarrow$ sample $U$; integrate $f$ from $q_{near}$ under $u_j$ for $\Delta t$ in substeps, checking each state
+3. among the free results keep the one closest to $q_{rand}$ — LaValle and Kuffner's rule; **if** none, the iteration adds nothing
+4. add it to $T$ with its control and its simulated segment; **if** within the goal radius, done
+5. the path is a list of controls; **executing it means re-running $f$**, which reproduces every node exactly
+</Algorithm>
+
+### The two-disc test, by hand
+
+Corridor $y \in [0, 2]$, two discs of radius $0.5$, composite $q = (x_1, y_1, x_2, y_2)$.
+
+**At $q = (1.0, 1.0, 1.8, 1.4)$.** Disc 1's clearance to the walls is $\min(1.0 - 0.5,\ 2 - 1.0 - 0.5) =
+0.5$; disc 2 spans $y \in [0.9, 1.9] \subset (0, 2)$. Both are free alone. The centers are
+$\sqrt{0.8^2 + 0.4^2} = \sqrt{0.80} = 0.8944$ apart, less than $r_1 + r_2 = 1$: $q \in \QO_{12}$,
+collision, penetration $0.1056$.
+
+**At $q' = (1.0, 1.0, 2.0, 1.4)$.** $\sqrt{1.0^2 + 0.4^2} = \sqrt{1.16} = 1.0770 > 1$: free.
+
+**Along the edge $q' \to q$**, only $x_2$ moves, from $2.0$ to $1.8$. The edge enters $\QO_{12}$ where
+$(x_2 - 1)^2 + 0.16 = 1$, i.e. $x_2 = 1 + \sqrt{0.84} = 1.9165$. Chapter 11's subdivision schedule at
+step $0.1$ on an edge of length $0.2$ has one interior check, the midpoint $x_2 = 1.9$, where
+$\|p_1 - p_2\| = \sqrt{0.81 + 0.16} = 0.9849 < 1$: rejected at the first interior check. (`steer`
+tests the far endpoint $q$ first and would already have said no.)
+
+**Prioritized slice.** Freeze robot 1 at $(1.0, 1.0)$. Robot 2's slice C-obstacle is the disc of
+radius $1$ about $(1, 1)$, spanning $y \in [0, 2]$ — the full corridor height at $x_2 = 1$. Scanning
+robot 2's own free band $y \in [0.5, 1.5]$ at $x_2 = 1$, every position collides: blocked fraction
+$1.00$. Robot 2 must wait or fail: Derivation 2, in numbers.
+
+### CBS on the swap corridor, by hand
+
+The grid is a corridor of seven cells, $(0,0)$ to $(6,0)$, with one alcove cell $(3,1)$ above the
+middle; agent 1 goes from $(0,0)$ to $(6,0)$, agent 2 the reverse. Every number below is produced by
+`Cbs` on this instance and pinned by a check.
+
+**Root.** Each agent planned alone takes the axis in six moves: $\mathrm{SIC} = 6 + 6 = 12$. The
+first conflict is a vertex conflict at cell $(3,0)$, $t = 3$ — the middle, where two robots driving at
+the same speed from opposite ends must meet.
+
+**Depth 1.** Two children, each forbidding $(3,0)$ at $t = 3$ to one agent. The constrained agent waits
+one step before the middle: $\mathrm{SIC} = 13$ in both. Each now has an *edge* conflict at $t = 4$ —
+the agents try to swap the arc into the middle cell, which no vertex constraint forbids. This is why
+edge conflicts are not optional.
+
+**Depths 2 and 3.** Each edge conflict splits into two arc constraints; the re-planned agent waits once
+more, $\mathrm{SIC} = 14$, and the conflict moves one cell and one time step along the corridor. At
+depth 3 the costs reach $15$ and the tree has grown to 23 nodes, of which CBS expands 12 in order of
+cost.
+
+**Depth 4.** The first conflict-free node popped: agent 1 drives $0, 1, 2$, waits, then $3, 4, 5, 6$ —
+seven steps; agent 2 drives $6, 5, 4, 3$, steps *up* into the alcove $(3,1)$, steps back down after
+agent 1 has passed beneath, and continues $2, 1, 0$ — eight steps. $\mathrm{SIC} = 15$, which the
+brute-force joint A\* confirms is the minimum: no plan that keeps both robots in the corridor can work,
+and every plan that uses the alcove costs at least two extra steps for the robot that detours plus one
+wait for the other. The joint search needed 19 expansions and 138 joint successors to say the same
+thing; here it is cheap, because there are two agents. With five it is not run.
+
+## Implementation in Rust
+
+The `multi` crate adds no planner. It adds a space (`Composite`), a free-space predicate
+(`MultiBody`), three coordination schemes (`prioritized`, `coordination`, `cbs`), a mode graph
+(`manip`) and a propagation trait (`propagate`), and imports everything else from `manifold`,
+`collide`, `robots`, `search` and `sampling`. The TypeScript port the widgets run is `web/lib/multi/`
+with the same module names.
+
+```rust title="crates/multi/src/composite.rs"
+use manifold::{Chart, Manifold};
+use sampling::FreeSpace;
+
+/// 𝒬 = A × B. dist is the ℓ² combination so Theorem 7.4.1's balls are balls; interpolate is
+/// componentwise, which is why Chapter 11's straight-line Steer works unchanged on the product.
+pub struct Composite<A: Manifold, B: Manifold> { pub a: A, pub b: B }
+
+impl<A: Manifold, B: Manifold> Manifold for Composite<A, B> {
+    type Point = (A::Point, B::Point);
+    fn dim(&self) -> usize { self.a.dim() + self.b.dim() }
+    fn dist(&self, p: &Self::Point, q: &Self::Point) -> f64 {
+        self.a.dist(&p.0, &q.0).hypot(self.b.dist(&p.1, &q.1))
+    }
+    fn interpolate(&self, p: &Self::Point, q: &Self::Point, t: f64) -> Self::Point {
+        (self.a.interpolate(&p.0, &q.0, t), self.b.interpolate(&p.1, &q.1, t))
+    }
+    fn sample(&self, rng: &mut impl rand::Rng) -> Self::Point { (self.a.sample(rng), self.b.sample(rng)) }
+}
+
+/// m copies of one chart — three Rustys. `Product<M, N>` is the const-generic form of the same.
+pub struct Product<M: Chart, const N: usize> { pub factor: M }
+
+/// Two discs overlap iff the center distance is below r₁ + r₂: Chapter 4's disc C-obstacle with
+/// both bodies moving. In Rust this is one parry2d distance query, the same one the world check makes.
+pub fn discs_collide(p1: [f64; 2], r1: f64, p2: [f64; 2], r2: f64) -> (bool, f64) {
+    let d = ((p1[0] - p2[0]).powi(2) + (p1[1] - p2[1]).powi(2)).sqrt();
+    (d <= r1 + r2, d)
+}
+
+/// Free space of m bodies: each against the world (Chapter 2), then every pair. Two counters,
+/// because the lab reports how much of the bill is pairwise.
+pub struct MultiBody<'w, M: Manifold> {
+    pub bodies: Vec<Body<'w>>, pub space: M,
+    pub world_checks: u64, pub pair_checks: u64, pub pair_only_rejections: u64,
+}
+
+impl<'w, M: Manifold<Point = Vec<[f64; 2]>>> FreeSpace<M> for MultiBody<'w, M> {
+    fn is_free(&mut self, q: &M::Point) -> bool {
+        // World first: cheaper, and where most random composite samples die.
+        for (b, qi) in self.bodies.iter().zip(q) { self.world_checks += 1; if !b.world.is_free(qi) { return false; } }
+        for i in 0..q.len() { for j in i + 1..q.len() {
+            self.pair_checks += 1;
+            if discs_collide(q[i], self.bodies[i].r, q[j], self.bodies[j].r).0 { self.pair_only_rejections += 1; return false; }
+        } }
+        true
+    }
+}
+```
+
+The two-disc test is the unit test and the worked example at once:
+
+```rust title="crates/multi/examples/two_discs.rs"
+use multi::composite::{discs_collide, MultiBody};
+use sampling::steer::{check_schedule, EdgeCheck};
+
+fn main() {
+    let r = 0.5;
+    let (q1, q2) = ([1.0, 1.0], [1.8, 1.4]);
+    let (hit, d) = discs_collide(q1, r, q2, r);
+    println!("q : dist {d:.4}, {}, penetration {:.4}", if hit { "collide" } else { "free" }, 2.0 * r - d);
+    let (hit, d) = discs_collide(q1, r, [2.0, 1.4], r);
+    println!("q': dist {d:.4}, {}", if hit { "collide" } else { "free" });
+    // Boundary along the edge q' → q: (x₂ − 1)² + 0.4² = 1.
+    println!("boundary x2 = {:.4}", 1.0 + (1.0 - 0.16f64).sqrt());
+    // Subdivision at step 0.1 on an edge of length 0.2: one interior check, the midpoint.
+    let ts = check_schedule(EdgeCheck::Subdivision { step: 0.1 }, 0.2);
+    let x2 = 2.0 - 0.2 * ts[0];
+    let (hit, d) = discs_collide(q1, r, [x2, 1.4], r);
+    println!("first interior check x2 = {x2:.1}: dist {d:.4} -> {}", if hit { "rejected" } else { "accepted" });
+    // Robot 2's slice at x₂ = 1 with robot 1 pinned: scan its own free band.
+    let blocked = (0..400).filter(|k| { let y = 0.5 + (*k as f64 + 0.5) / 400.0; discs_collide(q1, r, [1.0, y], r).0 }).count();
+    println!("slice at x2 = 1.0: {:.2} blocked", blocked as f64 / 400.0);
+}
+
+#[test]
+fn reproduces_two_disc_test() {
+    let (hit, d) = discs_collide([1.0, 1.0], 0.5, [1.8, 1.4], 0.5);
+    assert!(hit && (d - 0.8944).abs() < 1e-4 && (1.0 - d - 0.1056).abs() < 1e-4);
+    let (hit, d) = discs_collide([1.0, 1.0], 0.5, [2.0, 1.4], 0.5);
+    assert!(!hit && (d - 1.0770).abs() < 1e-4);
+    assert!((1.0 + 0.84f64.sqrt() - 1.9165).abs() < 1e-4);
+    let (hit, d) = discs_collide([1.0, 1.0], 0.5, [1.9, 1.4], 0.5);
+    assert!(hit && (d - 0.9849).abs() < 1e-4);
+    // MultiBody agrees with the closed form on 1 000 seeded composite configurations (parry2d vs. hypot).
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(14);
+    let mut mb = MultiBody::two_discs(&CORRIDOR, 0.5);
+    for _ in 0..1000 { let q = mb.space.sample(&mut rng); assert_eq!(mb.is_free(&q), MultiBody::closed_form(&CORRIDOR, &q, 0.5)); }
+}
+```
+
+Expected output:
+
+```text
+q : dist 0.8944, collide, penetration 0.1056
+q': dist 1.0770, free
+boundary x2 = 1.9165
+first interior check x2 = 1.9: dist 0.9849 -> rejected
+slice at x2 = 1.0: 1.00 blocked
+```
+
+Conflict-based search needs the time-expanded grid as a Chapter 6 `Graph`, and nothing else new:
+
+```rust title="crates/multi/src/cbs.rs" {30-46}
+use search::{astar, Graph, Edge};
+use search::grid::{Grid, GridIdx};
+
+pub struct Conflict { pub a: usize, pub b: usize, pub cell: GridIdx, pub t: u32, pub edge: Option<(GridIdx, GridIdx)> }
+pub struct Constraint { pub agent: usize, pub cell: GridIdx, pub t: u32, pub from: Option<GridIdx> }
+
+/// One agent's search space: (cell, time), five moves, minus what its constraints delete.
+struct TimedGrid<'g> { grid: &'g Grid, goal: GridIdx, vertex_ban: HashSet<(GridIdx, u32)>, edge_ban: HashSet<(GridIdx, GridIdx, u32)>, last_goal_ban: i64, horizon: u32 }
+
+impl<'g> Graph for TimedGrid<'g> {
+    type Node = (GridIdx, u32);          // t = u32::MAX marks "resting at the goal from here on"
+    fn neighbors(&self, &(cell, t): &Self::Node) -> Vec<Edge<Self::Node>> {
+        let mut out = Vec::new();
+        if cell == self.goal && t as i64 >= self.last_goal_ban { out.push(Edge { to: (cell, u32::MAX), cost: 0.0 }); }
+        if t >= self.horizon { return out; }
+        for nb in self.grid.moves_with_wait(cell) {
+            if self.vertex_ban.contains(&(nb, t + 1)) { continue; }
+            if nb != cell && self.edge_ban.contains(&(cell, nb, t + 1)) { continue; }
+            // A wait at the goal is free; everything else costs one time step.
+            let cost = if nb == self.goal && cell == self.goal { 0.0 } else { 1.0 };
+            out.push(Edge { to: (nb, t + 1), cost });
+        }
+        out
+    }
+}
+
+pub struct CtNode { pub constraints: Vec<Constraint>, pub paths: Vec<Vec<GridIdx>>, pub cost: u32 }
+
+pub struct Cbs<'g> { grid: &'g Grid, pub expansions: u64, pub low_level_expansions: u64 }
+
+impl<'g> Cbs<'g> {
+    /// Sharon et al., Algorithm 1: best-first on SIC over a binary constraint tree.
+    pub fn solve(&mut self, starts: &[GridIdx], goals: &[GridIdx]) -> Option<Vec<Vec<GridIdx>>> {
+        let mut open = BinaryHeap::new();
+        open.push(self.root(starts, goals)?);
+        while let Some(n) = open.pop() {
+            self.expansions += 1;
+            let Some(c) = first_conflict(&n.paths) else { return Some(n.paths) };
+            for (agent, constraint) in split(&c) {
+                let mut cs = n.constraints.clone(); cs.push(constraint);
+                // Re-plan only the constrained agent; inherit every other path verbatim.
+                let own: Vec<_> = cs.iter().filter(|k| k.agent == agent).collect();
+                if let Some(path) = self.low_level(starts[agent], goals[agent], &own) {
+                    let mut paths = n.paths.clone(); paths[agent] = path;
+                    let cost = sic(&paths, goals);
+                    open.push(CtNode { constraints: cs, paths, cost });
+                }
+            }
+        }
+        None
+    }
+}
+```
+
+The manipulation graph and the propagation trait are the two remaining types; the first is a
+`petgraph::UnGraph` over `(placement, grasp)`, the second is as small as the preview allows:
+
+```rust title="crates/multi/src/manip.rs · src/propagate.rs"
+pub enum Mode { Transit { placement: usize }, Transfer { grasp: usize } }
+
+pub struct Grasp { pub alpha: f64 }      // the puck's bearing in the hand frame
+pub struct Placement { pub x: f64, pub y: f64 }
+
+impl PuckArm {
+    /// c_g(q): the held puck is a rigid transform of the hand.
+    pub fn held_center(&self, q: &T2, g: &Grasp) -> Point2 {
+        let tip = self.arm.tip(q); let h = self.arm.tip_heading(q) + g.alpha;
+        Point2::new(tip.x + self.hold * h.cos(), tip.y + self.hold * h.sin())
+    }
+    /// Grasp configurations at (p, g): Chapter 2's IK on a virtual arm whose last link is
+    /// link 2 extended by the hold offset, so that the virtual tip is the puck's center.
+    pub fn grasp_configs(&self, p: &Placement, g: &Grasp) -> Vec<T2> {
+        let w = Vector2::new(self.arm.l[1] + self.hold * g.alpha.cos(), self.hold * g.alpha.sin());
+        let virt = self.arm.with_lengths([self.arm.l[0], w.norm()]);
+        virt.ik(p.into()).into_iter().flatten().map(|(t1, t2)| T2::new(t1, t2 - w.y.atan2(w.x))).collect()
+    }
+}
+
+/// MG: nodes (p, g, ik branch); edges transit (same p) or transfer (same g), each with a FuzzyPRM belief.
+pub struct ManipulationGraph { pub g: UnGraph<MgNode, MgEdge>, pub start: NodeIndex, pub goals: Vec<NodeIndex> }
+
+/// PREVIEW (Chapter 21 owns the full version). A simulator step; Hitch's Chapter 2 kinematic
+/// update implements it as a black box. Nothing about the dynamics is derived or inspected here.
+pub trait Propagate<M: Manifold> {
+    type Control;
+    fn propagate(&self, q: &M::Point, u: &Self::Control, dt: f64) -> M::Point;
+}
+
+impl Propagate<SE2> for Hitch {
+    type Control = CarCmd;
+    fn propagate(&self, q: &Pose2, u: &CarCmd, dt: f64) -> Pose2 { self.step(&HitchCfg { body: *q, trailer: None }, u, dt).body }
+}
+
+pub struct KinoRrtPreview<M: Chart, P: Propagate<M>> {
+    pub tree: Tree<M>, pub sim: P, pub controls: Vec<Option<P::Control>>, pub k: usize, pub dt: f64, pub rng: SmallRng,
+}
+
+impl<M: Chart, P: Propagate<M>> KinoRrtPreview<M, P> {
+    /// Sample q_rand; nearest; sample k controls; propagate each in substeps, checking every state;
+    /// keep the free result closest to q_rand (LaValle & Kuffner's rule). No Steer, no Extend.
+    pub fn extend_once(&mut self, free: &mut dyn FreeSpace<M>, sample_u: &mut dyn FnMut(&mut SmallRng) -> P::Control) -> Option<NodeId> {
+        let q_rand = self.tree.space.sample(&mut self.rng);
+        let (near, _) = self.tree.nearest(&q_rand);
+        let mut best: Option<(P::Control, M::Point, f64)> = None;
+        for _ in 0..self.k {
+            let u = sample_u(&mut self.rng);
+            let Some(q) = self.propagate_checked(free, &self.tree.q(near), &u) else { continue };
+            let d = self.tree.space.dist(&q, &q_rand);
+            if best.as_ref().map_or(true, |b| d < b.2) { best = Some((u, q, d)); }
+        }
+        let (u, q, _) = best?;
+        let id = self.tree.add(q, near);
+        self.controls.push(Some(u));
+        Some(id)
+    }
+}
+```
+
+`cargo run --example three_rustys -p multi` runs prioritized planning in both orders, coupled PRM on
+`Product<R2, 3>` and CBS on the inflated Apartment grid, printing success, makespan, SIC and check
+counts as a snapshot test at seed 14; `hitch_no_steer` grows `KinoRrtPreview` in the Lot and asserts
+the goal region within 4 000 iterations. The TypeScript checks behind this page do the same: on seed
+14 the forward-propagated tree reaches the Lot goal at iteration 63 with 63 nodes after 504
+propagations, 140 of them wasted on a collision; the path has 14 nodes, and re-running its 13 stored controls through
+`Hitch.step` reproduces every one of them to the last bit, all 66 simulator states are free, and the
+chord-versus-mean-heading mismatch of every edge is zero to machine precision — the signature of an
+exact arc.
+
+## Putting it together: three ways to pay
+
+<Deferred minHeight={820}>
+  <HitchNoSteer />
+</Deferred>
+
+The integration lab is the three widgets above read side by side, with the bills totted up.
+
+**Three Rustys.** In the swap corridor, prioritized planning fails in both orders at a cost of about
+3 000 configuration–time RRT iterations each; the decoupled coordinator fails in one grid search over
+a $48 \times 48$ diagram; CBS on the grid version succeeds with a sum of costs of 15 after 12
+constraint-tree expansions and 23 nodes, each expansion two time-expanded A\* searches; the brute-force
+joint A\* agrees on 15 after 19 expansions and 138 joint successors — cheap for two agents, and on the
+three-agent room already 1412 successors against CBS's three nodes. The coupled RRT-Connect in
+$(\mathbb R^2)^2$ succeeds at 2562 attempts and 3278 composite checks. Every one of those numbers is
+produced by the code behind the page and pinned by a check.
+
+**Reach and the puck.** Seven edges in the manipulation graph, four verified, 218 collision checks
+at the lower level, one upper-level round. Switch the eager toggle in w14.2 and every edge is planned
+whether or not it is needed — Exercise 4 asks you to count.
+
+**Hitch without a steer.** The preview above. One control per extension and the tree wanders;
+twenty and most propagations are thrown away; eight is the default because that is where, on the
+seeds tried, the time to the goal region stopped improving. The grey ghost is Chapter 12's RRT on
+SE(2) pretending $\theta$ is a coordinate like any other: it reaches the goal too, along a path that
+slides sideways by several radians in total. A car cannot execute it. The blue tree's path it can,
+because every edge *was* an execution. This is as far as the chapter goes: the simulator is a black
+box, and [Chapter 21](/chapters/ch21-nonholonomic-ii) opens it.
+
+### OMPL and MoveIt
+
+Everything in Part III is infrastructure in two systems you will meet in practice. The Open Motion
+Planning Library (Şucan, Moll and Kavraki 2012) is the sampling-based core; MoveIt (Coleman, Şucan,
+Chitta and Correll 2014) wraps it with a planning scene, kinematics plugins and request adapters for
+manipulators. The mapping onto this book's traits is interface-level and worth having in one place:
+
+| OMPL | this book | chapter |
+|---|---|---|
+| `StateSpace`, `CompoundStateSpace` | `Manifold`, `Product` / `CompositeSpace` | 5, 14 |
+| `StateSampler` | `Sampler` | 11 |
+| `StateValidityChecker` | `FreeSpace` over a `Collision` | 2, 11 |
+| `MotionValidator` | `Steer` + `EdgeCheck` | 11 |
+| `Planner`: `PRM`, `RRT`, `RRTConnect`, `EST`, `SBL`, `KPIECE1`, `RRTstar`, `PRMstar`, `InformedRRTstar`, `BITstar`, `FMT` | `Prm`, `Rrt`, `RrtConnect`, `Est`, `Sbl`, `Kpiece`, `RrtStar`, `PrmStar`, `InformedRrtStar`, `Bit`, `Fmt` | 11–13 |
+| `control::SpaceInformation`, `StatePropagator` | `Propagate` (preview) | 14, 21 |
+| MoveIt `PlanningScene`, `RobotModel`, `CollisionDetection` | `Scene`, `Reach`/`Hitch`, `Collision` | 2 |
+| MoveIt `PlanningRequestAdapter` chain (fix start state, shortcut, time-parametrize) | `shortcutGreedy`; Chapter 18's time scaling | 11, 18 |
+
+The point of the table is not that the names line up; it is that nothing in those systems is a
+different *kind* of thing from what this book has built, body by body. The capstone's stack is
+mapped onto OMPL, MoveIt and Nav2 through this table in [Chapter 23](/chapters/ch23-capstone).
+
+### Where §7.5.4–7.5.6 went
+
+<Deferred minHeight={420}>
+  <PointerBox />
+</Deferred>
+
+Choset's remaining three subsections — assembly planning, flexible objects, biological applications —
+are each a configuration space with a different shape under the same machinery: one subassembly as
+the robot and the rest as the workspace; a deformable body with an energy threshold standing in for
+a free-space predicate; a molecule as a tree-like articulated robot with dihedral angles as joints.
+The pointer box above condenses each to a paragraph. Nonprehensile manipulation — parts feeding,
+squeeze grasps, programmable vector fields, the $2n - 1$ squeezes that orient any polygonal part —
+and the NonDirectional Blocking Graph are mentioned in those paragraphs and taught nowhere in this
+book. Parallel SRT, which Choset notes plans for many robots by prioritizing each roadmap edge and
+centralizing its endpoints, is a sentence here and an exercise in Chapter 12.
+
+Part IV begins with the assumption every chapter so far has made in silence: that the robot knows
+where it is.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Which C-obstacle dominates">
+    Two unit-radius discs translate in $[0, 10]^2$ each, so $\Q = [0, 10]^4$. Compute the
+    four-dimensional measure of $\QO_{12} \cap [0,10]^4$ exactly (hint: it is the measure of the set of
+    pairs of centers within distance 2, which is $\int\!\!\int$ of the area of a disc of radius 2 clipped
+    to the square — bound it above and below first), and compare it with the measure of $\QO_1^{\W}$ for a
+    $1 \times 1$ pillar, lifted to $\Q$. Then let the number of discs grow to $m$ and say which family of
+    obstacles dominates the measure of $\Q \setminus \Qfree$, and why the answer is the same statement
+    as "pair checks grow like $m^2$."
+    <CheckAnswer id="ch14.e1" prompt="Ignoring the clipping at the square's edges, what fraction of [0,10]⁴ does 𝒬𝒪₁₂ occupy? (Area of a disc of radius 2 over the area of the square.)" answer={0.1257} tolerance={0.005}>
+    $\pi \cdot 2^2 / 100 = 0.1257$: for every position of disc 1, disc 2's center must avoid a disc of
+    radius $2$, which is $4\pi$ of the $100$ available. The lifted pillar, inflated by the unit radius to
+    a $3 \times 3$ square, removes $9/100 = 0.09$ for *each* disc. With $m$ discs there are $m$ lifted
+    pillars and $\binom m2$ pair cylinders; the pairs dominate from $m = 3$ on.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="F" difficulty={3} title="CBS never prunes a solution">
+    Prove Step 5 of the CBS derivation with edge conflicts included: for an edge conflict in which
+    $a_i$ traverses $u \to v$ and $a_j$ traverses $v \to u$ between $t - 1$ and $t$, show that every
+    conflict-free solution consistent with the parent is consistent with at least one of the two
+    children. Then construct a two-agent instance whose solution lies at depth $\ge 3$ in the
+    constraint tree — three constraints before the first conflict-free node — and verify your depth with
+    the `Cbs` class's `solve().depth`.
+    <Hints>
+      <>A conflict-free solution cannot have both agents traverse the same arc in opposite directions at the same time, so at least one of the two arc constraints holds for it.</>
+      <>For depth 3: a corridor where two agents must swap and the only passing place is two cells away from where they first meet, so the first constraint merely shifts the conflict by one step.</>
+      <>The swap corridor of this chapter solves at depth 4 on seed-independent CBS (it is deterministic); shorten the corridor on one side and watch the depth change.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the width at which both orders fail">
+    <Predict
+      id="ch14.e3"
+      question="In w14.1 at 3.2 radii of corridor width both prioritized orders fail. Widen the corridor. Before dragging: at what width do both orders start to succeed, and what happens to the coordination diagram's band there?"
+      options={[
+        { label: 'At exactly 4 radii; the band disappears entirely', because: 'At 4 radii the discs can just pass each other — but only along one line, and a time-expanded RRT must find that line. The band thins but does not vanish until the robots have room to spare: the diagram is built from the two axis paths, which still overlap at s₁ + s₂ = 1 whenever the robots are on the same line.' },
+        { label: 'Somewhat above 4 radii; the band stays as long as both paths are the axis', correct: true, because: 'Right. The prioritized planner needs room to sidestep in configuration–time space, which it finds reliably a little above 4 radii. The coordination diagram, however, is computed from the two paths planned alone — both the corridor axis — so its band is unchanged by width; decoupling fails at every width until the alone-paths themselves differ.' },
+        { label: 'Never: the alcove is the only passing place', because: 'The alcove is the only passing place below 4 radii. Above it the corridor itself is wide enough for two discs side by side.' },
+      ]}
+    >
+    Verify, then note the asymmetry: a planner that can change *paths* (prioritized, coupled) is
+    helped by width; one that can only change *velocities* (decoupled) is not, as long as its first
+    stage keeps returning the same two paths.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Minimum grasps, and the price of eagerness">
+    <Predict
+      id="ch14.e4"
+      question="In w14.2 with |𝒢| = 1 the manipulation graph is disconnected. What is the minimum |𝒢| that connects it with placement C enabled, and through which node does the path pass?"
+      options={[
+        { label: '|𝒢| = 2, regrasping at C from the front grasp to the left grasp', correct: true, because: 'A, 2.1 m from the base, is reachable only by grasps that hold the puck ahead of the forearm (of the first two, only the front grasp); B, behind the bar, only by a side grasp. No single grasp works at both, so one transfer cannot do it; with front and left the plan carries the puck to C, releases, and regrasps from the left.' },
+        { label: '|𝒢| = 2, a single transfer from A to B', because: 'No single grasp is feasible at both A and B: the grasps that reach A hold the puck ahead of the forearm, and exactly those are blocked by the bar at B.' },
+        { label: '|𝒢| = 3 — the right grasp is needed too', because: 'The right grasp also works at B, but the left one already does; the third grasp adds nodes and edges without changing connectivity.' },
+      ]}
+    >
+    Now switch the eager toggle on and read the verified-edges counter: every edge of $MG$ is planned,
+    including the ones no path uses. Record the ratio of collision checks eager/lazy at $|\mathcal G| = 2$
+    and again at $|\mathcal G| = 6$, where $MG$ has 45 edges.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="One robot at a time">
+    Implement Choset's one-robot-at-a-time extension (§7.5.2, after [C ref. 14]) as an `Extend`
+    implementation on `Product<R2, N>`: move robot 1 toward its target and check it against the
+    obstacles; then robot 2, checked against the obstacles *and* robot 1's new position; and so on,
+    re-sampling a robot's target when it collides. Compare its coupled-RRT success rate at a fixed
+    budget with the componentwise `extend` of Chapter 12 over 50 seeds in a four-Rusty Apartment, and
+    report the mean number of configurations "close to obstacles" that Choset says the plain extension
+    produces.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Makespan CBS against coupled A*">
+    Add a makespan objective to `Cbs` — the high level keyed on $\max_i \mathrm{cost}_i$ rather than the
+    sum — keeping edge conflicts, and prove or refute that the first conflict-free node popped is still
+    optimal (the sum argument used integrality and monotonicity; check both). Benchmark CBS under both
+    objectives against `jointAStar` on the inflated Apartment grid with 3 to 6 agents, plotting
+    constraint-tree expansions and joint successors generated against the number of agents, and mark
+    the agent count at which the joint search stops finishing.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Sharon, G., Stern, R., Felner, A., and Sturtevant, N. R."
+    year={2015}
+    title="Conflict-Based Search for Optimal Multi-Agent Pathfinding"
+    venue="Artificial Intelligence 219, 40–66"
+    doi="10.1016/j.artint.2014.11.006"
+    note="CBS as this chapter states and proves it: the two-level search, vertex and edge conflicts, the constraint tree, and the optimality argument of Derivation 3."
+  />
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="§7.5: control-based planning, centralized/decoupled/prioritized multi-robot planning with its incompleteness remark and the one-robot-at-a-time extension [ref. 14], transit/transfer manipulation with the two-level FuzzyPRM of Nielsen and Kavraki [ref. 335] and aSyMov [ref. 170], and the velocity coordination of Kant and Zucker [ref. 219]; the epigraph is from §7.5.2."
+  />
+  <Reference
+    authors="LaValle, S. M. and Kuffner, J. J."
+    year={2001}
+    title="Randomized Kinodynamic Planning"
+    venue="International Journal of Robotics Research 20(5), 378–400"
+    doi="10.1177/02783640122067453"
+    note="The forward-propagated RRT of the preview — sample controls, integrate, keep the result closest to the random state — in its original kinodynamic setting; Chapter 21 returns to it in full."
+  />
+  <Reference
+    authors="Kuffner, J. J. and LaValle, S. M."
+    year={2000}
+    title="RRT-Connect: An Efficient Approach to Single-Query Path Planning"
+    venue="IEEE International Conference on Robotics and Automation"
+    doi="10.1109/ROBOT.2000.844730"
+    note="The bidirectional planner the coupled lab and the manipulation planner's lower level run unchanged on the composite space and on each mode's torus."
+  />
+  <Reference
+    authors="Kavraki, L. E., Švestka, P., Latombe, J.-C., and Overmars, M. H."
+    year={1996}
+    title="Probabilistic Roadmaps for Path Planning in High-Dimensional Configuration Spaces"
+    venue="IEEE Transactions on Robotics and Automation 12(4), 566–580"
+    doi="10.1109/70.508439"
+    note="The roadmap whose two-level, lazily verified descendant plans the manipulation graph's edges, and whose sample-count bound Derivation 1 reads with d = Σ dᵢ."
+  />
+  <Reference
+    authors="Garrett, C. R., Chitnis, R., Holladay, R., Kim, B., Silver, T., Kaelbling, L. P., and Lozano-Pérez, T."
+    year={2021}
+    title="Integrated Task and Motion Planning"
+    venue="Annual Review of Control, Robotics, and Autonomous Systems 4, 265–293"
+    url="https://arxiv.org/abs/2010.01083"
+    note="The task-and-motion view that generalizes the manipulation graph: symbolic actions as modes, continuous parameters as grasps and placements, interleaved discrete and continuous search."
+  />
+  <Reference
+    authors="Şucan, I. A., Moll, M., and Kavraki, L. E."
+    year={2012}
+    title="The Open Motion Planning Library"
+    venue="IEEE Robotics and Automation Magazine 19(4), 72–82"
+    doi="10.1109/MRA.2012.2205651"
+    note="The system in which Part III is infrastructure; the interface mapping StateSpace ↔ Manifold, StateSampler ↔ Sampler, MotionValidator ↔ Steer, Planner ↔ Prm/Rrt/RrtStar is drawn from its design."
+  />
+  <Reference
+    authors="Coleman, D., Şucan, I. A., Chitta, S., and Correll, N."
+    year={2014}
+    title="Reducing the Barrier to Entry of Complex Robotic Software: a MoveIt! Case Study"
+    venue="Journal of Software Engineering for Robotics 5(1)"
+    url="https://arxiv.org/abs/1404.3785"
+    note="MoveIt as the planning scene, kinematics plugins and request adapters around OMPL — the manipulation-side half of the systems table."
+  />
+</References>

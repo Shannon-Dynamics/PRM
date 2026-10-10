@@ -1,0 +1,210 @@
+% =============================================================================
+%  Principles of Robot Motion via Rust — The FCP Way
+%  Print edition, in the Shannon Robotics design language.
+%
+%  Build:  make        (or: pdflatex main.tex, three times)
+% =============================================================================
+\documentclass[11pt, twoside, openright]{book}
+
+\usepackage[
+  paperwidth=7in, paperheight=10in,
+  inner=0.95in, outer=0.75in, top=0.85in, bottom=0.95in,
+  headsep=16pt, footskip=28pt
+]{geometry}
+
+\usepackage{shannon}
+
+\hypersetup{
+  pdftitle={Principles of Robot Motion via Rust --- The FCP Way},
+  pdfauthor={Shannon Robotics},
+  pdfsubject={Robot motion planning, configuration space, sampling-based planning, nonholonomic systems, Rust},
+  colorlinks=true,
+  linkcolor=shAccent,
+  urlcolor=shSkyDark,
+  citecolor=shAccent
+}
+
+\begin{document}
+
+% =============================================================================
+%  Front matter
+% =============================================================================
+\frontmatter
+\pagestyle{empty}
+
+\begin{titlepage}
+\thispagestyle{empty}
+\noindent
+{\color{shTeal}\rule{\textwidth}{3pt}}
+\vspace{2.2in}
+
+\noindent
+{\displayfont\fontsize{10}{12}\selectfont\color{shTealDark}%
+ \MakeUppercase{Shannon Robotics}}
+
+\vspace{10pt}
+\noindent
+{\displayfont\bfseries\fontsize{30}{35}\selectfont\color{shInk}%
+ Principles of\\Robot Motion\\via Rust}
+
+\vspace{12pt}
+\noindent
+{\displayfont\fontsize{16}{20}\selectfont\color{shInkMuted}%
+ The FCP Way}
+
+\vspace{20pt}
+\noindent
+{\color{shSlate300}\rule{2.4in}{0.6pt}}
+
+\vspace{16pt}
+\noindent
+\begin{minipage}{4.2in}
+{\fontsize{11}{15}\selectfont\color{shInkSecondary}%
+ Complete mathematical foundations, interactive intuition, and working
+ implementations in Rust --- for robots that know where they are and must
+ decide how to move.}
+\end{minipage}
+
+\vfill
+\noindent
+{\displayfont\fontsize{9}{12}\selectfont\color{shInkMuted}%
+ Foundation \ \textperiodcentered\ \ Conceptual \ \textperiodcentered\ \ Practical}
+
+\vspace{6pt}
+\noindent
+{\color{shTeal}\rule{\textwidth}{3pt}}
+\end{titlepage}
+
+% ----- Colophon --------------------------------------------------------------
+\cleardoublepage
+\thispagestyle{empty}
+\vspace*{\fill}
+\noindent
+{\fontsize{9}{13}\selectfont\color{shInkSecondary}
+\textbf{Principles of Robot Motion via Rust --- The FCP Way}\par
+\vspace{5pt}
+Print edition, generated from the interactive web edition.\par
+\vspace{9pt}
+This book takes Choset, Lynch, Hutchinson, Kantor, Burgard, Kavraki and Thrun's
+\emph{Principles of Robot Motion} as its spine and brings it forward:
+asymptotically optimal sampling-based planners, trajectory optimization and
+model predictive control, multi-robot and manipulation planning, learning inside
+the planning loop, and an integrated planning stack. It is the sister volume of
+\emph{Probabilistic Robotics via Rust}, with which it shares its robot, its
+simulator and its method; estimation is treated here only as far as a planner
+needs it, and cross-referenced there for the rest.\par
+\vspace{9pt}
+Every chapter of the web edition carries interactive simulations that run the
+same algorithms the text derives. In this print edition each appears as a
+described figure with its widget identifier, so the two editions can be read
+side by side.\par
+\vspace{9pt}
+{\color{shInkMuted}Set in Space Grotesk and a Palatino-class serif.
+Composed with \LaTeX.}\par}
+\vspace*{\fill}
+
+% ----- How to read this book -------------------------------------------------
+\cleardoublepage
+\pagestyle{fancy}
+\chapter*{How to read this book}
+\addcontentsline{toc}{chapter}{How to read this book}
+
+Every chapter makes three passes over its subject, and they are meant to be read
+in this order.
+
+\textbf{Conceptual} comes first, because intuition should precede formalism. In
+the web edition you meet an interactive figure before you meet an equation; here
+that figure is described, and the description tells you what it would show you.
+
+\textbf{Foundation} is the mathematics, in full. Definitions are precise,
+assumptions are stated where they are made rather than buried, and derivations
+are carried to the end. Long algebra sits in marked derivation blocks, so you
+can take the result on faith the first time through and come back for the proof
+later.
+
+\textbf{Practical} is the Rust. Not pseudocode dressed up as code: real types,
+real crates, code you could lift into a robot.
+
+\section*{The running lab}
+
+Three robots and three worlds recur throughout, so that every new method can be
+compared against the last on identical ground. \shrobotname{Rusty} is a
+differential-drive rover with a range sensor --- the same robot as in the sister
+volume --- and lives in the \textbf{Apartment}, a 2-D floorplan with rooms,
+doorways and a long corridor; for most of Parts~I--IV it is treated as a disc.
+\shrobotname{Reach} is a planar two-link arm (with a three-link variant) working
+at the \textbf{Workbench}, a table with polygonal obstacles; its configuration
+space is a torus, which is why it appears whenever topology matters, and its
+dynamics carry Part~V. \shrobotname{Hitch} is a car-like robot that can pull a
+trailer and lives in the \textbf{Lot}; it cannot move sideways, which is the
+whole subject of Chapters~20 and~21. All three are built in Chapter~2 and act
+together in Chapter~23.
+
+\section*{Colour carries meaning}
+
+One convention runs through the prose, the equations, the figures and the code
+comments alike. It is worth internalising before you start:
+
+\shplanningkey
+
+\noindent
+Green is always where you start and red is always where you want to be. Slate is
+a thing in the world; amber is the set of configurations that would make the
+robot touch it. Blue is what a planner has explored --- a roadmap, a tree, a
+wavefront. Purple is the path it chose. Orange is the robot itself and the
+trajectory it actually executed. Where a belief appears (Chapters~15--16 and the
+capstone) the sister volume's five estimation colours are used unchanged:
+
+\shcolorkey
+
+\noindent
+The teal used for chapter furniture is deliberately outside both sets, so it can
+never be mistaken for data.
+
+% ----- Contents --------------------------------------------------------------
+\cleardoublepage
+\setcounter{tocdepth}{0}
+\renewcommand{\contentsname}{Contents}
+\tableofcontents
+
+% =============================================================================
+%  Main matter
+% =============================================================================
+\mainmatter
+
+\part{Foundations: Robots, Worlds, and Configuration Space}
+\input{chapters/ch01}
+\input{chapters/ch02}
+\input{chapters/ch03}
+\input{chapters/ch04}
+\input{chapters/ch05}
+
+\part{Classical Planners: Search, Potentials, Roadmaps, Cells}
+\input{chapters/ch06}
+\input{chapters/ch07}
+\input{chapters/ch08}
+\input{chapters/ch09}
+\input{chapters/ch10}
+
+\part{Sampling-Based Planning}
+\input{chapters/ch11}
+\input{chapters/ch12}
+\input{chapters/ch13}
+\input{chapters/ch14}
+
+\part{Planning with Uncertainty}
+\input{chapters/ch15}
+\input{chapters/ch16}
+
+\part{Dynamics, Trajectories, and Constraints}
+\input{chapters/ch17}
+\input{chapters/ch18}
+\input{chapters/ch19}
+\input{chapters/ch20}
+\input{chapters/ch21}
+
+\part{Frontiers and Integration}
+\input{chapters/ch22}
+\input{chapters/ch23}
+
+\end{document}

@@ -1,0 +1,988 @@
+---
+title: Trajectory Optimization and MPC
+description: Once a trajectory is a vector of numbers, planning becomes descending a cost. Pontryagin's minimum principle and Choset's transcription are the root; CHOMP's covariant gradient on a distance field, STOMP's seeded rollouts, TrajOpt's sequential convexification, iLQR's backward value recursion and the receding-horizon loop are five modern answers — all local, all honest about it.
+chapter: 19
+part: PART V
+partTitle: Dynamics, Trajectories, and Constraints
+difficulty: Advanced
+readingTime: 75 min
+quote: Since nonlinear optimization uses local gradient information, it will converge to a locally optimal solution. For some problems, the control parameter space will be littered with many local optima. Therefore, the solution achieved will depend heavily on the initial guess.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §11.3.2
+---
+
+import { BeforeAfterHook } from '@/components/ch/ch19/before-after-hook';
+import { ChompSmoother } from '@/components/ch/ch19/chomp-smoother';
+import { IlqrBackwardPass } from '@/components/ch/ch19/ilqr-backward-pass';
+import { MpcHorizon } from '@/components/ch/ch19/mpc-horizon';
+import { OptimizerFamilyMap } from '@/components/ch/ch19/optimizer-family-map';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'State Pontryagin\'s minimum principle, derive the min-effort double integrator\'s u(t) = 6d/t_f² − 12d t/t_f³ and recover Chapter 18\'s bang-bang result from the same Hamiltonian',
+    'Transcribe an optimal-control problem to a nonlinear program the three ways Choset lists, and name their modern descendants: collocation (CHOMP), shooting (iLQR), full collocation (TrajOpt)',
+    'Derive CHOMP\'s covariant functional gradient, say why A⁻¹ spreads a push along the whole path, find the step bound η > ½(1 + (λ/ε)/λ_min(A)) that keeps it from oscillating, and compute the micro-example\'s equilibrium clearance (λ − 1)/(2(1 + λ))',
+    'Run the iLQR backward pass as a quadratic value recursion with a feedback policy, verify that on a linear-quadratic problem it is the Riccati recursion, and add DDP\'s second-order terms',
+    'Close the loop as MPC, and show why a terminal cost-to-go from Chapter 6 — not a longer horizon — is what cures receding-horizon myopia',
+    'Implement the trajopt crate: a shared Gauss–Newton/Levenberg–Marquardt optimizer that Chapter 21 imports, chomp, stomp, sco, ilqr and mpc, each checked against a closed form or an invariant',
+  ]}
+  prerequisites={[
+    'Distance fields and the Jᵀ lift of workspace forces to joint torques (Chapter 7); body-point Jacobians (Chapter 4)',
+    'Best-first search and the wave-front cost-to-go (Chapter 6); RRT paths and shortcutting (Chapters 12–13)',
+    'The standard form of dynamics and its RK4 integrator (Chapter 17); time scaling and the Trajectory type (Chapter 18)',
+    'Multivariable calculus: gradients, Hessians, Lagrange multipliers; one linear-algebra fact — a tridiagonal system solves in O(N)',
+  ]}
+>
+[Chapter 18](/chapters/ch18-trajectory-planning) fixed the path and optimized the clock. This chapter
+lets the path move too, and discovers that once a trajectory is a vector of numbers, "planning"
+becomes "descend a cost". Choset gave this two pages of optimal control and three of nonlinear
+programming, with the warning quoted above. Twenty years later that warning is the whole discipline:
+CHOMP, STOMP, TrajOpt, iLQR and model predictive control are five answers to *which* descent, in
+*which* metric, with obstacles as *cost* or as *constraint*.
+
+The idea the chapter unpacks is this. **A trajectory optimizer is a local planner with a global
+vocabulary.** It polishes the homotopy class it is handed — brilliantly: smoother, shorter,
+dynamically feasible, closed-loop — and it never changes its mind. Hand it the other side of the
+obstacle and it will polish that instead. So the pipeline [Chapter 23](/chapters/ch23-capstone) ships
+keeps Part III's sampling planners for the global decision and uses this chapter's machinery to make
+that decision fast, smooth and safe.
+
+Every method here is *local*, and the prose never says "optimal" without "locally". CHOMP's obstacle
+term is a cost, so a collision can survive convergence, and the widget shows it when it happens. Our
+`sco` is a recipe in TrajOpt's shape, not TrajOpt's QP-based solver, and says so. iLQR needs a
+regularization and a line search, and the defaults are stated. MPC's stability through a terminal
+Lyapunov cost is a pointer, not a theorem proved.
+</Overview>
+
+## The problem: a jagged path, polished
+
+Take a Chapter 12 RRT path for Reach on the Workbench, seeded, fourteen nodes from the home pose to
+the far side of the block. Shortcut it with Chapter 13's greedy shortcutter — three waypoints survive
+— resample to twenty-four, and run forty CHOMP steps against the Chapter 7 distance field of the
+block. Then hand both the original and the polished path to Chapter 18's time scaler on a horizontal
+Workbench with the same motors.
+
+<Figure caption="Left: the RRT path, time-scaled, 1.803 s. Right: after shortcutting and forty CHOMP iterations, time-scaled, 0.992 s. Same arm, same start and goal, same |τ| ≤ (20, 12) N·m; the smoothed path keeps 0.146 m of clearance from the block and executes in 55% of the time, because the time scaler is only as fast as the path's curvature lets it be.">
+  <BeforeAfterHook />
+</Figure>
+
+Nothing about the planner's global decision changed: both paths go around the block the same way.
+What changed is everything the sampling planner never cared about — curvature, clearance, and
+therefore the clock. The question of this chapter is how to make that change deliberately, and what
+"deliberately" cannot do.
+
+## Building intuition
+
+### A rubber band in a force field
+
+Think of the discretized trajectory $\xi = (q_1, \dots, q_{N-1})$ as a chain of beads on a rubber
+band with its ends pinned at $q_0$ and $q_N$. Smoothness pulls each bead toward the midpoint of its
+neighbours. The obstacle term is a force field: zero beyond a margin $\epsilon$ from the nearest
+obstacle, growing as a bead approaches, pushing straight out along $\nabla D$. CHOMP is what the
+band does when you let go — with one twist that makes it work on robots: a push on one bead is
+spread along the whole band by $A^{-1}$, so the band translates and bends instead of growing a kink
+where it was touched.
+
+<Deferred minHeight={600}>
+  <ChompSmoother />
+</Deferred>
+
+Three things to notice, each of which becomes a theorem below.
+
+**The step size has a stability bound, and it grows with the path's length.** Slide $\eta$ down and
+the band oscillates — on the micro-example preset it flips between the disc's centre and the edge of
+the margin. The bound is $\eta > \tfrac12(1 + (\lambda/\epsilon)/\lambda_{\min}(A))$: for one free
+waypoint and $\epsilon = \tfrac12$ it is $(1 + \lambda)/2$; for twenty waypoints it is about $90$,
+because $A^{-1}$ amplifies a low-frequency push by $(m+1)^2/\pi^2$. Above the bound, the step that
+is right for a short path crawls on a long one.
+
+**The answer depends on the initial path.** The two initial paths on the Workbench start in
+different homotopy classes around the block. CHOMP lowers the cost of both and they end $1.98$ rad
+apart at mid-path. From the straight chart line it converges — gradient at machine precision — with
+a body point still inside the block, at $D = -0.183$ m, and the badge says **converged in collision**.
+That is not a bug in the optimizer. The obstacle term is a cost; the smoothness term is a cost; the
+sum has a stationary point there, and a gradient method finds stationary points.
+
+**Clearance is bought with $\lambda$ and $\epsilon$, not asked for.** On the micro-example preset the
+single waypoint settles where $2y = \lambda(2 - 2y)$: at $y^* = \lambda/(1 + \lambda)$, clearance
+$D^* = (\lambda - 1)/(2(1 + \lambda))$ — zero at $\lambda = 1$, $1/6$ at $2$, $0.3$ at $4$. Raise
+$\lambda$ and the band stands further off; it never stands off by exactly what you need. The
+sequential-convex recipe later in the chapter is the method that does.
+
+<KeyIdea title="The one-sentence version">
+Every optimizer in this chapter minimizes a cost over a finite vector of trajectory parameters by
+local steps — first-order in some metric, second-order in a local model, or by sampling — and so
+every one of them converges to the nearest stationary point of the basin it started in. What they
+differ in is the metric, the model, and whether obstacles are a cost or a constraint.
+</KeyIdea>
+
+<NotationTable
+  rows={[
+    { sym: 'x = (q, \\dot q),\\; \\dot x = f(x, u)', meaning: 'State and state equation (Choset eq. 11.24).' },
+    { sym: 'J = \\int_0^{t_f} \\ell(x, u, t)\\,dt', meaning: 'Objective; ℓ is the running cost — Choset\'s optimal-control Lagrangian, renamed to avoid the dynamics L.' },
+    { sym: 'H = \\ell + \\lambda\\T f,\\; \\lambda(t)', meaning: 'Hamiltonian and costate (Lagrange multipliers for the state equation), eq. 11.26.' },
+    { sym: 'X', meaning: 'Finite parameter vector of the transcribed program (eq. 11.40).' },
+    { sym: '\\xi = (q_1, \\dots, q_{N-1})', meaning: 'Discretized trajectory with fixed endpoints q₀, q_N.' },
+    { sym: '\\mathsf{E},\\; A = \\mathsf{E}\\T\\mathsf{E},\\; \\mathcal{F}_{smooth} = \\tfrac12\\|\\mathsf{E}\\xi + e\\|^2', meaning: 'Finite-difference operator; the smoothness metric A = tridiag(−1, 2, −1); the smoothness functional.' },
+    { sym: 'c(d),\\; \\epsilon,\\; \\mathcal{F}_{obs},\\; \\lambda_{obs}', meaning: 'Obstacle cost of a distance, its margin, the obstacle functional, its weight.' },
+    { sym: '\\bar\\nabla\\mathcal{F} = A^{-1}\\nabla\\mathcal{F},\\; \\eta', meaning: 'Covariant gradient; the step is 1/η.' },
+    { sym: 'x_k, u_k;\\; f_x, f_u;\\; \\ell_x, \\ell_{xx}, \\dots', meaning: 'Discrete-time trajectory and its local derivatives.' },
+    { sym: 'V_k(x),\\; V_x, V_{xx};\\; Q_x, Q_u, Q_{xx}, Q_{uu}, Q_{ux}', meaning: 'Value function and its quadratic model; the action-value expansion at one stage.' },
+    { sym: 'k_k,\\; \\mathbf{K}_k,\\; \\mu,\\; \\alpha', meaning: 'Feedforward and feedback gains; regularization on Q_uu; line-search step.' },
+    { sym: 'sd(\\cdot),\\; \\hat n,\\; \\Delta,\\; \\mu_{pen};\\; N_h', meaning: 'Signed distance, contact normal, trust radius, penalty weight (TrajOpt); the MPC horizon.' },
+  ]}
+/>
+
+## The mathematics
+
+### Definitions
+
+**Direct trajectory planning** (Choset §11.3) searches the full state space for $(x(t), u(t))$
+jointly, rather than a path first and a clock second.
+
+**An extremal control** satisfies $\partial H/\partial u = 0$ along the trajectory — necessary, not
+sufficient; it is **locally optimal** if also $\partial^2 H/\partial u^2 > 0$ (the Legendre–Clebsch
+condition, eq. 11.29). A **singular optimal control** is extremal with $\partial^2 H/\partial u^2$
+only semidefinite: the min-time double integrator, and Chapter 18's zero-inertia arcs.
+
+**Transcription** replaces $(x(t), u(t))$ by a finite $X$ and the continuous constraints by finitely
+many checks at $j\Delta t$ (eqs. 11.40–11.45).
+
+**The covariant gradient** is steepest descent in the metric $A$: $\bar\nabla\mathcal{F} =
+A^{-1}\nabla\mathcal{F}$, the direction that most decreases $\mathcal{F}$ per unit of
+$\tfrac12\,\delta\xi\T A\,\delta\xi$ — a perturbation measured by how much it changes the *whole*
+path's smoothness, not by how far one bead moves.
+
+**Receding horizon (MPC).** Each tick, solve a horizon-$N_h$ problem from the measured state, apply
+the first control, discard the rest, repeat.
+
+### Pontryagin and the min-effort double integrator
+
+<KeyIdea title="Statement (Choset Example 11.3.1)">
+For $\ddot q = u$, $\ell = u^2$, rest to rest over distance $d$ in fixed $t_f$, the extremal control is
+$u(t) = 6d/t_f^2 - 12d\,t/t_f^3$, and it is a local minimum.
+</KeyIdea>
+
+<Derivation title="The minimum principle on the simplest system" result="u(t) = 6d/t_f^2 - 12d\,t/t_f^3,\quad \partial^2 H/\partial u^2 = 2 > 0">
+**Step 1 — the Hamiltonian.** With $x = (q, \dot q)$, $f = (x_2, u)$ and $\ell = u^2$:
+$H = u^2 + \lambda_1 x_2 + \lambda_2 u$ (eq. 11.26).
+
+**Step 2 — extremality.** $\partial H/\partial u = 2u + \lambda_2 = 0$, so $u = -\lambda_2/2$ (eq. 11.31).
+
+**Step 3 — the adjoint equation.** $\dot\lambda = -\partial H/\partial x$ gives $\dot\lambda_1 = 0$ and
+$\dot\lambda_2 = -\lambda_1$ (eq. 11.32): $\lambda_1$ is constant, $\lambda_2$ is affine in $t$, and
+therefore so is $u(t) = c_0 + c_1 t$.
+
+**Step 4 — the terminal conditions.** $x_2(t_f) = \int_0^{t_f} u\,dt = 0$ gives $c_0 t_f + c_1 t_f^2/2 = 0$;
+$x_1(t_f) = \int_0^{t_f}\!\int_0^t u = d$ gives $c_0 t_f^2/2 + c_1 t_f^3/6 = d$. Solving:
+$c_0 = 6d/t_f^2$, $c_1 = -12d/t_f^3$.
+
+**Step 5 — convexity.** $\partial^2 H/\partial u^2 = 2 > 0$: the extremal is a local minimum. The
+position is the cubic $q(t) = 3d(t/t_f)^2 - 2d(t/t_f)^3$ — the minimum-acceleration-energy profile every
+spline library rediscovers.
+
+**Discretized and solved numerically.** With $N = 100$ stages of $\Delta t = 0.01$, $\ell_k = u_k^2\Delta t$
+and a terminal weight of $10^6$ on $\|x_N - (1, 0)\|^2$, iLQR's first and only iteration returns
+$u_0 = 5.9405$ against Pontryagin's $6 - 12 \cdot 0.005 = 5.94$, with $\max_k |u_k - (6 - 12\,t_{k+1/2})|
+= 5.1 \times 10^{-4}$ and $x_N = (1, 0)$ to $10^{-4}$. One iteration, because the problem is
+linear-quadratic — the next derivation but one says why.
+</Derivation>
+
+### Minimum time is bang-bang, by the minimum principle
+
+<KeyIdea title="Statement (Choset §11.3.1)">
+With $\ell = 1$, $|u| \le u_{\max}$ and $t_f$ free, $u^* = -u_{\max}\,\mathrm{sign}(\lambda_2)$, with at most one switch.
+</KeyIdea>
+
+<Derivation title="Where the control set's boundary does the work" result="u^* = -u_{\max}\,\mathrm{sign}\,\lambda_2,\ \text{one switch at } t_s = \sqrt{d/u_{\max}}">
+**Step 1 — no $u$ in $\partial H/\partial u$.** $H = 1 + \lambda_1 x_2 + \lambda_2 u$ is affine in $u$;
+$\partial H/\partial u = \lambda_2$ says nothing about $u$, and $\partial^2 H/\partial u^2 = 0$, so
+Legendre–Clebsch is silent. The extremality condition 11.28 is useless here.
+
+**Step 2 — use the inequality instead.** The minimum principle 11.27 says $H^* \le H$ for every
+feasible $u$: $\lambda_2 u^* \le \lambda_2 u$ for all $|u| \le u_{\max}$.
+
+**Step 3 — so $u^*$ is at a bound.** If $\lambda_2 < 0$ the inequality forces $u^* = u_{\max}$; if
+$\lambda_2 > 0$, $u^* = -u_{\max}$. The control lives on the boundary of its set — bang-bang.
+
+**Step 4 — at most one switch.** $\lambda_2$ is affine in $t$ (same adjoint equation), so it changes
+sign at most once. Rest to rest over $d$: accelerate for $t_s$, brake for $t_s$, with $u_{\max}t_s^2 = d$,
+so $t_s = \sqrt{d/u_{\max}}$ — the $0.3963$ s of Chapter 18's micro-example read off a Hamiltonian
+instead of a phase plane.
+
+**Shooting.** When the extremality conditions cannot be solved by hand, guess $\lambda(0)$, integrate
+state and adjoint with $u$ from $\partial H/\partial u = 0$, compare $x(t_f)$ with the target, and
+correct the guess — typically by a Gauss–Newton step on the terminal miss. This is where the
+"initial guess" problem is first explicit, and `optim::lm` below is the corrector.
+</Derivation>
+
+### Transcription
+
+<KeyIdea title="Statement (Choset §11.3.2)">
+The program 11.33–11.39 becomes the finite program 11.40–11.45 once (a) $q(t)$, or (b) $u(t)$, or
+(c) both are parameterized and the inequality constraints are enforced at $k + 1$ points; (a) computes
+$u$ from the dynamics, (b) integrates them, (c) adds the dynamics as equality constraints.
+</KeyIdea>
+
+<Derivation title="Three ways to make a trajectory a vector" result="X \in \R^p;\ \min J(X)\ \text{s.t. } g(X) \le 0,\ h(X) = 0">
+**Step 1 — choose a basis.** Choset's list: polynomial coefficients, a truncated Fourier series, spline
+coefficients, wavelets, piecewise-constant accelerations or forces. The basis decides whether one
+parameter moves the whole trajectory or a finite support, which decides the conditioning of
+everything downstream.
+
+**Step 2 — sample the constraints.** Torque limits 11.42 and obstacle constraints 11.43 are checked at
+$j\Delta t$, $j = 0 \dots k$; endpoint conditions 11.44–11.45 are equalities on $X$.
+
+**Step 3 — hand it to a solver.** Sequential quadratic programming needs $J$, $g$, $h$ and their
+gradients, usually a Hessian approximation too, and all of it at least $C^1$ in $X$. Choset's two
+warnings are exactly the two the modern methods still trip on: smoothness in $X$, and local optima.
+
+**The modern names.** (a) is *state collocation*: CHOMP's $\xi$ is a sampled $q(t)$, and its
+smoothness functional is the acceleration energy the dynamics would charge. (b) is *direct
+shooting*: iLQR parameterizes $u_k$ and integrates $f$ to get $x_k$. (c) is *full collocation*:
+TrajOpt carries both and enforces the dynamics as equalities. Choset's penalty variant — constraints
+folded into the objective — is CHOMP's obstacle term and TrajOpt's outer loop.
+</Derivation>
+
+### CHOMP's covariant functional gradient
+
+<KeyIdea title="Statement (Ratliff et al. 2009; Zucker et al. 2013)">
+With $\mathcal{F} = \mathcal{F}_{smooth} + \lambda_{obs}\mathcal{F}_{obs}$, $\nabla\mathcal{F}_{smooth} = A\xi + b$,
+and for a body point $x(q, \beta)$ moving at $\|x'\|$ along the path
+<LinkedMath>
+$$
+\nabla_{q}\mathcal{F}_{obs} = \sum_\beta \htmlClass{term-robot}{J_\beta\T}\,\|x'\|\,\Big[(\mathbb{1} - \hat x'\hat x'\T)\,\htmlClass{term-cobstacle}{\nabla c} - c\,\kappa\Big],
+\qquad
+\xi \leftarrow \xi - \tfrac1\eta\,\htmlClass{term-path}{A^{-1}}\nabla\mathcal{F}.
+$$
+</LinkedMath>
+</KeyIdea>
+
+<Derivation title="Steepest descent in the smoothness metric" result="\xi \leftarrow \xi - \tfrac1\eta A^{-1}(A\xi + b + \lambda\nabla\mathcal{F}_{obs})">
+**Step 1 — the smoothness functional is a quadratic.** $\mathcal{F}_{smooth} = \tfrac12\sum_k\|q_{k+1} - q_k\|^2
+= \tfrac12\|\mathsf{E}\xi + e\|^2$ with $\mathsf{E}$ the finite-difference operator on the free
+waypoints and $e$ carrying the fixed ends. Its gradient is $A\xi + b$ with $A = \mathsf{E}\T\mathsf{E} =
+\mathrm{tridiag}(-1, 2, -1) \otimes \mathbb{1}$, i.e. $2q_k - q_{k-1} - q_{k+1}$ at each free waypoint.
+
+**Step 2 — the obstacle functional is an arc-length integral.** $\mathcal{F}_{obs} = \sum_\beta \int_0^1
+c(D(x_\beta(q(s))))\,\|x_\beta'\|\,ds$: cost per metre travelled by each body point, so retiming the
+path does not change it, and a longer path through cost costs more.
+
+**Step 3 — differentiate under the integral.** The variation of $c(D(x))\|x'\|$ with respect to the
+body point's path gives the Euler–Lagrange expression $\|x'\|\big[(\mathbb{1} - \hat x'\hat x'\T)\nabla c - c\,\kappa\big]$,
+with $\kappa = (\mathbb{1} - \hat x'\hat x'\T)x''/\|x'\|^2$ the path's curvature. The projection
+$(\mathbb{1} - \hat x'\hat x'\T)$ discards the component of $\nabla c$ along the path — pushing a
+bead *along* the band does nothing but retime it — and the curvature term says that where the cost is
+positive, straightening the path shortens the exposure.
+
+**Step 4 — pull back to joint space.** A workspace force $f$ at body point $\beta$ is the joint
+torque $J_\beta\T f$ — Chapter 7's §4.7 lift, Chapter 17's eq. 10.12, the same virtual-work identity
+every time. Summing over body points gives $\nabla_q\mathcal{F}_{obs}$ at each waypoint. The library
+uses Chapter 7's `controlPointJacobian` for $J_\beta$ unchanged.
+
+**Step 5 — the covariant step.** Minimize the first-order model $\mathcal{F}(\xi) + \nabla\mathcal{F}\T\delta\xi$
+subject to $\tfrac12\,\delta\xi\T A\,\delta\xi \le$ const. The Lagrange condition gives
+$\delta\xi \propto -A^{-1}\nabla\mathcal{F}$: steepest descent in the metric that measures a
+perturbation by the smoothness it costs. $A$ is block-tridiagonal, so $A^{-1}\nabla\mathcal{F}$ is one
+Thomas sweep per coordinate, $O(N)$; the library's sweep agrees with the dense inverse to
+$4 \times 10^{-15}$.
+
+**The obstacle cost and its slope.** $c(d) = -d + \epsilon/2$ for $d < 0$, $(\epsilon - d)^2/(2\epsilon)$
+on $[0, \epsilon]$, $0$ above: $C^1$ at both seams, with $c'(0) = -1$ on both sides. The *pointwise*
+form $\nabla_q\mathcal{F}_{obs} = \sum_\beta J_\beta\T c'(D)\nabla D$ drops the arc-length weighting; it
+is what the micro-example pins exactly, and the library checks it against finite differences of its
+cost to $4 \times 10^{-10}$.
+
+**Why $A^{-1}$ spreads a push.** $A^{-1}$ is dense and positive: its columns are tent functions
+peaked at the pushed waypoint and decaying linearly to the pinned ends. A force on one bead moves
+every bead, most where it was pushed — the band bends rather than kinks.
+
+**The step bound.** Linearize the obstacle term as a Hessian of at most $\lambda/\epsilon$ per
+waypoint ($c'' = 1/\epsilon$ in the margin, $\|\nabla D\| \le 1$). The iteration matrix is
+$\mathbb{1} - \tfrac1\eta(\mathbb{1} + A^{-1}H)$ with eigenvalues $1 - (1 + \mu_i)/\eta$,
+$\mu_i \in [0, (\lambda/\epsilon)/\lambda_{\min}(A)]$ and $\lambda_{\min}(A) = 2 - 2\cos(\pi/(m+1))$.
+It is a contraction iff $\eta > \tfrac12(1 + (\lambda/\epsilon)/\lambda_{\min}(A))$. For $m = 1$,
+$\epsilon = \tfrac12$: $\eta > (1 + \lambda)/2$. For $m = 20$, $\lambda = 2$, $\epsilon = \tfrac12$:
+$\eta^* = 90.0$; the library runs at $2\eta^*$ without a single cost increase in $400$ steps and at
+$\eta^*/4$ records $36$ increases in $100$. The bound is worst-case — a path with few waypoints
+inside the margin tolerates a smaller $\eta$ — and it is the mechanism behind the widget's headline.
+
+**STOMP's gradient-free replacement.** Sample $\delta\xi_k \sim \mathcal{N}(0, A^{-1})$ for $K$
+rollouts — smooth noise, because its covariance is the smoothness metric — evaluate
+$S_k = \mathcal{F}(\xi + \delta\xi_k)$, weight $w_k \propto \exp(-h(S_k - S_{\min})/(S_{\max} - S_{\min}))$,
+update by $\sum_k w_k\delta\xi_k$ smoothed once more through $A^{-1}$. No gradient is formed, so any
+cost that can be *evaluated* can be optimized. On the micro-example at $\lambda = 2$, seed 7, $K = 24$,
+120 iterations end at $y = 0.6566$ against CHOMP's $y^* = 0.6667$, with the accepted cost never rising.
+</Derivation>
+
+**The micro-example, step by step.** A point robot, three waypoints with the ends fixed: $q_0 = (0,0)$,
+$q_2 = (2, 0)$, free $q_1 = (1, 0.2)$; one disc at $(1, 0)$ of radius $\tfrac12$, so
+$D(q_1) = 0.2 - 0.5 = -0.3$ (inside) and $\nabla D = (0, 1)$; $\epsilon = \tfrac12$, $\lambda = 1$,
+$\eta = 1$, unit spacing, pointwise gradient. Smoothness: $\nabla_{q_1}\mathcal{F}_{smooth} = 2q_1 - q_0 - q_2 = (0, 0.4)$,
+$A = 2$. Obstacle: $D < 0$, so $c = 0.55$ and $c' = -1$, giving $\nabla_{q_1}\mathcal{F}_{obs} = (0, -1)$.
+Total $(0, -0.6)$; covariant step $q_1 \leftarrow (1, 0.2) - \tfrac11\cdot\tfrac12(0, -0.6) = (1, 0.5)$:
+one step lands the waypoint exactly on the disc, $D = 0$. Second step: $\nabla\mathcal{F}_{smooth} = (0, 1.0)$,
+$c'(0) = -1$ so $\nabla\mathcal{F}_{obs} = (0, -1)$, total $0$ — a fixed point *in contact*. In general,
+inside the margin $c' = -(\epsilon - D)/\epsilon$ and the equilibrium is $y^* = \lambda/(1 + \lambda)$,
+clearance $D^* = (\lambda - 1)/(2(1 + \lambda))$: $0$, $1/6$, $0.3$ for $\lambda = 1, 2, 4$, which the
+library reaches to $10^{-4}$ in 200 iterations at $\eta = 4$. The lesson: clearance is bought with
+$\lambda$ and $\epsilon$; it is never guaranteed.
+
+### The iLQR backward pass
+
+<KeyIdea title="Statement">
+With
+$Q_x = \ell_x + f_x\T V'_x$, $Q_u = \ell_u + f_u\T V'_x$,
+$Q_{xx} = \ell_{xx} + f_x\T V'_{xx} f_x$, $Q_{uu} = \ell_{uu} + f_u\T V'_{xx} f_u$, $Q_{ux} = \ell_{ux} + f_u\T V'_{xx} f_x$,
+the optimal local policy is $\delta u = k + \mathbf{K}\,\delta x$ with $k = -Q_{uu}^{-1}Q_u$,
+$\mathbf{K} = -Q_{uu}^{-1}Q_{ux}$, and the value model recurses as
+$V_x = Q_x - \mathbf{K}\T Q_{uu}k$, $V_{xx} = Q_{xx} - \mathbf{K}\T Q_{uu}\mathbf{K}$.
+</KeyIdea>
+
+<Derivation title="Bellman, expanded to second order about a nominal rollout" result="k = -Q_{uu}^{-1}Q_u,\quad \mathbf{K} = -Q_{uu}^{-1}Q_{ux},\quad V_{xx} = Q_{xx} - \mathbf{K}\T Q_{uu}\mathbf{K}">
+**Step 1 — Bellman.** $V_k(x) = \min_u\big[\ell(x, u) + V_{k+1}(f(x, u))\big]$, with $V_N = \ell_f$.
+
+**Step 2 — expand about the nominal.** Write $x = \bar x_k + \delta x$, $u = \bar u_k + \delta u$, and
+expand the bracket to second order: the coefficients are the $Q$ terms of the statement. Dropping the
+second derivatives of $f$ — the tensor terms $V'_x\cdot f_{xx}$, $V'_x\cdot f_{uu}$, $V'_x\cdot f_{ux}$
+— is iLQR; keeping them is DDP. The library computes them by central differences of the Jacobians
+when `ddp: true`.
+
+**Step 3 — minimize the quadratic in $\delta u$.** $\partial/\partial\delta u = 0$ gives
+$Q_u + Q_{uu}\delta u + Q_{ux}\delta x = 0$, i.e. $\delta u = -Q_{uu}^{-1}(Q_u + Q_{ux}\delta x) = k + \mathbf{K}\delta x$.
+This is a *policy*: a feedforward correction plus a linear feedback on the deviation from the nominal.
+
+**Step 4 — substitute back.** The minimized quadratic is the new value model:
+$V_x = Q_x + \mathbf{K}\T Q_{uu}k + \mathbf{K}\T Q_u + Q_{ux}\T k$ and $V_{xx} = Q_{xx} + \mathbf{K}\T Q_{uu}\mathbf{K} + \mathbf{K}\T Q_{ux} + Q_{ux}\T\mathbf{K}$,
+which collapse to the statement's forms once $k$ and $\mathbf{K}$ are substituted (Tassa et al. keep
+the cross terms for numerical symmetry; so does the library).
+
+**Step 5 — recurse, then roll out.** From $V_N = \ell_f$ down to $k = 0$. The forward pass is
+closed-loop: $u_k = \bar u_k + \alpha k_k + \mathbf{K}_k(x_k - \bar x_k)$, with backtracking on $\alpha$
+against the expected decrease $\Delta V(\alpha) = \alpha\sum_k k_k\T Q_u + \tfrac12\alpha^2\sum_k k_k\T Q_{uu}k_k$.
+A step is accepted when the realized decrease is a reasonable fraction of the promise.
+
+**Regularization.** $Q_{uu}$ need not be positive definite far from a minimum; the library adds
+$\mu\mathbb{1}$, raises $\mu$ tenfold when a Cholesky pivot fails or no $\alpha$ descends, and lowers it
+on success. Defaults: $\mu_0 = 10^{-6}$ (zero for linear-quadratic checks), $\alpha \in \{1, \tfrac12, \dots, 1/64\}$.
+
+**On a linear-quadratic problem one pass is Riccati.** If $f = Ax + Bu$ and $\ell$ is quadratic
+about the origin, $f_x = A$, $f_u = B$ and the recursion for $V_{xx}$ is exactly the discrete Riccati
+recursion $P_k = Q + A\T P_{k+1}A + A\T P_{k+1}B\,\mathbf{K}_k$ with $\mathbf{K}_k = -(R + B\T P_{k+1}B)^{-1}B\T P_{k+1}A$.
+The library computes that recursion independently; on a 40-stage double-integrator problem the gains
+agree to $1.1 \times 10^{-15}$ and the $\alpha = 1$ forward pass lands on the optimal cost
+$\tfrac12 x_0\T P_0 x_0 = 10.88611263$ in one iteration.
+
+**The first nonlinear term that breaks this.** For the unicycle, $f_x$ depends on $\theta$ through
+$\cos\theta$, $\sin\theta$; the rollout is no longer the linear prediction, $\alpha = 1$ may overshoot,
+and the pass has to be repeated. Hitch's parking problem below takes 79 iLQR iterations, or 30 with
+DDP's second-order terms, and the two reach *different* local optima — DDP's cheaper on this instance,
+$56.24$ against $60.62$, both parking within 5 cm and 0.05 rad.
+</Derivation>
+
+<Deferred minHeight={600}>
+  <IlqrBackwardPass />
+</Deferred>
+
+### TrajOpt's sequential convex optimization
+
+<KeyIdea title="Statement (Schulman et al. 2013, 2014)">
+Minimize $J(X) + \mu_{pen}\sum_i|g_i(X)|^+$ by repeatedly convexifying $J$ and $g$ about the current
+$X$, solving the convex subproblem inside a trust region $\|\delta X\|_\infty \le \Delta$, accepting if
+the true merit improves, and increasing $\mu_{pen}$ in an outer loop until the constraints hold.
+Collision constraints are $sd(R(q), \WO_i) \ge d_{safe}$, linearized at the witness point as
+$sd(q) + \hat n\T J_p(q)\,\delta q$.
+</KeyIdea>
+
+<Derivation title="An exact penalty, convexified" result="\text{violation} = 0 \text{ at convergence (for finite } \mu_{pen})">
+**Step 1 — the $\ell_1$ penalty is exact.** For a finite $\mu_{pen}$ larger than the constraints'
+multipliers, the minimizer of $J + \mu_{pen}\sum|g_i|^+$ satisfies $g_i \le 0$ exactly — not
+approximately, as a quadratic penalty would. The hinge is non-smooth, which is why the subproblem is
+solved as a convex program rather than by a gradient step.
+
+**Step 2 — convexify.** Replace $J$ by its quadratic model and each $g_i$ by its linearization; the
+hinge of an affine function is convex. For collision, $g = d_{safe} - sd(q)$ and the linearization
+at the witness pair is $d_{safe} - sd(q_0) - \hat n\T J_p(q_0)\,\delta q$ — exactly the contact normal
+times the body-point Jacobian, Chapter 7's lift once more.
+
+**Step 3 — the trust region guarantees descent on the merit.** The convex model agrees with the
+true merit to first order; inside a small enough box the true merit decreases when the model's does.
+Accept and expand $\Delta$ on success; reject and shrink on failure.
+
+**Step 4 — the penalty loop.** When the inner loop converges with violations left, multiply
+$\mu_{pen}$ and repeat. Swept volumes between consecutive footprints are handled as convex hulls of
+the two shapes — a recipe this book states and does not implement.
+
+**What our `sco` simplifies, and says so.** The convex subproblem is a QP in TrajOpt. Here it is the
+book's own Levenberg–Marquardt on the residual vector $[\mathsf{E}\xi + e;\ \sqrt{\mu}\,|g_{lin}|^+]$,
+boxed by the same $\Delta$ — a recipe in TrajOpt's shape, not TrajOpt. On the twelve-waypoint disc
+problem it ends after 27 convexifications at $\mu_{pen} = 10^5$ with every waypoint at least
+$d_{safe} = 0.1$ from the disc, the tightest at $0.1000$ and a violation of $6 \times 10^{-7}$; CHOMP
+on the same scene with $\lambda = 1$, $\epsilon = 0.5$ settles at a clearance of $0.471$ — far more
+than asked, because it never saw the constraint. Cost versus constraint, in one number each.
+</Derivation>
+
+### MPC: the loop around any of them
+
+<KeyIdea title="Statement">
+Each tick: measure $x$; solve the horizon-$N_h$ problem from $x$ with the obstacles where the sensor
+says they are; apply $u_0$; shift the solution one stage as the next warm start. The horizon trades
+compute for foresight, and past the point where the plan is corrected anyway it buys compute only.
+A terminal cost that approximates the cost-to-go is what lets a short horizon see around a corner.
+</KeyIdea>
+
+<Deferred minHeight={620}>
+  <MpcHorizon />
+</Deferred>
+
+The widget's numbers are the chapter's check. Rusty crosses the Apartment from room A to room E,
+$\Delta t = 0.1$ s, $v_{\max} = 1$ m/s, with a disc sliding in and out of the corridor through room
+B's door, frozen at its measured position each tick. With the Chapter 6 wave-front cost-to-go as
+terminal cost, horizons $N_h = 6, 10, 24$ all arrive — in 125, 127 and 139 ticks — without touching
+the disc or a wall, at 1.9, 3.9 and 10.0 ms of iLQR per tick. With a plain quadratic pull to the goal
+as terminal cost, neither $N_h = 10$ nor $24$ ever arrives: the pull parks Rusty against the corridor
+wall it cannot see around. And the open-loop ghost at $N_h = 16$, executing each plan to its end
+before replanning, collides for 10 ticks where MPC waits. Horizon is not what cured myopia; the
+terminal cost was. Stability of the closed loop via a terminal cost that is a Lyapunov function is
+the standard theorem (Rawlings, Mayne and Diehl); this chapter points at it and does not prove it.
+
+## The algorithm
+
+<Algorithm
+  name="chomp_step(ξ, q₀, q_N, D, {J_β}, ε, λ, η)"
+  inputs="free waypoints, fixed ends, distance field with gradient, body-point Jacobians, margin, weight, step"
+  outputs="ξ updated in place; F_smooth, F_obs, min clearance"
+  complexity="O(N·β) distance queries + one O(N) Thomas sweep per coordinate"
+>
+1. $g_k \leftarrow 2q_k - q_{k-1} - q_{k+1}$ for each free waypoint (the smoothness gradient $A\xi + b$)
+2. for each waypoint $k$ and body point $\beta$: $x \leftarrow x_\beta(q_k)$, $d \leftarrow D(x)$, $f \leftarrow c'(d)\,\nabla D(x)$; in the arclength form, $f \leftarrow \|x'\|\,[(\mathbb{1} - \hat x'\hat x'\T)f - c(d)\,\kappa]$ with $x', x''$ by central differences along $\xi$
+3. $g_k \leftarrow g_k + \lambda\,J_\beta(q_k)\T f$
+4. solve $A\,\delta = g$ by the Thomas sweep on $\mathrm{tridiag}(-1, 2, -1)$, one coordinate at a time
+5. $\xi \leftarrow \xi - \delta/\eta$; report $F_{smooth}$, $F_{obs}$, $\min d$. Stable iff $\eta > \tfrac12(1 + (\lambda/\epsilon)/\lambda_{\min}(A))$.
+</Algorithm>
+
+<Algorithm
+  name="stomp_step(ξ, K, rng, noise, h)"
+  inputs="the same problem, a seeded generator, rollout count, noise scale, temperature"
+  outputs="ξ updated if the cost did not rise"
+  complexity="K full cost evaluations; no gradients"
+>
+1. $L L\T = A^{-1}$ once; for $k = 1 \dots K$: $\delta\xi_k \leftarrow \text{noise}\cdot L\,z_k$, $z_k \sim \mathcal{N}(0, \mathbb{1})$ per coordinate
+2. $S_k \leftarrow \mathcal{F}(\xi + \delta\xi_k)$; $w_k \leftarrow \exp(-h(S_k - S_{\min})/(S_{\max} - S_{\min}))$, normalized
+3. $\delta\xi \leftarrow M\sum_k w_k\delta\xi_k$ with $M = A^{-1}$ column-scaled so its largest entry is $1/m$
+4. if $\mathcal{F}(\xi + \delta\xi) \le \mathcal{F}(\xi)$: $\xi \leftarrow \xi + \delta\xi$
+</Algorithm>
+
+<Algorithm
+  name="sco(ξ₀, sd, d_safe, μ₀, Δ₀)  —  a recipe in TrajOpt's shape"
+  inputs="initial waypoints, signed-distance field, clearance, initial penalty and trust radius"
+  outputs="ξ with violation below tolerance, the merit history"
+  complexity="outer penalty loop × inner convexify–solve–accept loop; each solve a few LM iterations"
+>
+1. repeat (penalty loop): repeat (inner loop):
+2. convexify: at each waypoint record $sd(q_k)$ and $\hat n_k = \nabla sd(q_k)$; model $g_k(\delta) = d_{safe} - sd(q_k) - \hat n_k\T\delta q_k$
+3. solve $\min_\delta \tfrac12\|\mathsf{E}(\xi + \delta) + e\|^2 + \mu\sum_k|g_k(\delta)|^+$ with $\|\delta\|_\infty \le \Delta$ — here by LM on the residuals $[\mathsf{E}(\xi + \delta) + e;\ \sqrt\mu\,|g_k(\delta)|^+]$ with the box as trust region (TrajOpt: a QP)
+4. if the *true* merit $\tfrac12\|\mathsf{E}\xi + e\|^2 + \mu\sum_k|d_{safe} - sd(q_k)|^+$ decreased: accept, $\Delta \leftarrow 1.5\Delta$; else $\Delta \leftarrow \Delta/2$
+5. until four rejections; if the worst violation $\ge$ tol: $\mu \leftarrow 10\mu$ and repeat the penalty loop
+</Algorithm>
+
+<Algorithm
+  name="ilqr(f, ℓ, ℓ_f, x₀, ū, μ₀)"
+  inputs="discrete dynamics with Jacobians, running and terminal cost with derivatives, start, initial controls, regularization"
+  outputs="(x̄, ū, {k_k}, {𝐊_k}), the cost per iteration"
+  complexity="O(N (n_x + n_u)³) per iteration"
+>
+1. roll $\bar u$ out from $x_0$; $J \leftarrow \sum\ell + \ell_f$
+2. **backward pass:** $V_x, V_{xx} \leftarrow \nabla\ell_f, \nabla^2\ell_f$; for $k = N-1 \dots 0$: form $Q_x, Q_u, Q_{xx}, Q_{uu}, Q_{ux}$ (add $V_x\cdot f_{xx}$ etc. for DDP); if $Q_{uu} + \mu\mathbb{1}$ is not positive definite, $\mu \leftarrow 10\mu$ and restart; $k_k \leftarrow -(Q_{uu} + \mu\mathbb{1})^{-1}Q_u$, $\mathbf{K}_k \leftarrow -(Q_{uu} + \mu\mathbb{1})^{-1}Q_{ux}$; update $V_x, V_{xx}$; accumulate $\Delta V = \alpha a + \alpha^2 b$
+3. **forward pass:** for $\alpha \in \{1, \tfrac12, \dots\}$: $u_k \leftarrow \bar u_k + \alpha k_k + \mathbf{K}_k(x_k - \bar x_k)$, $x_{k+1} \leftarrow f(x_k, u_k)$; accept the first $\alpha$ whose realized decrease is a fair fraction of $-\Delta V(\alpha)$; $\mu \leftarrow \mu/10$
+4. if no $\alpha$ descends: $\mu \leftarrow 10\mu$; repeat from 2 until the relative decrease is below tol
+</Algorithm>
+
+<Algorithm
+  name="mpc_tick(x_meas, t)"
+  inputs="measured state, tick; a horizon N_h, a cost builder seeing the obstacles at t, a warm start"
+  outputs="u₀ to apply; the plan"
+  complexity="one warm-started iLQR solve (a few iterations) per tick"
+>
+1. $\bar u \leftarrow$ last plan shifted by one stage (its last control repeated), or zeros
+2. $(\bar x, \bar u) \leftarrow$ `ilqr`$(f, \ell_t, \ell_f, x_{meas}, \bar u)$ with the obstacle frozen where it is at $t$ and $\ell_f$ the cost-to-go when one is available
+3. apply $\bar u_0$; keep $\bar u$ for the next tick
+</Algorithm>
+
+<Algorithm
+  name="optim::lm(r, J_r, x₀, Δ)  —  shared with Chapter 21"
+  inputs="residual function (and Jacobian, else central differences), start, optional box trust radius"
+  outputs="x minimizing ½‖r(x)‖², cost history"
+  complexity="one m×n Jacobian and one n×n solve per trial step"
+>
+1. $\lambda \leftarrow 10^{-3}$; repeat:
+2. $J \leftarrow J_r(x)$; stop if $\|J\T r\|_\infty <$ tol
+3. solve $(J\T J + \lambda\,\mathrm{diag}(J\T J))\,\delta = -J\T r$; clip $\|\delta\|_\infty \le \Delta$
+4. if $\tfrac12\|r(x + \delta)\|^2 < \tfrac12\|r(x)\|^2$: accept, $\lambda \leftarrow 0.3\lambda$; else $\lambda \leftarrow 10\lambda$ and retry
+</Algorithm>
+
+## Implementation in Rust
+
+The `trajopt` crate is introduced here and imported by Chapters 21 and 23. Its one shared piece is
+the optimizer; the rest are the five methods, each small enough to read beside its derivation.
+
+```rust title="crates/trajopt/src/optim.rs"
+use nalgebra::{DMatrix, DVector};
+
+/// A nonlinear least-squares problem ½‖r(x)‖². `jacobian` defaults to central differences.
+pub trait LeastSquares {
+    fn residual(&self, x: &DVector<f64>) -> DVector<f64>;
+    fn jacobian(&self, x: &DVector<f64>) -> DMatrix<f64> { finite_difference_jacobian(|y| self.residual(y), x, 1e-6) }
+}
+
+pub struct LmOptions { pub max_iter: usize, pub tol_grad: f64, pub lambda0: f64, pub trust: f64 }
+
+/// Levenberg–Marquardt with Marquardt scaling and a box trust region:
+///     (JᵀJ + λ diag(JᵀJ)) δ = −Jᵀr,   ‖δ‖∞ ≤ trust,   accept iff the true cost drops.
+/// λ → 0 is Gauss–Newton, λ → ∞ a short gradient step. The box is the crude trust
+/// region `sco` leans on, and Chapter 21's nonlinear steering reuses the whole thing.
+pub fn levenberg_marquardt(p: &impl LeastSquares, x0: DVector<f64>, o: &LmOptions) -> LmResult {
+    let (mut x, mut lambda) = (x0, o.lambda0);
+    let mut r = p.residual(&x);
+    let mut cost = 0.5 * r.norm_squared();
+    for _ in 0..o.max_iter {
+        let j = p.jacobian(&x);
+        let g = j.transpose() * &r;
+        if g.amax() < o.tol_grad { break; }
+        let jtj = j.transpose() * &j;
+        loop {
+            let mut a = jtj.clone();
+            for i in 0..a.nrows() { a[(i, i)] += lambda * jtj[(i, i)].max(1e-12); }
+            let mut delta = a.lu().solve(&(-&g)).expect("JᵀJ + λD is positive definite");
+            let step = delta.amax();
+            if step > o.trust { delta *= o.trust / step; }
+            let x_trial = &x + &delta;
+            let r_trial = p.residual(&x_trial);
+            let c_trial = 0.5 * r_trial.norm_squared();
+            if c_trial < cost { x = x_trial; r = r_trial; cost = c_trial; lambda *= 0.3; break; }
+            lambda *= 10.0;
+            if lambda > 1e15 { return LmResult::stationary(x, cost); }
+        }
+    }
+    LmResult::converged(x, cost)
+}
+```
+
+```rust title="crates/trajopt/src/chomp.rs"
+use nalgebra::{Point2, SMatrix, SVector};
+
+/// A discretized trajectory with fixed endpoints; ξ holds only the N−1 free waypoints.
+pub struct ChompProblem<'a, const N: usize> {
+    pub q0: SVector<f64, N>, pub q_end: SVector<f64, N>,
+    pub field: &'a dyn DistanceField,            // Chapter 7: dist(x), grad(x), signed
+    /// Body points: workspace position and 2×N Jacobian at q (Reach: samples along both links).
+    pub body: Vec<Box<dyn Fn(&SVector<f64, N>) -> (Point2<f64>, SMatrix<f64, 2, N>) + 'a>>,
+    pub eps: f64, pub lambda_obs: f64, pub eta: f64,
+    pub obstacle_form: ObstacleGradient,        // Pointwise (the micro-example) | ArcLength (full CHOMP)
+}
+
+/// c(d): −d + ε/2 below zero, (ε − d)²/(2ε) on [0, ε], 0 above — C¹ at both seams.
+pub fn obstacle_cost(d: f64, eps: f64) -> f64 { if d < 0.0 { -d + eps / 2.0 } else if d < eps { (eps - d).powi(2) / (2.0 * eps) } else { 0.0 } }
+pub fn obstacle_slope(d: f64, eps: f64) -> f64 { if d < 0.0 { -1.0 } else if d < eps { -(eps - d) / eps } else { 0.0 } }
+
+/// Solve A y = r for A = tridiag(−1, 2, −1) ⊗ I by one Thomas sweep per coordinate: the
+/// covariant preconditioner. A⁻¹ is dense and positive — a push on one waypoint moves them all.
+pub fn solve_smoothness_metric<const N: usize>(r: &[SVector<f64, N>]) -> Vec<SVector<f64, N>> {
+    let m = r.len();
+    let mut bp = vec![2.0; m];
+    let mut dp: Vec<SVector<f64, N>> = r.to_vec();
+    for k in 1..m { let w = -1.0 / bp[k - 1]; bp[k] = 2.0 + w; dp[k] = dp[k] - w * dp[k - 1]; }
+    let mut y = vec![SVector::zeros(); m];
+    y[m - 1] = dp[m - 1] / bp[m - 1];
+    for k in (0..m - 1).rev() { y[k] = (dp[k] + y[k + 1]) / bp[k]; }
+    y
+}
+
+/// One covariant step ξ ← ξ − (1/η) A⁻¹ ∇F. Returns the statistics *before* the step.
+pub fn chomp_step<const N: usize>(p: &ChompProblem<'_, N>, xi: &mut [SVector<f64, N>]) -> ChompStats {
+    let full: Vec<_> = std::iter::once(p.q0).chain(xi.iter().copied()).chain(std::iter::once(p.q_end)).collect();
+    let mut grad: Vec<SVector<f64, N>> = (1..full.len() - 1).map(|k| 2.0 * full[k] - full[k - 1] - full[k + 1]).collect();
+    let (mut f_obs, mut min_clear) = (0.0, f64::INFINITY);
+    for k in 1..full.len() - 1 {
+        for b in &p.body {
+            let (x, j) = b(&full[k]);
+            let d = p.field.dist(&x);
+            min_clear = min_clear.min(d);
+            let c = obstacle_cost(d, p.eps);
+            let mut f = obstacle_slope(d, p.eps) * p.field.grad(&x);          // ∇c = c′(D) ∇D
+            let mut w = 1.0;
+            if p.obstacle_form == ObstacleGradient::ArcLength {
+                let (xm, _) = b(&full[k - 1]); let (xp, _) = b(&full[k + 1]);
+                let v = 0.5 * (xp - xm); let acc = xp - 2.0 * x + xm;        // x′, x″ along the path
+                if let Some(t) = v.try_normalize(1e-9) {
+                    let proj = |z: nalgebra::Vector2<f64>| z - t * t.dot(&z);
+                    let kappa = proj(acc.coords) / v.norm_squared();
+                    f = v.norm() * (proj(f) - c * kappa);                   // ‖x′‖[(I − x̂′x̂′ᵀ)∇c − c κ]
+                    w = v.norm();
+                }
+            }
+            f_obs += c * w;
+            grad[k - 1] += p.lambda_obs * (j.transpose() * f);               // Jᵀ f: Chapter 7's lift
+        }
+    }
+    let dir = solve_smoothness_metric(&grad);
+    for (q, d) in xi.iter_mut().zip(dir) { *q -= d / p.eta; }
+    ChompStats { f_smooth: smoothness(&full), f_obs, min_clearance: min_clear }
+}
+
+/// Sufficient step bound: η > ½(1 + (λ/ε)/λ_min(A)), λ_min(A) = 2 − 2cos(π/(m+1)).
+pub fn stable_eta(m: usize, lambda_obs: f64, eps: f64) -> f64 {
+    0.5 * (1.0 + lambda_obs / eps / (2.0 - 2.0 * (std::f64::consts::PI / (m as f64 + 1.0)).cos()))
+}
+```
+
+```rust title="crates/trajopt/src/ilqr.rs"
+/// Discrete-time dynamics x_{k+1} = f(x_k, u_k) with Jacobians; implemented by `models::*`.
+pub trait DiscreteDynamics<const NX: usize, const NU: usize> {
+    fn step(&self, x: &SVector<f64, NX>, u: &SVector<f64, NU>) -> SVector<f64, NX>;
+    /// (f_x, f_u). Default: central differences — override with analytic forms for speed.
+    fn jacobians(&self, x: &SVector<f64, NX>, u: &SVector<f64, NU>) -> (SMatrix<f64, NX, NX>, SMatrix<f64, NX, NU>) {
+        numeric_jacobians(|a, b| self.step(a, b), x, u, 1e-6)
+    }
+}
+
+pub struct BackwardPass<const NX: usize, const NU: usize> {
+    pub k: Vec<SVector<f64, NU>>,          // feedforward
+    pub big_k: Vec<SMatrix<f64, NU, NX>>,  // feedback gains 𝐊_k — the policy, not just a plan
+    pub v_xx: Vec<SMatrix<f64, NX, NX>>,   // the value model, for the widget's ellipses
+    pub expected_decrease: (f64, f64),     // ΔV(α) = α·a + α²·b, for the line search
+    pub ok: bool,                          // every regularized Q_uu was positive definite
+}
+
+pub fn backward_pass<const NX: usize, const NU: usize>(
+    f: &impl DiscreteDynamics<NX, NU>, cost: &impl StageCost<NX, NU>,
+    xs: &[SVector<f64, NX>], us: &[SVector<f64, NU>], mu: f64, ddp: bool,
+) -> BackwardPass<NX, NU> {
+    let n = us.len();
+    let (mut v_x, mut v_xx) = cost.terminal_derivs(&xs[n]);
+    let mut bp = BackwardPass::with_capacity(n);
+    let (mut a, mut b) = (0.0, 0.0);
+    for k in (0..n).rev() {
+        let (fx, fu) = f.jacobians(&xs[k], &us[k]);
+        let l = cost.running_derivs(&xs[k], &us[k], k);
+        let q_x  = l.lx + fx.transpose() * v_x;
+        let q_u  = l.lu + fu.transpose() * v_x;
+        let mut q_xx = l.lxx + fx.transpose() * v_xx * fx;
+        let mut q_uu = l.luu + fu.transpose() * v_xx * fu;
+        let mut q_ux = l.lux + fu.transpose() * v_xx * fx;
+        if ddp {                                   // the tensor terms V_x · f_xx etc., by differencing the Jacobians
+            let so = second_order_terms(f, &xs[k], &us[k], &v_x);
+            q_xx += so.xx; q_uu += so.uu; q_ux += so.ux;
+        }
+        let q_uu_reg = q_uu + mu * SMatrix::identity();
+        let Some(chol) = q_uu_reg.cholesky() else { bp.ok = false; return bp; };
+        let kk = -chol.solve(&q_u);
+        let big_k = -chol.solve(&q_ux);
+        a += kk.dot(&q_u);
+        b += 0.5 * kk.dot(&(q_uu * kk));
+        // Value update with the cross terms (Tassa, Erez & Todorov 2012, eq. 11).
+        v_x  = q_x + big_k.transpose() * q_uu * kk + big_k.transpose() * q_u + q_ux.transpose() * kk;
+        v_xx = q_xx + big_k.transpose() * q_uu * big_k + big_k.transpose() * q_ux + q_ux.transpose() * big_k;
+        v_xx = 0.5 * (v_xx + v_xx.transpose());
+        bp.push(k, kk, big_k, v_xx);
+    }
+    bp.expected_decrease = (a, b);
+    bp
+}
+
+/// Closed-loop rollout u_k = ū_k + α k_k + 𝐊_k (x_k − x̄_k): the policy, not the plan.
+pub fn forward_pass<const NX: usize, const NU: usize>(f: &impl DiscreteDynamics<NX, NU>, xs: &[SVector<f64, NX>], us: &[SVector<f64, NU>], bp: &BackwardPass<NX, NU>, alpha: f64)
+    -> (Vec<SVector<f64, NX>>, Vec<SVector<f64, NU>>) {
+    let mut xs_new = vec![xs[0]];
+    let mut us_new = Vec::with_capacity(us.len());
+    for k in 0..us.len() {
+        let u = us[k] + alpha * bp.k[k] + bp.big_k[k] * (xs_new[k] - xs[k]);
+        xs_new.push(f.step(&xs_new[k], &u));
+        us_new.push(u);
+    }
+    (xs_new, us_new)
+}
+
+pub fn ilqr<const NX: usize, const NU: usize>(f: &impl DiscreteDynamics<NX, NU>, cost: &impl StageCost<NX, NU>, x0: SVector<f64, NX>, u_init: &[SVector<f64, NU>], opts: IlqrOptions) -> IlqrResult<NX, NU> {
+    let mut us = u_init.to_vec();
+    let mut xs = rollout(f, x0, &us);
+    let mut j = total_cost(cost, &xs, &us);
+    let mut mu = opts.mu0;
+    for _ in 0..opts.max_iter {
+        let mut bp = backward_pass(f, cost, &xs, &us, mu, opts.ddp);
+        while !bp.ok { mu = (mu * 10.0).max(1e-6); bp = backward_pass(f, cost, &xs, &us, mu, opts.ddp); }
+        let mut accepted = false;
+        for &alpha in &[1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625] {
+            let (xs_t, us_t) = forward_pass(f, &xs, &us, &bp, alpha);
+            let j_t = total_cost(cost, &xs_t, &us_t);
+            let expected = -(alpha * bp.expected_decrease.0 + alpha * alpha * bp.expected_decrease.1);
+            if j_t < j && (expected <= 1e-12 || (j - j_t) / expected > 1e-4) {
+                let rel = (j - j_t) / j.abs().max(1e-300);
+                xs = xs_t; us = us_t; j = j_t; mu = (mu * 0.1).max(opts.mu_min); accepted = true;
+                if rel < opts.tol { return IlqrResult::converged(xs, us, bp); }
+                break;
+            }
+        }
+        if !accepted { mu *= 10.0; if mu > opts.mu_max { break; } }
+    }
+    IlqrResult::stopped(xs, us)
+}
+```
+
+```rust title="crates/trajopt/src/mpc.rs"
+/// Receding horizon around any solver that accepts a warm start.
+pub struct Mpc<S: HorizonSolver> { pub solver: S, pub horizon: usize, warm: Option<Vec<S::Control>> }
+
+impl<S: HorizonSolver> Mpc<S> {
+    /// One tick: solve from the *measured* state with the obstacles where the sensor says they
+    /// are, apply the first control, keep the rest shifted by one stage as the next warm start.
+    pub fn tick(&mut self, x_meas: &S::State, t: usize) -> S::Control {
+        let init = match &self.warm {
+            Some(w) => { let mut u = w[1..].to_vec(); u.push(*w.last().unwrap()); u }
+            None => vec![S::Control::zeros(); self.horizon],
+        };
+        let plan = self.solver.solve(x_meas, &init, t);        // iLQR, a few iterations
+        let u0 = plan.controls[0];
+        self.warm = Some(plan.controls);
+        u0
+    }
+}
+
+/// Chapter 6's wave-front distance to the goal on an occupancy grid, bilinearly interpolated:
+/// the terminal cost that lets a short horizon see around a corner.
+pub struct GridCostToGo { grid: OccupancyGrid, value: Vec<f64> }
+impl GridCostToGo {
+    pub fn new(world: &World, goal: Point2<f64>, cell: f64, inflation: f64) -> Self {
+        let grid = grid_from_world(world, cell, inflation);
+        let wf = wavefront(&grid, grid.cell_at(goal), Connectivity::Eight);   // Chapter 7's wave-front on Chapter 6's grid
+        let value = wf.label.iter().map(|&l| if l >= 2 { (l - 2) as f64 * cell } else { f64::INFINITY }).collect();
+        Self { grid, value }
+    }
+    pub fn at(&self, x: f64, y: f64) -> f64 { self.grid.bilinear(&self.value, x, y) }
+}
+```
+
+### The worked example, printed
+
+`cargo run --example chomp_three -p trajopt` builds the micro-example with an analytic `DiscField` so
+the numbers are exact (the widget uses the Chapter 7 grid field) and prints
+
+```text
+grad_smooth = (0.0000, 0.4000)    grad_obs = (0.0000, -1.0000)    c(D) = 0.5500
+q1 <- (1.0000, 0.5000)            clearance = 0.0000
+step 2: |grad| = 0.0000 (fixed point, in contact)
+lambda_obs in {1, 2, 4}, eta = 4, 200 iterations:  D* = 0.0000  0.1667  0.3000
+stability: eta* = (1 + lambda)/2;  lambda = 2: eta = 1.4 -> y = 0.4615 (oscillates), eta = 1.6 -> y = 0.6667
+20 waypoints, lambda = 2, eps = 0.5:  eta* = 90.0;  2 eta*: 0 cost rises in 400 steps, clearance 0.494;  eta*/4: 36 rises in 100
+STOMP seed 7, K = 24, 120 iterations, lambda = 2:  y = 0.6566  (y* = 0.6667)
+sco, 12 waypoints, d_safe = 0.1:  27 convexifications, mu = 1e5, tightest clearance 0.1000, violation 5.6e-7
+```
+
+`cargo run --example ilqr_min_effort -p trajopt` discretizes $\ddot q = u$ at $N = 100$, $t_f = 1$,
+$d = 1$, cost $\sum u_k^2\Delta t$ plus $10^6\|x_N - (1, 0)\|^2$, and prints
+
+```text
+u_0 = 5.9405 (Pontryagin 5.9400)   u_50 = -0.0600 (-0.0600)   max |u_k - (6 - 12 t_{k+1/2})| = 5.1e-4
+alpha = 1 accepted; converged in one iteration (linear-quadratic: one pass is Riccati)
+LQR check, N = 40 double integrator:  max |K - K_riccati| = 1.1e-15;  cost after one pass 10.88611263 = 1/2 x0' P0 x0
+Hitch parking, N = 30:  iLQR 79 iterations 559.76 -> 60.62;  DDP 30 iterations -> 56.24  (different local optima; both park within 5 cm, 0.05 rad)
+Reach on the Workbench, 24 waypoints, 8 body points, arclength, eta = 8:
+  straight chart line:  F 1.1895 -> 1.0612, |grad| 5e-15, clearance -0.183  (CONVERGED IN COLLISION)
+  detour via folded elbow:  F 0.9236 -> 0.3724, clearance 0.099;  mid-path separation 1.98 rad
+MPC, Apartment, dt = 0.1:  cost-to-go terminal  N_h = 6: 125 ticks 1.9 ms | 10: 127 ticks 3.9 ms | 24: 139 ticks 10.0 ms, no contact
+                           quadratic terminal   N_h = 10, 24: never arrives (myopic);  open-loop ghost N_h = 16: 10 collision ticks
+hook pipeline:  RRT (seed 19) 14 nodes -> shortcut 3 -> 40 CHOMP steps, clearance 0.146;  t_f 1.803 s -> 0.992 s
+```
+
+`#[test] fn reproduces_micro_example()` asserts the first block to $10^{-4}$ and
+`#[test] fn ilqr_matches_pontryagin()` the second: $\max_k |u_k - (6 - 12\,t_{k+1/2})| < 5 \times 10^{-2}$
+and convergence in one iteration. `#[test] fn argmin_agrees()` runs `argmin`'s L-BFGS on the
+micro-example's objective and asserts the same fixed point to $10^{-6}$ — the one place a library
+optimizer appears, as a cross-check and never as the implementation.
+
+<Callout type="info">
+The widgets on this page run the TypeScript port in `lib/trajopt/`, a line-for-line translation of
+the Rust above. Its fifteen self-checks reproduce every number in the two printouts and add the
+invariants: the Thomas sweep against the dense inverse, the pointwise gradient against finite
+differences, the iLQR gains against an independent Riccati recursion, the car model against
+Chapter 2's `Hitch.step`, the brushfire field bracketed by the exact Euclidean distance
+($d/\sqrt2 - 1.5$ cells $\le D \le d + 1.5$ cells at all 379 sampled points of the Workbench), and
+the receding-horizon loop against its open-loop ghost.
+</Callout>
+
+## Putting it together
+
+The Reach pipeline the capstone ships is the hook: a Chapter 12 RRT → Chapter 13 shortcut → `chomp`
+→ Chapter 18 `CubicSpline` + `time_scale` → Chapter 17 replay. On the seeded instance above it takes
+the time-optimal execution from $1.803$ s to $0.992$ s without changing the planner's global decision.
+Three honesty items the pipeline makes visible.
+
+**Where optimization beats search.** Smoothness, clearance and dynamics are what a sampling planner
+ignores and an optimizer measures. Forty covariant steps cost less than the RRT that found the path,
+and the time scaler rewards every bit of curvature removed. iLQR goes further than CHOMP can: it
+respects the dynamics by construction, and it returns a feedback policy — the gains $\mathbf{K}_k$ —
+which is what makes the receding-horizon loop closed-loop rather than a replanner.
+
+**Where it sticks.** Homotopy and narrow passages. From the straight chart line, CHOMP on the
+Workbench converges with a body point inside the block, at machine-precision stationarity. No
+$\eta$, $\lambda$ or $\epsilon$ fixes that; only a different initial path does, which is a sampling
+planner's job. Choset's "the solution achieved will depend heavily on the initial guess" is the
+chapter's epigraph for a reason.
+
+**Where the loop earns its keep.** MPC's value is not foresight — a frozen-obstacle planner has
+none past its sensor — but correction: the obstacle moves, the plan moves with it, every tick. The
+Apartment check shows the horizon buying compute ($1.9 \to 10.0$ ms) while the terminal cost-to-go,
+not the horizon, decides whether Rusty arrives at all. The sister book's MPPI runs the same loop
+with sampling in place of iLQR; a side-by-side on the same model, horizon and seeds is the honest way
+to compare them, and anything less is not shown.
+
+<OptimizerFamilyMap />
+
+On to [Chapter 20](/chapters/ch20-nonholonomic-i), where the question becomes whether the car can
+reach a configuration at all — and to [Chapter 21](/chapters/ch21-nonholonomic-ii), where
+`trajopt::optim` steers it there.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="The equilibrium and its stability">
+    For the three-waypoint micro-example derive $y^* = \lambda/(1 + \lambda)$ from
+    $\nabla_{q_1}\mathcal{F} = 0$ inside the margin, then write the covariant update as
+    $y \leftarrow y(1 - (1 + \lambda)/\eta) + \lambda/\eta$ and show it is a contraction iff
+    $\eta > (1 + \lambda)/2$. The design brief for this chapter claimed stability "for every
+    $\eta \ge 1$"; find the smallest $\lambda$ for which $\eta = 1$ oscillates.
+    <CheckAnswer id="ch19.e1" prompt="For λ = 2, the smallest stable η" answer={1.5} tolerance={0.01}>
+    Inside the margin $c'(D) = -(\epsilon - D)/\epsilon = 2y - 2$ (with $\epsilon = \tfrac12$,
+    $D = y - \tfrac12$), so $\nabla_{q_1}\mathcal{F} = (0,\ 2y + \lambda(2y - 2))$ and the update is
+    $y \leftarrow y - \tfrac{1}{2\eta}\big((2 + 2\lambda)y - 2\lambda\big)$. Fixed point
+    $y^* = \lambda/(1 + \lambda)$; contraction factor $|1 - (1 + \lambda)/\eta| < 1$ iff
+    $\eta > (1 + \lambda)/2$. At $\eta = 1$ the factor is $-\lambda$: marginal at $\lambda = 1$,
+    oscillating for every $\lambda > 1$. The library pins $\eta = 1.4$ oscillating and $\eta = 1.6$
+    converging at $\lambda = 2$.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="One pass is Riccati">
+    Show that for $x_{k+1} = Ax_k + Bu_k$ and $\ell = \tfrac12(x\T Qx + u\T Ru)$, $\ell_f = \tfrac12 x\T Q_f x$,
+    the iLQR backward pass with $\mu = 0$ produces $V_{xx,k} = P_k$ of the discrete Riccati recursion
+    and $\mathbf{K}_k = -(R + B\T P_{k+1}B)^{-1}B\T P_{k+1}A$, and that the $\alpha = 1$ forward pass
+    is the optimal trajectory in one iteration. Then exhibit the first term that breaks this for the
+    unicycle $x_{k+1} = x_k + \Delta t\,(v\cos\theta, v\sin\theta, \omega)$.
+    <Hints>
+      <>With a quadratic cost about the origin and a linear model, $Q_{xx} = Q + A\T P A$, $Q_{uu} = R + B\T P B$, $Q_{ux} = B\T P A$, and the value update $V_{xx} = Q_{xx} - \mathbf{K}\T Q_{uu}\mathbf{K}$ is the Joseph form of the Riccati step.</>
+      <>Along the nominal, $f(x, u) = f(\bar x, \bar u) + f_x\delta x + f_u\delta u$ exactly for a linear model, so the closed-loop rollout coincides with the linear prediction the backward pass assumed; the realized decrease equals $\Delta V(1)$.</>
+      <>For the unicycle $f_x$ contains $-v\Delta t\sin\theta$ and $v\Delta t\cos\theta$: the prediction is first-order in $\delta\theta$ and the rollout is not, so $\alpha = 1$ can overshoot and the pass must repeat — 79 times on Hitch's parking problem.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Predict the clearance">
+    <Predict
+      id="ch19.e3"
+      question="In the CHOMP Smoother load the micro-example preset and set λ_obs = 4 (η stays above the bound). What clearance does the waypoint converge to?"
+      options={[
+        { label: 'Zero — it ends in contact as at λ = 1', because: 'At λ = 1 the obstacle push balances the smoothness pull exactly at D = 0. Quadrupling λ makes the push stronger at every D inside the margin, so the balance point moves outward.' },
+        { label: '0.3 m', correct: true, because: 'D* = (λ − 1)/(2(1 + λ)) = 3/10. The waypoint sits at y* = 4/5, inside the margin ε = 0.5 (D* < ε), where the balance is 2y = λ(2 − 2y).' },
+        { label: '0.5 m — right at the edge of the margin', because: 'At D = ε the obstacle gradient is zero, so nothing holds the waypoint there against the smoothness pull toward y = 0; the equilibrium must be strictly inside the margin for every finite λ.' },
+      ]}
+    >
+    Now set $\epsilon = 1.0$ and predict again before pressing run. With $c'(D) = -(\epsilon - D)/\epsilon$
+    and $D = y - \tfrac12$ the balance is $2y = \lambda(1.5 - y)$, so $y^* = 1.5\lambda/(2 + \lambda)$:
+    at $\lambda = 4$, $y^* = 1.0$ and the clearance rises from $0.3$ to $0.5$ because the margin's
+    push now reaches further out.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Horizon versus cost-to-go">
+    In the MPC Horizon widget, switch the terminal cost-to-go off. Find the longest $N_h$ at which
+    Rusty still fails to round the corridor into room E, and explain the failure with the
+    Chapter 6 backward-Dijkstra cost-to-go: what does the quadratic pull believe about the wall?
+    Switch the cost-to-go back on and verify that $N_h = 6$ now succeeds. Which parameter decided
+    the outcome, and what did the horizon buy instead?
+    <Hints>
+      <>A quadratic pull to the goal is the cost-to-go of a world without walls. From the corridor the goal is north-east through a wall; every horizon that ends before the door sees only that wall and a gradient pointing into it.</>
+      <>The wave-front distance differs from the Euclidean one exactly where walls intervene; as a terminal cost it tells the short horizon that the door is "closer" to the goal than the wall is. The check records $N_h = 6, 10, 24$ all arriving in 125–139 ticks with it, and neither $10$ nor $24$ arriving without it.</>
+      <>What grows with $N_h$ is the solve time, $1.9 \to 10.0$ ms per tick in the check; the driven path barely changes once the terminal cost is right.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="DDP's second-order terms by finite differences">
+    `ilqr.rs` adds $V_x\cdot f_{xx}$, $V_x\cdot f_{uu}$ and $V_x\cdot f_{ux}$ by central differences of
+    the Jacobians when `ddp` is set. Verify the implementation against the analytic second derivatives
+    of the unicycle, then compare iteration counts and wall-clock time of iLQR and DDP on Hitch's
+    parking problem over 20 seeded starts. Report, honestly, how often the two reach different local
+    optima — the chapter's single instance has DDP finding a cheaper one in fewer iterations, and one
+    instance is not a trend.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="STOMP against CHOMP on the two-homotopy Workbench (stretch)">
+    Run `stomp` from 20 seeds and `chomp` from both initial paths on the Workbench scene of the
+    smoother widget. Report the success rate (final clearance positive), the median final cost, and
+    the seeds that never escape the straight-line class's collision minimum. STOMP's noise can jump
+    a waypoint across the block where a gradient cannot; it can also wander. Include the seeds that
+    fail.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="§11.3.1 (the Hamiltonian, the minimum principle, Example 11.3.1 and the bang-bang recovery, shooting) and §11.3.2 (transcription, the three parameterizations, the two warnings) are the root of everything here; §12.5.3's remark that underactuated systems must parameterize u(t) is Chapter 21's hook. Bryson & Ho, Kirk and Pontryagin et al. are cited there as the classical texts."
+  />
+  <Reference
+    authors="Zucker, M., Ratliff, N., Dragan, A. D., Pivtoraiko, M., Klingensmith, M., Dellin, C. M., Bagnell, J. A., and Srinivasa, S. S."
+    year={2013}
+    title="CHOMP: Covariant Hamiltonian Optimization for Motion Planning"
+    venue="International Journal of Robotics Research 32(9–10)"
+    doi="10.1177/0278364913488805"
+    note="The journal version of CHOMP: the smoothness metric, the arc-length obstacle functional and its gradient with the velocity projection and curvature term, the C¹ obstacle cost used here, and the Hamiltonian Monte Carlo variant this chapter does not implement. The 2009 ICRA paper by Ratliff, Zucker, Bagnell and Srinivasa introduced the method."
+  />
+  <Reference
+    authors="Kalakrishnan, M., Chitta, S., Theodorou, E., Pastor, P., and Schaal, S."
+    year={2011}
+    title="STOMP: Stochastic Trajectory Optimization for Motion Planning"
+    venue="IEEE International Conference on Robotics and Automation"
+    doi="10.1109/ICRA.2011.5980280"
+    note="The gradient-free sibling: noise with covariance A⁻¹, exponentiated cost weights, and the smoothing matrix M. Implemented here with a seeded generator and an accept-if-not-worse guard."
+  />
+  <Reference
+    authors="Schulman, J., Duan, Y., Ho, J., Lee, A., Awwal, I., Bradlow, H., Pan, J., Patil, S., Goldberg, K., and Abbeel, P."
+    year={2014}
+    title="Motion Planning with Sequential Convex Optimization and Convex Collision Checking"
+    venue="International Journal of Robotics Research 33(9)"
+    doi="10.1177/0278364914528132"
+    note="TrajOpt: the ℓ₁ penalty, the trust-region sequential convex loop, signed-distance constraints linearized at the witness, and swept-volume collision checking. Our sco keeps the loop's shape with LM in place of the QP and says so."
+  />
+  <Reference
+    authors="Li, W. and Todorov, E."
+    year={2004}
+    title="Iterative Linear Quadratic Regulator Design for Nonlinear Biological Movement Systems"
+    venue="International Conference on Informatics in Control, Automation and Robotics (ICINCO)"
+    url="https://homes.cs.washington.edu/~todorov/papers/LiICINCO04.pdf"
+    note="iLQR: DDP without the second-order dynamics terms. Jacobson and Mayne's Differential Dynamic Programming (1970) is the ancestor with the terms kept; Tassa, Erez and Todorov (IROS 2012) supply the regularization and line search used here."
+  />
+  <Reference
+    authors="Tassa, Y., Erez, T., and Todorov, E."
+    year={2012}
+    title="Synthesis and Stabilization of Complex Behaviors through Online Trajectory Optimization"
+    venue="IEEE/RSJ International Conference on Intelligent Robots and Systems"
+    url="https://homes.cs.washington.edu/~todorov/papers/TassaIROS12.pdf"
+    note="The practical iLQR/DDP: Q_uu regularization, the expected-decrease line search ΔV(α) = αa + α²b, and the value update with cross terms — the exact forms backwardPass and forwardPass implement — run inside an MPC loop."
+  />
+  <Reference
+    authors="Rawlings, J. B., Mayne, D. Q., and Diehl, M. M."
+    year={2017}
+    title="Model Predictive Control: Theory, Computation, and Design (2nd ed.)"
+    venue="Nob Hill Publishing"
+    url="https://sites.engineering.ucsb.edu/~jbraw/mpc/"
+    note="The stability theory this chapter points at and does not prove: a terminal cost that is a control Lyapunov function makes the receding-horizon loop stable. Our cost-to-go terminal is the practical cousin."
+  />
+</References>

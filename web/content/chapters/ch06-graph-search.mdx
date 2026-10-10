@@ -1,0 +1,947 @@
+---
+title: Graph Search for Planners
+description: Best-first search is one algorithm with one knob — breadth-first, Dijkstra, greedy and A* — with the optimality proof, the counterexample that breaks it, D* and D* Lite for repairing a search instead of redoing it, and universal plans as the reader's first value function.
+chapter: 6
+part: PART II
+partTitle: Classical Planners — Search, Potentials, Roadmaps, Cells
+difficulty: Foundational
+readingTime: 60 min
+quote: To distinguish between these forms of optimality, let us reserve the term optimality to measure the path and efficiency to measure the search, i.e., the number of nodes visited to determine the path.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Appendix H.2
+---
+
+import { SearchTheater } from '@/components/ch/ch06/search-theater';
+import { DStarReplanner } from '@/components/ch/ch06/dstar-replanner';
+import { UniversalPlanField } from '@/components/ch/ch06/universal-plan-field';
+import { GreedyControllerHook } from '@/components/ch/ch06/greedy-controller-hook';
+import { ComplexityLadder } from '@/components/ch/ch06/complexity-ladder';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Write breadth-first search, Dijkstra, greedy search and A* as one best-first loop with one priority rule, and say which guarantee each rule buys',
+    'Prove that A* terminates, is complete, and is optimal when the heuristic is admissible — and show with a four-node graph exactly where the proof fails when it is not',
+    'Explain why a consistent heuristic never reopens a node, and what weighted A* trades for its speed',
+    'Repair a search after the world changes with D* and D* Lite, and say which states a repair must touch',
+    'Turn a backward Dijkstra into a universal plan, and recognize its labels as a Bellman fixed point',
+    'State what complete, resolution complete and probabilistically complete mean, and where motion planning sits among P, NP and PSPACE',
+  ]}
+  prerequisites={[
+    'Rusty, the Apartment and the simulator (Chapter 2)',
+    'Configuration space and the rasterized free space of a disc robot (Chapter 4)',
+    'A metric on a configuration space, so that edges have costs (Chapter 5)',
+  ]}
+>
+Every planner in Parts II and III ends the same way: with a graph and a question — *which
+vertices lead from here to there, cheapest?* This chapter builds the one tool they all share. The
+reader knows what $\Qfree$ is and how to test a configuration for collision. None of that tells
+Rusty which way to drive.
+
+The idea the chapter unpacks fits in one sentence. **Best-first search is one algorithm with one
+knob.** Priority by edge count gives breadth-first search; by cost-to-come $g$, Dijkstra; by a guess
+$h$ alone, greedy search; by $g + h$ with an *optimistic* $h$, A* — optimal and lazy at once. Push
+the knob past optimism and optimality quietly breaks, and the chapter shows exactly where, on a
+graph small enough to trace by hand.
+
+Two consequences follow and get their own widgets. A search can be *repaired* rather than redone
+when the world changes — D*, and its modern descendant D* Lite — and a search run *backward from
+the goal* yields a plan for every vertex at once, the reader's first value function, which the
+sister book turns into Markov decision processes.
+</Overview>
+
+## The problem: a goal is not a plan
+
+Put Rusty in room A of the Apartment and the goal in room B, and write the first controller anyone
+writes: drive toward the goal.
+
+<Figure caption="The goal-seeking controller. Rusty drives straight at a goal two rooms away and wedges against the party wall between them. Nothing in 'drive toward the goal' knows that the doorway is behind it.">
+  <GreedyControllerHook />
+</Figure>
+
+It wedges into the first wall. The goal is $2.2$ m away through the plaster, the doorway is two
+metres behind and to the left, and nothing in the controller can know that, because the controller
+only looks at where it is and where it wants to be. Something must *look ahead* — must consider
+positions Rusty is not in, order them by how promising they are, and remember which one led to
+which. That something is a graph search, and the rest of the chapter is what the words "promising"
+and "remember" mean precisely.
+
+## Building intuition: one search, one knob
+
+Rasterize the Apartment's south rooms and corridor into a grid of half-metre cells, connect each
+cell to its eight neighbors, and search it four ways at once.
+
+<Deferred>
+  <SearchTheater />
+</Deferred>
+
+The four lanes run the *same* loop. Pop the most promising node, mark it done, look at its
+neighbors, push the ones not yet done. The only thing that differs is what "most promising" means:
+
+- **Breadth-first** ranks by *link length*, the number of edges from the start. It floods outward
+  in rings, and the first time it reaches the goal it has found the path with the fewest edges —
+  which, on a grid where a diagonal step costs $1.4$ and an axial one costs $1$, is not the
+  cheapest path.
+- **Dijkstra** ranks by $g$, the cost of the cheapest known path from the start. It floods in
+  *cost* rings, and the first time it pops the goal it has the cheapest path — at the price of
+  expanding every cell cheaper than the goal.
+- **Greedy** ranks by $h$, a guess at the cost from each node to the goal. It darts toward the goal
+  and often arrives in a handful of expansions with a path that is visibly bad.
+- **A\*** ranks by $f = g + \varepsilon h$. With $\varepsilon = 1$ it expands only the cells it
+  must and matches Dijkstra's cost to the last digit.
+
+Now slide $\varepsilon$. Below one, the A* lane's cost does not move; only its expansion count does,
+climbing toward Dijkstra's as $\varepsilon \to 0$ and the heuristic switches off. Above one the
+expansion count keeps falling — and the path cost drifts above Dijkstra's. The badge marks the first
+$\varepsilon$ at which that happens. This is the misconception the widget exists to kill: *a better
+heuristic always means a better path.* A stronger heuristic means fewer expansions *only while it
+stays optimistic*; past that, it buys speed with path quality, and the chapter's derivations say how
+much of each.
+
+<KeyIdea title="The one sentence version">
+Breadth-first, Dijkstra, greedy and A* are one best-first loop with four priority rules. The rule
+decides the guarantee: link-optimal, cost-optimal, no guarantee, or cost-optimal if — and only as
+long as — the heuristic never overestimates.
+</KeyIdea>
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: 'G = (V, E),\\; c(n_1, n_2) \\ge 0', meaning: 'a graph with non-negative edge costs (weights)' },
+    { sym: '\\mathrm{Star}(n)', meaning: 'the set of nodes adjacent to n — Choset\'s name for the neighbor set' },
+    { sym: 'g(n),\\; h(n),\\; f(n)', meaning: 'cost-to-come along the back-pointer path; heuristic estimate of the cost-to-go; the priority', note: 'book-wide' },
+    { sym: 'O,\\; C', meaning: 'the open set (priority queue) and the closed set (expanded nodes)' },
+    { sym: 'b(n)', meaning: 'back pointer: the parent of n on the best known path from q_start' },
+    { sym: '\\ell(\\pi)', meaning: 'link length of a path — number of edges, weights ignored' },
+    { sym: 'k(X),\\; t(X),\\; r(X, Y)', meaning: 'D*: minimum key, tag ∈ {NEW, OPEN, CLOSED}, measured arc cost' },
+    { sym: 'rhs(s),\\; k_m', meaning: 'D* Lite: one-step lookahead value, key modifier' },
+    { sym: '\\varepsilon \\ge 1', meaning: 'heuristic inflation factor (weighted A*, ARA*)' },
+    { sym: '\\pi^\\star : V \\to V', meaning: 'universal plan (policy): the successor to take from every vertex' },
+    { sym: 'O(\\cdot), o(\\cdot), \\Omega(\\cdot), \\Theta(\\cdot)', meaning: 'asymptotic bounds (Choset Def. G.1.1)' },
+  ]}
+/>
+
+### Graphs, grids, and two kinds of length
+
+<KeyIdea title="Definitions — graph, path, cycle, tree (Choset §H.1)">
+A **graph** $G = (V, E)$ is a set of nodes and a set of edges, directed or undirected, each with a
+non-negative **weight** $c$. A **path** is a sequence of nodes with consecutive nodes adjacent; a
+**cycle** is a path whose first and last nodes coincide; a **tree** is a connected directed graph
+without cycles, with a unique **root** that has no incoming edge. A **grid** induces a graph whose
+nodes are cells; **four-point connectivity** joins N/S/E/W neighbors, **eight-point** adds the
+diagonals.
+</KeyIdea>
+
+The weights on a grid are the chapter's first honesty item. Choset's §H.2.4 charges $1$ for an axial
+step and $1.4$ for a diagonal — his approximation of $\sqrt 2$, chosen so that hand arithmetic comes
+out in tenths. This is *not* the Euclidean metric: two cells sideways and one up costs $2.4$, not
+$\sqrt 5 = 2.24$. It is a perfectly good metric on the graph, and the design of this chapter keeps
+it, because it is what makes the examples traceable. Code that wants $\sqrt 2$ changes one constant.
+
+The **link length** $\ell(\pi)$ of a path is its number of edges, weights ignored. Breadth-first
+search minimizes link length; Dijkstra minimizes weighted cost; the two coincide only when all
+weights are equal. On the $1/1.4$ grid they disagree in a concrete way: four axial steps cost $4.0$
+and three diagonals cost $4.2$, so a path with *more* links can be *cheaper*. This is why the
+Search Theater's breadth-first lane reports a different cost from Dijkstra's, and why the Rust port
+relaxes a node by depth in breadth-first mode and by cost everywhere else.
+
+### Expansion, open and closed, and what a heuristic promises
+
+**Expanding** a node $n$ (Choset §H.2.1) moves it from the open set $O$ to the closed set $C$ and,
+for every $x \in \mathrm{Star}(n) \setminus C$, either inserts $x$ into $O$ with
+$g(x) = g(n) + c(n, x)$ and $b(x) = n$, or — if $x$ is already open and the new route is cheaper —
+updates $g(x)$ and $b(x)$. The closed set is what stops a search from walking in circles; the open
+set is the frontier between what is known and what is not. In the colors every figure on this page
+uses:
+
+<LinkedMath>
+$$
+f(n) \;=\; \htmlClass{term-start}{g(n)} \;+\; \varepsilon\, \htmlClass{term-goal}{h(n)},
+\qquad
+\htmlClass{term-graph}{O \cup C} \text{ is what the search has looked at},
+\qquad
+\htmlClass{term-path}{\qstart = b^k(\qgoal), \ldots, b(\qgoal), \qgoal} \text{ is what it returns.}
+$$
+</LinkedMath>
+
+The cost-to-come $g$ is measured from the green start; the heuristic $h$ is an estimate toward the
+red goal; the blue explored set is the price of the search; the purple back-pointer path is its
+product. Point at a term and the matching layer in the Search Theater comes forward.
+
+<KeyIdea title="Definitions — admissible and consistent heuristics">
+Let $h^\star(n)$ be the true cost of the cheapest path from $n$ to $\qgoal$. A heuristic is
+**admissible** (Choset: *optimistic*) if $h(n) \le h^\star(n)$ for every $n$. It is **consistent**
+if $h(n) \le c(n, x) + h(x)$ for every edge $(n, x)$ and $h(\qgoal) = 0$. Consistency implies
+admissibility: sum the inequality along an optimal path from $n$ to the goal.
+</KeyIdea>
+
+Consistency is not in Choset; it is the standard strengthening that makes the no-reopening theorem
+below true, and the octile heuristic — $h = 1.4\min(\Delta x, \Delta y) + |\Delta x - \Delta y|$,
+the exact cost-to-go on an *empty* $1/1.4$ grid — has it. Exercise 1 asks for the proof, and for
+the slightly embarrassing fact that the same formula is not admissible if diagonals cost $\sqrt 2$.
+
+<Derivation title="Breadth-first search is optimal in link length" result="\text{depth at first dequeue} = \min \ell(\pi)">
+**Statement.** With a FIFO queue, a node's depth when it is first dequeued is its shortest link
+length from $\qstart$ — on a grid, the Manhattan (4-connected) or chessboard (8-connected) shortest
+path (Choset §H.1–H.2).
+
+**Step 1 — the queue invariant.** At every moment the queue holds nodes of some depth $d$ followed
+by nodes of depth $d + 1$, and nothing else: the start is at depth $0$, and dequeuing a depth-$d$
+node enqueues only depth-$(d+1)$ nodes behind the remaining depth-$d$ ones.
+
+**Step 2 — first discovery.** A node is enqueued the first time it is seen, from a parent at depth
+$d$, and is assigned depth $d + 1$; later sightings are ignored.
+
+**Step 3 — no shorter path exists.** Suppose $x$ were reachable in $d' < d + 1$ links. Then its
+parent on that path has depth $d' - 1 \le d - 1$ and, by the invariant, was dequeued *before* any
+depth-$d$ node — at which moment $x$ would have been enqueued at depth $d' \le d$. Contradiction.
+
+**Step 4 — grids.** On a unit-weight grid link length *is* the grid metric, so the first path to
+the goal is also cheapest. With $1/1.4$ weights it is not: see the paragraph above. $\blacksquare$
+
+*Why depth-first is different.* A stack pushes and pops on the same end, so the search commits to a
+branch and backs up only at a dead end. It is complete on a finite graph — every node is visited at
+most once — and optimal in nothing (Choset's figures H.8–H.9). The chapter's check confirms the
+first claim on two hundred random grids and does not bother with the second.
+</Derivation>
+
+<Derivation title="A* terminates and is complete" result="\text{pops } q_{goal} \text{ or empties } O \text{ — finitely}">
+**Statement.** On a finite graph, A* (Alg. 24) either pops $\qgoal$ or empties $O$; in the latter
+case no path exists (Choset §H.2.2).
+
+**Step 1.** Each expansion moves a node into $C$. Under a consistent heuristic a node is never
+removed from $C$ again, so there are at most $|V|$ expansions. Without consistency a closed node may
+be *reopened* when a cheaper path to it is found; but each reopening strictly decreases its $g$,
+and $g$ takes values among the costs of acyclic paths, of which a finite graph has finitely many.
+Choset's phrasing: A* searches a tree, a tree has finitely many acyclic paths, so the work is finite.
+
+**Step 2.** $V$ is finite, so by Step 1 the number of expansions is finite and the loop terminates.
+
+**Step 3.** While a path from $\qstart$ to $\qgoal$ exists, $O$ contains some node on it: the start
+is on it and in $O$ initially; whenever a path node is expanded, its successor on the path is
+inserted or already present. So $O$ cannot empty while a path exists, and if $O$ empties, no path
+exists. $\blacksquare$
+</Derivation>
+
+<Derivation title="A* is optimal under admissibility" result="g(q_{goal}) = c^\star \text{ when first popped}">
+**Statement.** If $h$ is admissible, then the first time $\qgoal$ is popped, $g(\qgoal) = c^\star$,
+the cost of a cheapest path (formalizing Choset §H.2.2).
+
+**Step 1 — suppose not.** Assume $\qgoal$ is popped with $g(\qgoal) > c^\star$.
+
+**Step 2 — a frontier node on an optimal path.** Fix an optimal path $\qstart = v_0, v_1, \dots,
+v_m = \qgoal$. Let $v$ be the first node on it not yet expanded. Its predecessor has been expanded
+with the optimal $g$ (induction along the path), so $v \in O$ with $g(v) = g^\star(v)$.
+
+**Step 3 — bound its priority.** $f(v) = g^\star(v) + h(v) \le g^\star(v) + h^\star(v) = c^\star$,
+using admissibility and the fact that $v$ lies on an optimal path.
+
+**Step 4 — compare with the goal.** $f(\qgoal) = g(\qgoal) + 0 > c^\star \ge f(v)$.
+
+**Step 5 — contradiction.** The queue pops the smallest $f$, so it would pop $v$ before $\qgoal$.
+Hence the assumption fails and $g(\qgoal) = c^\star$. $\blacksquare$
+
+*Reconciling two stopping rules.* Alg. 24 exits when the goal is *popped*. Choset's §H.2
+walk-through keeps expanding nodes whose $f$ is below the pushed goal's and discards the rest. These
+are the same rule: a node is popped only when nothing in $O$ beats it, so the walk-through's
+"discard everything with $f \ge$ the goal's" is what the pop does implicitly.
+</Derivation>
+
+<Derivation title="Consistency means no node is ever reopened" result="f \text{ non-decreasing along pops} \Rightarrow g \text{ optimal at closing}">
+**Statement.** With a consistent $h$, the popped $f$-values are non-decreasing, and every node's $g$
+is already optimal when it enters $C$.
+
+**Step 1.** For an edge $(n, x)$, $f(x) = g(n) + c(n, x) + h(x) \ge g(n) + h(n) = f(n)$ by
+consistency. A node's children enter the queue with priority at least their parent's.
+
+**Step 2.** Hence the sequence of popped $f$-values is monotone non-decreasing: whatever is popped
+next was inserted by some earlier pop with no smaller $f$.
+
+**Step 3.** Suppose a closed node $x$ later received a cheaper $g$ via some node $y$ popped after
+$x$. Then $f(x)_{\text{new}} = g_{\text{new}}(x) + h(x) < f(x)_{\text{old}} \le f(y)$, contradicting
+monotonicity. So closed nodes stay closed and their $g$ is optimal. $\blacksquare$
+
+*Consequences.* Octile and Euclidean heuristics are consistent, so the "reopened" column in the
+Search Theater reads zero for them, and the chapter's check asserts it on two hundred random grids.
+An inflated $\varepsilon h$ with $\varepsilon > 1$ is not consistent — but it still satisfies
+$c \le \varepsilon\, c^\star$, since the argument of the previous derivation goes through with
+$f(v) \le g^\star(v) + \varepsilon h^\star(v) \le \varepsilon c^\star$. That is the weighted-A*
+bound, which anytime planners such as ARA* (Likhachev, Gordon and Thrun, 2003; see the literature)
+exploit by running a decreasing schedule of $\varepsilon$ and reusing the open set between runs.
+</Derivation>
+
+### Where optimism fails: the four-node counterexample
+
+<Derivation title="The non-optimistic counterexample" result="A^\star \text{ returns cost } 8;\ \text{optimum } 5">
+**Statement** (Choset §H.2.5, figure H.20, with the numbers fixed). Edges $S$–$A$: $4$, $A$–$G$:
+$4$, $S$–$B$: $3$, $B$–$G$: $2$. Heuristic $h(S) = 2$, $h(A) = 3$, $h(B) = 10$, $h(G) = 0$. A*
+returns $S, A, G$ at cost $8$; the optimum $S, B, G$ costs $5$.
+
+**Step 1 — expand $S$.** $f(A) = g(A) + h(A) = 4 + 3 = 7$; $f(B) = 3 + 10 = 13$.
+
+**Step 2 — expand $A$**, the smaller $f$. $f(G) = (4 + 4) + 0 = 8$.
+
+**Step 3 — pop $G$.** $8 < 13$, so the goal is popped before $B$ is ever expanded. A* returns the
+back-pointer path $S, A, G$ with $g(G) = 8$.
+
+**Step 4 — the culprit.** $h(B) = 10 > h^\star(B) = 2$. In Step 3 of the optimality proof the
+inequality $f(v) \le c^\star$ needed $h(v) \le h^\star(v)$ at the frontier node $v = B$ on the
+optimal path; here $f(B) = 13 > 5 = c^\star$, and the chain of inequalities snaps. One bad estimate,
+anywhere on an optimal path, suffices. $\blacksquare$
+
+Repair $h(B)$ to its true value $2$ and A* pops $B$ at $f = 5$ before $G$ at $8$, finds $G$ via $B$
+at $f = 5$, and returns the optimum; the chapter's check runs both versions.
+</Derivation>
+
+### The hand trace: five pops on a $4 \times 3$ grid
+
+Here is the micro-example the tests pin, in Choset's §H.2.4 style. An 8-connected $4 \times 3$ grid,
+cells $(\mathrm{col}, \mathrm{row})$ with $\mathrm{col} \in \{1, \dots, 4\}$ and
+$\mathrm{row} \in \{1, 2, 3\}$; obstacle cells $(2, 1)$ and $(2, 2)$ are *deleted* from the graph;
+$\qstart = (1, 1)$, $\qgoal = (4, 1)$; axial step $1$, diagonal $1.4$; octile heuristic. Ties in $f$
+break toward smaller $h$, then lexicographically.
+
+| pop | expanded | $g$ | $h$ | $f$ | open set after expansion ($f$: cell) |
+|---|---|---|---|---|---|
+| 1 | $(1,1)$ | $0$ | $3.0$ | $3.0$ | $4.4$: $(1,2)$ |
+| 2 | $(1,2)$ | $1.0$ | $3.4$ | $4.4$ | $5.2$: $(2,3)$ · $5.8$: $(1,3)$ |
+| 3 | $(2,3)$ | $2.4$ | $2.8$ | $5.2$ | $5.2$: $(3,2)$ · $5.8$: $(1,3)$, $(3,3)$ |
+| 4 | $(3,2)$ | $3.8$ | $1.4$ | $5.2$ | $5.2$: $(4,1)$ · $5.8$: $(1,3)$, $(3,1)$, $(3,3)$, $(4,2)$ · $7.2$: $(4,3)$ |
+| 5 | $(4,1)$ | $5.2$ | $0$ | $5.2$ | goal popped — done |
+
+Back pointers give $(1,1) \to (1,2) \to (2,3) \to (3,2) \to (4,1)$ at cost
+$1 + 1.4 + 1.4 + 1.4 = \mathbf{5.2}$ in **five** expansions. Dijkstra on the same grid, $h \equiv 0$,
+expands all **ten** free cells — every other free cell has $g < 5.2$, so all of them are popped
+before the goal — and returns the same cost. Greedy, $f = h$, happens to find the same path here in
+five expansions, with no guarantee that it would anywhere else. All three facts are asserted by
+`astar_trace_matches_text` and the TypeScript check that mirrors it.
+
+### Repairing a search: D*, and universal plans
+
+<Derivation title="D* repairs locally; backward Dijkstra is a universal plan" result="h(X) = \min_Y [c(X,Y) + h(Y)];\ \text{repair touches only chains through the change}">
+**Statement** (Choset §H.3–H.4). Dijkstra from $\qgoal$ labels every node with its cost-to-goal
+$h(X)$ and a back pointer $b(X)$ — a policy. When an arc cost changes, only nodes whose best path
+used that arc need new labels.
+
+**Step 1.** Backward Dijkstra is forward Dijkstra on the reversed graph; for the symmetric graphs
+this chapter searches, the same graph.
+
+**Step 2 — the fixed point.** Its labels satisfy $h(X) = \min_Y [c(X, Y) + h(Y)]$ with
+$h(\qgoal) = 0$: a *deterministic Bellman equation*. The policy is the arg min.
+
+**Step 3 — raised states.** Increase the cost of an arc $(X_c, Y)$. Only nodes whose back-pointer
+chain passes through that arc have an $h$ that is now too small. D* re-inserts the affected states;
+when such a state is popped its key $k$ — the smallest $h$ it has had since insertion — is less than
+its current $h$. Choset calls it a **RAISE** state: its old route got worse.
+
+**Step 4 — lowered states.** A neighbor whose chain avoided the change has a trustworthy $h$ and can
+offer a better route: in Choset's gate example, cell $(3,2)$ is raised when the gate $(4,3)$ closes,
+and its neighbor $(4,1)$, whose path never used the gate, offers $h(4,1) + 1.4 = 6.2 + 1.4 = 7.6$
+(figure H.26). A state popped with $k = h$ is a **LOWER** state: it has good news for its descendants.
+
+**Step 5 — when to stop.** Propagation stops when the smallest key on the open list is at least the
+robot's own $h(X_c)$ (Alg. 25, line 20): nothing left on the queue could lower the robot's cost, so
+its back-pointer path is optimal again. $\blacksquare$
+
+*PROCESS-STATE* (Alg. 31) is the case analysis of Steps 3–4 made exact; the Rust `dstar.rs` and the
+TypeScript port follow Stentz's original structure, in which a state that is lowered by the RAISE
+fix-up still propagates in the same call (Choset's typesetting has an `else if` there — see the
+honesty notes). *D\* Lite* (Koenig and Likhachev) reaches the same behavior from Lifelong Planning
+A*: two values per vertex, $g$ and a one-step lookahead $rhs$, a queue of *inconsistent* vertices,
+and a key modifier $k_m$ that absorbs the robot's own motion so the heap never needs re-keying. In
+the sister book's
+[Chapter 21](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch21-mdps) the
+$\min$ in Step 2 becomes an expectation and the plan becomes a value function; nothing else changes.
+</Derivation>
+
+### Complexity and completeness
+
+<Figure caption="Choset Appendix G in one picture. Left: the complexity classes, nested, with the inclusions that are proven and the strictness that is open. Right: the three completeness notions this book uses as law; hover for the definitions.">
+  <ComplexityLadder />
+</Figure>
+
+Running time is measured asymptotically (Choset Def. G.1.1): $f \in O(g)$ if $f(n) \le c\,g(n)$ for
+all large $n$; $\Omega$ is the lower bound, $\Theta$ both, $o$ and $\omega$ the strict versions. A*
+with a binary heap runs in $O((V + E)\log V)$ in the worst case, the same as Dijkstra, and the
+heuristic buys a smaller constant — fewer expansions — not a better exponent.
+
+<KeyIdea title="Definitions G.2.5, G.2.7, G.2.11 — P, NP, PSPACE">
+A decision problem is in **P** if some algorithm decides it in polynomial time; in **NP** if a
+polynomial-length certificate for a "yes" instance can be verified in polynomial time; in
+**PSPACE** if some algorithm decides it in polynomial space. $P \subseteq NP \subseteq PSPACE
+\subseteq EXPTIME$ (Choset §G.2). Shortest paths, and A* on an explicit graph, are in P.
+Generalized motion planning with many bodies is PSPACE-hard, which Chapter 9 needs when it quotes
+Canny's bound.
+</KeyIdea>
+
+<KeyIdea title="Definitions G.3.1–G.3.3 — three kinds of complete">
+An algorithm is **complete** if in finite time it finds a solution when one exists and otherwise
+reports that none does; **resolution complete** if it does so for a fixed resolution step
+$\epsilon > 0$; **probabilistically complete** if the probability of finding an existing solution
+tends to one as running time tends to infinity. A* is complete. A grid planner is resolution
+complete: it answers correctly about the grid. PRM and RRT, in Part III, are probabilistically
+complete and cannot report that no solution exists.
+</KeyIdea>
+
+## The algorithm
+
+Choset's Algorithm 24 is the master template; everything else in this chapter is a special case,
+a repair of it, or a run of it in reverse.
+
+<Algorithm
+  name="BEST-FIRST(G, q_start, q_goal, h, priority)  —  Choset Alg. 24 with the knob exposed"
+  inputs="a graph G with Star(n) and costs c ≥ 0, start and goal, a heuristic h, a priority rule"
+  outputs="a back-pointer path from q_start to q_goal and its cost, or failure when O empties"
+  complexity="O((V + E) log V) with a binary heap; the heuristic shrinks the constant"
+>
+1. $g(\qstart) \leftarrow 0$; $O \leftarrow \{\qstart\}$ keyed on $f$; $C \leftarrow \emptyset$
+2. **repeat**
+3. &nbsp;&nbsp;&nbsp;&nbsp;pick $n_{best}$ from $O$ with $f(n_{best}) \le f(n)$ for all $n \in O$ &nbsp;— ties: smaller $h$, then the graph's order
+4. &nbsp;&nbsp;&nbsp;&nbsp;remove $n_{best}$ from $O$ and add it to $C$
+5. &nbsp;&nbsp;&nbsp;&nbsp;**if** $n_{best} = \qgoal$ **then** EXIT with the back-pointer path
+6. &nbsp;&nbsp;&nbsp;&nbsp;**for all** $x \in \mathrm{Star}(n_{best})$ not in $C$ **do**
+7. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**if** $x \notin O$ **then** $g(x) \leftarrow g(n_{best}) + c(n_{best}, x)$; $b(x) \leftarrow n_{best}$; add $x$ to $O$
+8. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**else if** $g(n_{best}) + c(n_{best}, x) < g(x)$ **then** update $g(x)$, $b(x)$ *and* $x$'s priority &nbsp;— Alg. 24 prints only the back pointer
+9. **until** $O$ is empty — report that no path exists
+10. **where** $f(n) = $ link length (breadth-first) · $g(n)$ (Dijkstra) · $h(n)$ (greedy) · $g(n) + \varepsilon h(n)$ (A*, weighted A*)
+</Algorithm>
+
+Two implementation notes that the proofs depend on. The open set is a *lazy* binary heap: improving
+a node pushes a fresh entry and the stale one is discarded when it surfaces, so line 8 never needs a
+decrease-key. And if a node already in $C$ receives a cheaper $g$ — which Derivation 4 says cannot
+happen under a consistent heuristic, and which does happen with $\varepsilon > 1$ — it is
+*reopened*: removed from $C$ and pushed again. Correctness over speed, and a counter the widget shows.
+
+<Algorithm
+  name="PROCESS-STATE(O, L)  —  the heart of D* (Choset Alg. 31, Stentz's structure)"
+  inputs="the open list O keyed on k, all states L with h, k, t, b"
+  outputs="the new k_min, with h, b and O updated"
+  complexity="O(deg · log |O|) per call; a repair runs it until k_min ≥ h(X_c)"
+>
+1. $X \leftarrow$ the state in $O$ with minimum $k$; $k_{old} \leftarrow k(X)$; delete $X$ from $O$, $t(X) \leftarrow \mathrm{CLOSED}$
+2. **if** $k_{old} < h(X)$ **then** &nbsp;— RAISE: the old route got worse; look for a rescuer
+3. &nbsp;&nbsp;&nbsp;&nbsp;**for each** neighbor $Y$ with $h(Y) \le k_{old}$ and $h(X) > h(Y) + c(Y, X)$: $b(X) \leftarrow Y$; $h(X) \leftarrow h(Y) + c(Y, X)$
+4. **if** $k_{old} = h(X)$ **then** &nbsp;— LOWER: good news for the descendants
+5. &nbsp;&nbsp;&nbsp;&nbsp;**for each** neighbor $Y$: **if** $t(Y) = \mathrm{NEW}$, or $b(Y) = X$ and $h(Y) \ne h(X) + c(X, Y)$, or $b(Y) \ne X$ and $h(Y) > h(X) + c(X, Y)$ **then** $b(Y) \leftarrow X$; INSERT$(Y, h(X) + c(X, Y))$
+6. **else** &nbsp;— still RAISE after the fix-up
+7. &nbsp;&nbsp;&nbsp;&nbsp;**for each** neighbor $Y$: **if** $t(Y) = \mathrm{NEW}$, or $b(Y) = X$ and $h(Y) \ne h(X) + c(X,Y)$ **then** $b(Y) \leftarrow X$; INSERT$(Y, h(X) + c(X,Y))$
+8. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**else if** $b(Y) \ne X$ and $h(Y) > h(X) + c(X,Y)$ **then** INSERT$(X, h(X))$ &nbsp;— re-open X: it can still improve Y later
+9. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**else if** $b(Y) \ne X$ and $h(X) > h(Y) + c(X,Y)$ and $t(Y) = \mathrm{CLOSED}$ and $h(Y) > k_{old}$ **then** INSERT$(Y, h(Y))$ &nbsp;— re-open a possible rescuer
+10. **return** $k_{min}$ of $O$ &nbsp;— INSERT (Alg. 27): $k(X) \leftarrow h_{new}$ if NEW, $\min(k, h_{new})$ if OPEN, $\min(h, h_{new})$ if CLOSED; then $h(X) \leftarrow h_{new}$, $t(X) \leftarrow \mathrm{OPEN}$
+</Algorithm>
+
+<Algorithm
+  name="D*-LITE  —  Koenig & Likhachev's ComputeShortestPath, backward from the goal"
+  inputs="g, rhs tables (∞ except rhs(goal) = 0), a queue U keyed on [min(g,rhs) + h(start, s) + k_m ; min(g,rhs)]"
+  outputs="g(start) = cost-to-goal, with the greedy descent of g an optimal path"
+  complexity="each vertex expanded at most twice per repair; repair cost proportional to the affected region"
+>
+1. **while** TopKey$(U) \le$ Key$(s_{start})$ **or** $rhs(s_{start}) \ne g(s_{start})$ **do** &nbsp;— ties processed too, so the whole $f \le g(s_{start})$ band is consistent
+2. &nbsp;&nbsp;&nbsp;&nbsp;$u \leftarrow$ Pop$(U)$, $k_{old} \leftarrow$ its key
+3. &nbsp;&nbsp;&nbsp;&nbsp;**if** $k_{old} <$ Key$(u)$ **then** re-insert $u$ with Key$(u)$ &nbsp;— stale because $k_m$ grew
+4. &nbsp;&nbsp;&nbsp;&nbsp;**else if** $g(u) > rhs(u)$ **then** $g(u) \leftarrow rhs(u)$; UpdateVertex on every predecessor &nbsp;— overconsistent: commit the good news
+5. &nbsp;&nbsp;&nbsp;&nbsp;**else** $g(u) \leftarrow \infty$; UpdateVertex on every predecessor and on $u$ &nbsp;— underconsistent: forget, re-derive
+6. **UpdateVertex**$(u)$: **if** $u \ne s_{goal}$: $rhs(u) \leftarrow \min_{s'} [c(u, s') + g(s')]$; remove $u$ from $U$; **if** $g(u) \ne rhs(u)$ insert $u$ with Key$(u)$
+7. **on edge changes**: $k_m \leftarrow k_m + h(s_{last}, s_{start})$; $s_{last} \leftarrow s_{start}$; UpdateVertex on both endpoints of every changed arc; run lines 1–5
+8. **move**: $s_{start} \leftarrow \arg\min_{s'} [c(s_{start}, s') + g(s')]$
+</Algorithm>
+
+<Algorithm
+  name="UNIVERSAL-PLAN(G, q_goal)  —  Choset §H.4"
+  inputs="a graph with symmetric non-negative costs and a goal"
+  outputs="cost-to-go h(X) and a successor π*(X) for every reachable X"
+  complexity="one full Dijkstra, O((V + E) log V); every later query is a lookup"
+>
+1. $h(\qgoal) \leftarrow 0$; push $\qgoal$; all other $h \leftarrow \infty$
+2. **while** the queue is non-empty **do** pop the cheapest $X$
+3. &nbsp;&nbsp;&nbsp;&nbsp;**for each** $Y \in \mathrm{Star}(X)$: **if** $h(X) + c(X, Y) < h(Y)$ **then** $h(Y) \leftarrow h(X) + c(X, Y)$; $\pi^\star(Y) \leftarrow X$; push $Y$
+4. **return** $(h, \pi^\star)$ &nbsp;— $h$ satisfies $h(X) = \min_Y [c(X,Y) + h(Y)]$ everywhere; following $\pi^\star$ from any $X$ costs exactly $h(X)$
+</Algorithm>
+
+### Replanning, watched
+
+<Deferred>
+  <DStarReplanner />
+</Deferred>
+
+With Choset's gate world the numbers are the ones in his figures. The initial backward Dijkstra
+labels the start $(2,1)$ with $h = 7.0$ — five diagonals — and $(4,1)$ with $h = 6.2$, and Rusty
+sets off along $(2,1)\,(3,2)\,(4,3)\,(5,4)\,(6,5)\,(7,6)$. The gate closes; at $(3,2)$ Rusty is
+adjacent and notices. D* re-inserts the gate and its neighbors, pops $(3,2)$ as a RAISE state —
+its $h$ has jumped above Choset's obstacle cost of $10000$ while its key stays at the old $7.0$ —
+and the LOWER neighbor $(4,1)$ rescues it at $6.2 + 1.4 = 7.6$. The repair pops **15** states, five
+of them raised, and Rusty drives $(3,2)\,(4,1)\,(5,2)\,(6,3)\,(7,4)\,(7,5)\,(7,6)$ at cost $7.6$.
+Redoing the backward Dijkstra from scratch on the changed map would pop **32**; a from-scratch A*
+from $(3,2)$ needs only **7** expansions on this tiny grid, which is Exercise 4's point — repair is
+not always cheaper than redo, and the raised/lowered classification says when it is.
+
+### A plan that is a field
+
+<Deferred>
+  <UniversalPlanField />
+</Deferred>
+
+A path is a plan for one start. Run the backward Dijkstra to exhaustion and every free cell of the
+Apartment carries a cost-to-go and an arrow; kick Rusty anywhere and the arrows bring it home. The
+equal-cost contours are wave fronts — Chapter 7's wave-front planner is this picture with unit
+costs — and the panel under the canvas evaluates $h(X) = \min_Y [c(X, Y) + h(Y)]$ at the cell under
+the cursor, term by term, with the minimizing $Y$ being the arrow. The chapter's check asserts the
+equation holds at every labelled cell to $10^{-15}$ and that following the arrows from sixty random
+cells reaches the goal at exactly Dijkstra's cost for that start.
+
+## Implementation in Rust
+
+The `search` crate is introduced here and imported by Chapters 7, 8, 10, 16, 18, 21 and 22. Its
+interface is the smallest thing best-first search needs.
+
+```rust title="crates/search/src/space.rs"
+/// Anything best-first search can walk. Costs are non-negative edge weights
+/// (Choset App. H.1); `Node` must be hashable so open/closed sets are maps.
+pub trait SearchSpace {
+    type Node: Copy + Eq + std::hash::Hash;
+    /// Star(n) with edge costs c(n, x) — Choset's notation, made an iterator.
+    fn neighbors(&self, n: Self::Node) -> impl Iterator<Item = (Self::Node, f64)> + '_;
+}
+
+/// 8-connected lattice over a rasterized Q_free (Chapter 4's `cspace::Raster`). `diag` is
+/// 1.4 for Choset's grid metric (figure H.16) or SQRT_2 for the exact one. Obstacle cells
+/// are deleted from the graph: a neighbor that is occupied is simply not yielded.
+pub struct Grid8<'a> { pub raster: &'a cspace::Raster, pub diag: f64 }
+
+impl SearchSpace for Grid8<'_> {
+    type Node = (i32, i32);
+    fn neighbors(&self, (i, j): (i32, i32)) -> impl Iterator<Item = ((i32, i32), f64)> + '_ {
+        const STEPS: [(i32, i32); 8] = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)];
+        STEPS.iter().filter_map(move |&(di, dj)| {
+            let n = (i + di, j + dj);
+            if !self.raster.is_free(n) { return None; }
+            let diag = di != 0 && dj != 0;
+            Some((n, if diag { self.diag } else { 1.0 } * self.raster.cell_size()))
+        })
+    }
+}
+```
+
+The engine is one function. `Priority` is the knob; `Trace` records the pop order so the examples
+can print Choset-style tables and the widgets can paint the frontier.
+
+```rust title="crates/search/src/best_first.rs" {9-15,41-48}
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+
+/// The one knob: how a node's priority is formed from g, h and depth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Priority { LinkLength, CostToCome, HeuristicOnly, Sum { eps: f64 } }
+
+impl Priority {
+    fn f(self, g: f64, h: f64, depth: usize) -> f64 {
+        match self {
+            Priority::LinkLength => depth as f64,
+            Priority::CostToCome => g,
+            Priority::HeuristicOnly => h,
+            Priority::Sum { eps } => g + eps * h,
+        }
+    }
+}
+
+/// One row of the trace table and the result of a search.
+pub struct Pop<N> { pub node: N, pub g: f64, pub h: f64, pub f: f64 }
+pub struct Trace<N> { pub pops: Vec<Pop<N>>, pub path: Vec<N>, pub cost: f64, pub reopened: usize }
+
+/// Heap entries ordered by (f, h, seq): ties toward smaller h, then insertion order.
+/// `Reverse` semantics are written out so the comparison is readable.
+struct Entry<N> { f: f64, h: f64, seq: u64, g: f64, node: N }
+impl<N> PartialEq for Entry<N> { fn eq(&self, o: &Self) -> bool { self.cmp(o) == Ordering::Equal } }
+impl<N> Eq for Entry<N> {}
+impl<N> PartialOrd for Entry<N> { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+impl<N> Ord for Entry<N> {
+    fn cmp(&self, o: &Self) -> Ordering {
+        // BinaryHeap is a max-heap: reverse every component so the smallest f pops first.
+        o.f.total_cmp(&self.f).then(o.h.total_cmp(&self.h)).then(o.seq.cmp(&self.seq))
+    }
+}
+
+/// BFS, Dijkstra, greedy, and (weighted) A* are this function with four `Priority` values.
+/// Returns `None` when the open set empties — the completeness half of Derivation 2.
+pub fn best_first<S: SearchSpace>(
+    space: &S, start: S::Node, goal: S::Node,
+    h: impl Fn(S::Node) -> f64, prio: Priority,
+) -> Option<Trace<S::Node>> {
+    let mut g: HashMap<S::Node, f64> = HashMap::from([(start, 0.0)]);
+    let mut depth: HashMap<S::Node, usize> = HashMap::from([(start, 0)]);
+    let mut parent: HashMap<S::Node, S::Node> = HashMap::new();
+    let mut closed: HashSet<S::Node> = HashSet::new();
+    let mut open = BinaryHeap::new();
+    let (mut seq, mut pops, mut reopened) = (0u64, Vec::new(), 0usize);
+    open.push(Entry { f: prio.f(0.0, h(start), 0), h: h(start), seq, g: 0.0, node: start });
+
+    while let Some(Entry { node, g: gn, .. }) = open.pop() {
+        // Lazy deletion: a stale entry (better g pushed later, or already closed) costs nothing.
+        if closed.contains(&node) || gn > g[&node] + 1e-12 { continue; }
+        closed.insert(node);
+        let d = depth[&node];
+        pops.push(Pop { node, g: gn, h: h(node), f: prio.f(gn, h(node), d) });
+        if node == goal {
+            let mut path = vec![goal];
+            while let Some(&p) = parent.get(path.last().unwrap()) { path.push(p); }
+            path.reverse();
+            return Some(Trace { pops, path, cost: gn, reopened });
+        }
+        for (x, c) in space.neighbors(node) {
+            let tentative = gn + c;
+            // Breadth-first relaxes on link length (first discovery wins); the rest on cost.
+            let better = match prio {
+                Priority::LinkLength => d + 1 < *depth.get(&x).unwrap_or(&usize::MAX),
+                _ => tentative < *g.get(&x).unwrap_or(&f64::INFINITY) - 1e-12,
+            };
+            if !better { continue; }
+            if closed.remove(&x) { reopened += 1; }       // only an inconsistent h gets here
+            g.insert(x, tentative); depth.insert(x, d + 1); parent.insert(x, node);
+            seq += 1;
+            open.push(Entry { f: prio.f(tentative, h(x), d + 1), h: h(x), seq, g: tentative, node: x });
+        }
+    }
+    None
+}
+
+pub fn astar<S: SearchSpace>(s: &S, a: S::Node, b: S::Node, h: impl Fn(S::Node) -> f64) -> Option<Trace<S::Node>> {
+    best_first(s, a, b, h, Priority::Sum { eps: 1.0 })
+}
+pub fn dijkstra<S: SearchSpace>(s: &S, a: S::Node, b: S::Node) -> Option<Trace<S::Node>> {
+    best_first(s, a, b, |_| 0.0, Priority::CostToCome)
+}
+```
+
+D* Lite is the default replanner. The whole algorithm is the key, the two update cases, and the
+modifier $k_m$; everything else is bookkeeping.
+
+```rust title="crates/search/src/dstar_lite.rs" {22-35}
+/// Incremental replanner (Koenig & Likhachev 2002/2005): g/rhs tables plus the key
+/// modifier k_m, so the robot's own motion never forces a heap rebuild.
+pub struct DStarLite<S: SearchSpace> {
+    space: S,
+    g: HashMap<S::Node, f64>,
+    rhs: HashMap<S::Node, f64>,
+    queue: KeyedHeap<S::Node, [f64; 2]>,   // lazy; stale entries detected by key mismatch
+    start: S::Node, last: S::Node, goal: S::Node,
+    km: f64,
+    h: fn(S::Node, S::Node) -> f64,
+}
+
+impl<S: SearchSpace> DStarLite<S> {
+    fn key(&self, s: S::Node) -> [f64; 2] {
+        let m = self.g[&s].min(self.rhs[&s]);
+        [m + (self.h)(self.start, s) + self.km, m]
+    }
+
+    fn update_vertex(&mut self, u: S::Node) {
+        if u != self.goal {
+            let best = self.space.neighbors(u).map(|(v, c)| c + self.g[&v]).fold(f64::INFINITY, f64::min);
+            self.rhs.insert(u, best);
+        }
+        self.queue.remove(u);
+        if self.g[&u] != self.rhs[&u] { let k = self.key(u); self.queue.insert(u, k); }
+    }
+
+    pub fn compute_shortest_path(&mut self) -> usize {
+        let mut pops = 0;
+        // Process ties with the start's key as well: a stale vertex left at an equal key
+        // can win a tie in the greedy descent and misreport the path's cost.
+        while self.queue.top_key().is_some_and(|k| k <= self.key(self.start)) || self.rhs[&self.start] != self.g[&self.start] {
+            let Some((u, k_old)) = self.queue.pop() else { break };
+            pops += 1;
+            let k_new = self.key(u);
+            if k_old < k_new { self.queue.insert(u, k_new); }
+            else if self.g[&u] > self.rhs[&u] {
+                self.g.insert(u, self.rhs[&u]);                      // overconsistent: commit
+                for (p, _) in self.space.neighbors(u) { self.update_vertex(p); }
+            } else {
+                self.g.insert(u, f64::INFINITY);                     // underconsistent: re-derive
+                for (p, _) in self.space.neighbors(u) { self.update_vertex(p); }
+                self.update_vertex(u);
+            }
+        }
+        pops
+    }
+
+    /// Report observed cost changes; returns how many vertices' values moved (w6.2's statistic).
+    pub fn update_edges(&mut self, changed: &[(S::Node, S::Node)]) -> usize {
+        self.km += (self.h)(self.last, self.start);
+        self.last = self.start;
+        let mut touched = HashSet::new();
+        for &(u, v) in changed { for s in [u, v] { self.update_vertex(s); touched.insert(s); } }
+        self.compute_shortest_path();
+        touched.len()
+    }
+
+    pub fn next_step(&mut self) -> Option<S::Node> {
+        if self.g[&self.start].is_infinite() { return None; }
+        let (s, _) = self.space.neighbors(self.start)
+            .map(|(v, c)| (v, c + self.g[&v]))
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        self.start = s;
+        Some(s)
+    }
+}
+```
+
+The universal plan is Dijkstra with the early exit removed and the direction reversed.
+
+```rust title="crates/search/src/policy.rs"
+/// Choset §H.4: Dijkstra run backward from the goal yields cost-to-go and a successor
+/// for *every* node — a universal plan. The sister book's Chapter 21 generalizes `min` to E[·].
+pub struct UniversalPlan<N> { pub cost_to_go: HashMap<N, f64>, pub next: HashMap<N, N> }
+
+pub fn universal_plan<S: SearchSpace>(space: &S, goal: S::Node) -> UniversalPlan<S::Node> {
+    let mut cost_to_go = HashMap::from([(goal, 0.0)]);
+    let mut next = HashMap::from([(goal, goal)]);
+    let mut closed = HashSet::new();
+    let mut heap = BinaryHeap::new();
+    heap.push(MinEntry { key: 0.0, node: goal });
+    while let Some(MinEntry { key, node: x }) = heap.pop() {
+        if !closed.insert(x) || key > cost_to_go[&x] + 1e-12 { continue; }
+        for (y, c) in space.neighbors(x) {              // symmetric edges: neighbors = predecessors
+            let cand = cost_to_go[&x] + c;
+            if cand < *cost_to_go.get(&y).unwrap_or(&f64::INFINITY) - 1e-12 {
+                cost_to_go.insert(y, cand);
+                next.insert(y, x);
+                heap.push(MinEntry { key: cand, node: y });
+            }
+        }
+    }
+    UniversalPlan { cost_to_go, next }
+}
+
+/// The deterministic Bellman residual: max |h(X) − min_Y [c(X,Y) + h(Y)]|, zero for a correct plan.
+pub fn bellman_residual<S: SearchSpace>(space: &S, plan: &UniversalPlan<S::Node>) -> f64 {
+    plan.cost_to_go.iter().filter(|(x, _)| plan.next[x] != **x).map(|(&x, &hx)| {
+        let best = space.neighbors(x).filter_map(|(y, c)| plan.cost_to_go.get(&y).map(|hy| c + hy)).fold(f64::INFINITY, f64::min);
+        (hx - best).abs()
+    }).fold(0.0, f64::max)
+}
+```
+
+### The worked example, and its printed output
+
+```rust title="crates/search/examples/astar_trace.rs"
+fn main() {
+    let raster = cspace::Raster::from_ascii(&["....", ".#..", ".#.."]);   // first row is the top
+    let grid = Grid8 { raster: &raster, diag: 1.4 };
+    let (start, goal) = ((0, 0), (3, 0));                                    // (col,row) = (1,1), (4,1)
+    let h = |(i, j): (i32, i32)| { let (dx, dy) = ((3 - i).abs() as f64, (0 - j).abs() as f64); 1.4 * dx.min(dy) + (dx - dy).abs() };
+    let t = astar(&grid, start, goal, h).expect("a path exists");
+    println!("pop  node   g    h    f");
+    for (k, p) in t.pops.iter().enumerate() {
+        println!("{:>3}  ({},{}) {:.1}  {:.1}  {:.1}", k + 1, p.node.0 + 1, p.node.1 + 1, p.g, p.h, p.f);
+    }
+    println!("path: {}", t.path.iter().map(|(i, j)| format!("({},{})", i + 1, j + 1)).collect::<Vec<_>>().join(" "));
+    println!("cost = {:.1}", t.cost);
+    let d = dijkstra(&grid, start, goal).unwrap();
+    println!("dijkstra: expansions = {}, cost = {:.1}", d.pops.len(), d.cost);
+}
+```
+
+```text title="cargo run -p search --example astar_trace"
+pop  node   g    h    f
+  1  (1,1) 0.0  3.0  3.0
+  2  (1,2) 1.0  3.4  4.4
+  3  (2,3) 2.4  2.8  5.2
+  4  (3,2) 3.8  1.4  5.2
+  5  (4,1) 5.2  0.0  5.2
+path: (1,1) (1,2) (2,3) (3,2) (4,1)
+cost = 5.2
+dijkstra: expansions = 10, cost = 5.2
+```
+
+```text title="cargo run -p search --example nonoptimistic   ·   cargo run -p search --example dstar_gate"
+A* returned cost 8 via A; optimal is 5 via B
+initial path: (2,1) (3,2) (4,3) (5,4) (6,5) (7,6)  cost 7.0
+gate (4,3) closed at (3,2): repaired k(3,2) = h(3,2) = 7.6 via (4,1)  —  15 states popped (5 raised) vs 32 for a fresh backward Dijkstra
+```
+
+`astar_trace_matches_text` asserts the pop order, the $g/h/f$ triples to $10^{-9}$, the path, and
+both expansion counts. `astar_equals_dijkstra_on_random_grids` runs two hundred seeded `SmallRng`
+grids and asserts equal costs, zero reopenings, and equality with `pathfinding::prelude::astar`
+(the crate is a test dependency only; no search crate is in the library path).
+`nonoptimistic_loses` asserts $8$ and $5$. `dstar_gate_repairs_to_7_6` asserts the initial path,
+$h(4,1) = 6.2$, and the repaired $k(3,2) = 7.6$ with back pointer $(4,1)$; the work counts are
+regression-locked, as the design doc asks, because they depend on the choice to re-insert both
+endpoints of a changed arc. `dstar_lite_equals_fresh_astar` flips random cells on forty grids as the
+robot walks and asserts, after every flip and every step, that D* Lite's cost-to-goal equals a
+fresh A*'s and that its greedy descent has that cost. `universal_plan_is_bellman_fixed_point`
+asserts the residual is below $10^{-9}$ on the Apartment and that following the policy from sixty
+random cells reaches the goal at Dijkstra's cost. The TypeScript port in `web/lib/search/` runs
+the same eleven checks, and every widget on this page is that port.
+
+<Callout type="info">
+The D* Lite check caught a real bug worth recording. Koenig and Likhachev's loop stops when the top
+key is no longer *less than* the start's. A vertex whose key *ties* the start's — common on a grid,
+where keys are sums of $1$s and $\sqrt 2$s — can be left stale, and on one grid in five hundred the
+greedy descent stepped onto such a vertex and reported a cost $g$ had never promised. Processing
+ties, with a tolerance for the ulp-level rounding of those sums, fixed it. The loop in the listing
+and in the port both say `≤`.
+</Callout>
+
+## Putting it together: a door closes
+
+The integration lab is the Apartment scenario of the D* Replanner. Rasterize the Apartment at
+half-metre cells for disc-Rusty with the Chapter 4 inflation of $0.25$ m, plan from room A to the
+bedroom with `astar` under Choset's $1/1.4$ metric, and let Rusty drive. At the chosen step the cell
+on the plan about halfway along — in the Apartment that is almost always a doorway — becomes an
+obstacle, a door closing while Rusty is en route. When Rusty is adjacent it notices, and D* Lite
+repairs: it updates the cells around the door, propagates until the band of keys below Rusty's own
+is consistent again, and hands back a path through a different door. The blue footprint is the
+repair; the readout compares its size with the expansions a from-scratch A* needs from the same
+cell. In the open corridor the two are comparable, because the repair has to re-derive the whole
+region whose cost-to-go flowed through the closed door; deep inside a room, where a closed door
+changes only a few cells' routes, the repair is a tenth of the redo. Exercise 4 asks you to find the
+other kind of case.
+
+Three pointers forward close the chapter. Chapter 7's brushfire and wave-front planners are
+breadth-first search from a different seed set — all obstacle cells, or the goal — and its
+navigation functions are universal plans with a smoothness requirement. Chapter 8 runs A* on the
+visibility graph and the generalized Voronoi diagram, and Chapter 10 on a cell decomposition's
+adjacency graph; none of them re-implement anything on this page. And the sister book's Chapter 21
+takes the deterministic Bellman equation of the universal plan, replaces the minimum over successors
+by an expectation over outcomes, and arrives at value iteration — the same table, now a value
+function.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Octile is consistent — for the right diagonal">
+    Prove that $h(n) = 1.4\min(\Delta x, \Delta y) + |\Delta x - \Delta y|$ is consistent on the
+    8-connected grid with Choset's $1/1.4$ metric: show $h(n) \le c(n, x) + h(x)$ for each of the
+    eight moves and $h(\qgoal) = 0$. Then give a two-cell example showing that the same formula is
+    *not* admissible if diagonals cost $\sqrt 2$ instead of $1.4$.
+    <Hints>
+      <>Consistency is one inequality per move type. An axial move changes one of Δx, Δy by one; check how much h can drop.</>
+      <>A diagonal move can reduce both Δx and Δy by one, dropping h by exactly 1.4 — the cost of the move. An axial move drops h by at most 1.</>
+      <>For inadmissibility with √2: start one diagonal step from the goal. h says 1.4; the true cost is √2 = 1.414…, so h &lt; h*, fine. Now try two diagonal steps along the same diagonal, and compare 2.8 with 2√2.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Obstacles as 10000-cost nodes">
+    Choset's grid A* (§H.2.4) keeps obstacle pixels in the graph as nodes that cost $10000$ to
+    enter. Show that on any grid with fewer than $10000 / 1.4$ cells this returns the same path as
+    deleting them. Then exhibit a grid where the two differ — and say which answer a robot should
+    prefer.
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the weighted-A* bound, then verify">
+    <Predict
+      id="ch06.e3"
+      question="In the Search Theater set ε = 2. Before pressing Run: can the A* lane's path cost exceed Dijkstra's by more than a factor of 2 on any layout?"
+      options={[
+        { label: 'Yes — once the heuristic is inadmissible, anything goes', because: 'Inadmissible, but not arbitrary. Weighted A* with ε·h keeps the proof of Derivation 3 alive with one extra factor: f(v) ≤ g*(v) + ε h*(v) ≤ ε c*, so the goal is never popped above ε c*.' },
+        { label: 'No — the cost is at most 2 × Dijkstra\'s, and usually much closer', correct: true, because: 'Right. The ε-suboptimality bound c ≤ ε c* holds for every layout, and on grids the realized ratio is typically 1.0–1.2: the bound is loose, the loss is real but small, and the expansion savings are large.' },
+        { label: 'No — the cost never changes at all, only the expansion count does', because: 'That is true for ε ≤ 1. Past 1 the heuristic overestimates, Derivation 5\'s failure mode applies, and the cost does drift — the badge marks the first ε at which it does.' },
+      ]}
+    >
+    Run ten seeds and record the ratio column. You should see values between $1.00$ and about
+    $1.2$, never above $2$. Then set $\varepsilon = 3$ and look for the layouts where the ratio
+    gets largest: they are the ones where the heuristic's straight line toward the goal points
+    into a room with no second door.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="When repair costs more than redo">
+    In the D* Replanner, find a gate position — on Choset's grid or in the Apartment — for which
+    D* Lite touches *more* cells than a from-scratch A* expands. Explain, using the raised/lowered
+    classification, why this is rare: which cells must a repair touch, which cells must a redo
+    touch, and when is the first set the larger?
+    <CheckAnswer
+      id="ch06.e4"
+      prompt="On Choset's gate grid, how many states does the D* repair pop after the gate closes with Rusty at (3,2)?"
+      answer={15}
+      tolerance={0}
+    >
+    Fifteen: the gate cell and its neighbors are re-inserted at their current $h$ and popped as
+    LOWER states, $(3,2)$ and the cells behind it are popped as RAISE states, and the loop stops as
+    soon as the smallest key reaches $7.6$. A from-scratch A* from $(3,2)$ expands only seven cells
+    here, because the grid is tiny and the heuristic nearly exact; a from-scratch backward Dijkstra —
+    what D* would have to redo to recover a plan for *every* cell — pops thirty-two.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="A true FIFO">
+    Implement `Priority::LinkLength` as a true first-in-first-out queue — not a heap with constant
+    keys — and add a property test that breadth-first search and Dijkstra agree on every unit-weight
+    grid over 200 seeded trials: same link length, same cost. Then switch the weights to $1/1.4$
+    and write the test that shows where they disagree, with the four-axial-versus-three-diagonal
+    example as its smallest witness.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="ARA*">
+    Implement anytime repairing A* in `src/ara.rs` with the schedule
+    $\varepsilon = 3, 2, 1.5, 1$, reusing the open set between iterations and keeping the
+    *inconsistent* list that the algorithm uses to seed the next round. Add a fifth lane to the
+    Search Theater that shows each iterate's path, and assert in a test that the final cost equals
+    Dijkstra's. The paper is Likhachev, Gordon and Thrun's; the design is three pages, and
+    Derivation 4 is the part of this chapter you will need.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Appendices G and H are this chapter's source: the by-example pedagogy, Algorithm 24, the non-optimistic figure H.20, the D* gate walk-through and Algorithms 25–31, and the universal plans of §H.4. D* itself is Stentz's (Choset's reference [397], ICRA 1994)."
+  />
+  <Reference
+    authors="Dijkstra, E. W."
+    year={1959}
+    title="A Note on Two Problems in Connexion with Graphs"
+    venue="Numerische Mathematik 1, 269–271"
+    doi="10.1007/BF01386390"
+    note="The cost-to-come search; three pages. The priority rule f = g in this chapter's one loop."
+  />
+  <Reference
+    authors="Hart, P. E., Nilsson, N. J., and Raphael, B."
+    year={1968}
+    title="A Formal Basis for the Heuristic Determination of Minimum Cost Paths"
+    venue="IEEE Transactions on Systems Science and Cybernetics 4(2), 100–107"
+    doi="10.1109/TSSC.1968.300136"
+    note="A*, with the admissibility condition and the optimality theorem that Derivation 3 restates; consistency appears there as the 'consistency assumption'."
+  />
+  <Reference
+    authors="Koenig, S. and Likhachev, M."
+    year={2005}
+    title="Fast Replanning for Navigation in Unknown Terrain"
+    venue="IEEE Transactions on Robotics 21(3), 354–363"
+    doi="10.1109/TRO.2004.838026"
+    note="D* Lite, the chapter's default replanner: g, rhs, the queue of inconsistent vertices, and the key modifier k_m. The AAAI 2002 paper of the same authors introduced it; this is the journal version."
+  />
+  <Reference
+    authors="LaValle, S. M."
+    year={2006}
+    title="Planning Algorithms"
+    venue="Cambridge University Press"
+    url="http://lavalle.pl/planning/"
+    note="Chapter 2 presents discrete planning as the same forward-search template with a swappable priority queue, and is the best second reading for this chapter's 'one search, one knob'."
+  />
+  <Reference
+    authors="Russell, S. and Norvig, P."
+    year={2020}
+    title="Artificial Intelligence: A Modern Approach"
+    venue="Pearson, 4th edition"
+    url="https://aima.cs.berkeley.edu"
+    note="Chapter 3 has the cleanest textbook statements of admissibility, consistency and the no-reopening property, with the proofs this chapter follows."
+  />
+  <Reference
+    authors="Thrun, S., Burgard, W., and Fox, D."
+    year={2005}
+    title="Probabilistic Robotics"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262201629/probabilistic-robotics/"
+    note="Where the universal plan goes next: value iteration over MDPs, which the sister volume's Chapter 21 derives as this chapter's backward Dijkstra with an expectation in place of the minimum."
+  />
+</References>

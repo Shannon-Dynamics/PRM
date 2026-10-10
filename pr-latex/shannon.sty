@@ -1,0 +1,651 @@
+% =============================================================================
+%  shannon.sty — design system for "Probabilistic Robotics via Rust"
+%
+%  Visual language derived from Shannon Robotics (shannon.id):
+%    · Space Grotesk display type for headings and structural furniture
+%    · Slate neutral scale for ink and rules
+%    · Teal (#14b8a6) primary accent, Sky (#0ea5e9) secondary
+%    · Flat, card-like blocks with hairline rules — no gradients, no shadows
+%
+%  Shared with the companion volume "Reinforcement Learning for Robotics", and
+%  extended here with what a book about estimation needs: the five-role
+%  estimation palette, derivation and algorithm blocks, and the notation table.
+%
+%  Compiles with pdfLaTeX (metric-compatible substitute fonts) or with
+%  XeLaTeX/LuaLaTeX (real Space Grotesk if installed on the system).
+% =============================================================================
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{shannon}[2026/08/12 Shannon Robotics book design system]
+
+\RequirePackage{iftex}
+\RequirePackage{xcolor}
+\RequirePackage{graphicx}
+\RequirePackage{amsmath,amssymb,amsthm}
+\RequirePackage{mathtools}
+\RequirePackage[most]{tcolorbox}
+\RequirePackage{titlesec}
+\RequirePackage{fancyhdr}
+\RequirePackage{booktabs}
+\RequirePackage{array}
+\RequirePackage{colortbl}   % provides \arrayrulecolor
+\RequirePackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc}
+\RequirePackage{longtable}
+\RequirePackage{enumitem}
+\RequirePackage{microtype}
+\RequirePackage{caption}
+\RequirePackage{listings}
+\RequirePackage{fontawesome5}
+\RequirePackage[hidelinks]{hyperref}
+
+% -----------------------------------------------------------------------------
+%  Palette — Shannon Robotics tokens
+% -----------------------------------------------------------------------------
+\definecolor{shTeal}{HTML}{14B8A6}     % primary accent
+\definecolor{shTealDark}{HTML}{0F766E} % accent, print-safe on white
+\definecolor{shSky}{HTML}{0EA5E9}      % secondary accent
+\definecolor{shSkyDark}{HTML}{0369A1}
+\definecolor{shSlate950}{HTML}{020617}
+\definecolor{shSlate900}{HTML}{0F172A} % primary ink
+\definecolor{shSlate700}{HTML}{334155} % secondary ink
+\definecolor{shSlate500}{HTML}{64748B} % muted ink
+\definecolor{shSlate400}{HTML}{94A3B8}
+\definecolor{shSlate300}{HTML}{CBD5E1} % rules
+\definecolor{shSlate200}{HTML}{E2E8F0} % hairlines
+\definecolor{shSlate100}{HTML}{F1F5F9} % block fill
+\definecolor{shSlate50}{HTML}{F8FAFC}  % page tint
+
+% Semantic aliases used throughout the book.
+\colorlet{shInk}{shSlate900}
+\colorlet{shInkSecondary}{shSlate700}
+\colorlet{shInkMuted}{shSlate500}
+\colorlet{shRule}{shSlate200}
+\colorlet{shAccent}{shTealDark}
+
+% Layer colours — Foundation / Conceptual / Practical.
+\definecolor{shFoundation}{HTML}{0369A1}  % sky, deepened for print
+\definecolor{shConceptual}{HTML}{0F766E}  % teal
+\definecolor{shPractical}{HTML}{B45309}   % amber, the one warm slot
+\definecolor{shWarning}{HTML}{B91C1C}
+
+% -----------------------------------------------------------------------------
+%  The estimation palette — this book's load-bearing convention
+%
+%  Blue is always the prior, orange always the prediction, green always the
+%  measurement, purple always the posterior, grey always the truth the robot
+%  cannot see. The same five hues carry that meaning in the prose, inside
+%  equations, in every figure, and in the code comments. They are deepened from
+%  the screen values so they hold up in ink on cream stock, and they are never
+%  used for chrome — chrome is teal, deliberately outside these hues.
+% -----------------------------------------------------------------------------
+\definecolor{shPrior}{HTML}{1D4ED8}        % blue
+\definecolor{shPrediction}{HTML}{C2410C}   % orange
+\definecolor{shMeasurement}{HTML}{15803D}  % green
+\definecolor{shPosterior}{HTML}{7E22CE}    % purple
+\definecolor{shTruth}{HTML}{64748B}        % grey
+
+% Term tints for equations. The web edition writes \htmlClass{term-prior}{...};
+% the converter rewrites those into these.
+\newcommand{\prior}[1]{\textcolor{shPrior}{#1}}
+\newcommand{\prediction}[1]{\textcolor{shPrediction}{#1}}
+\newcommand{\measurement}[1]{\textcolor{shMeasurement}{#1}}
+\newcommand{\posterior}[1]{\textcolor{shPosterior}{#1}}
+\newcommand{\truthterm}[1]{\textcolor{shTruth}{#1}}
+
+% Planning roles — this book's own colour code (TOC.md §2). The estimation
+% colours above are kept unchanged for the chapters where a belief appears.
+\definecolor{shStart}{HTML}{15803D}        % green
+\definecolor{shGoal}{HTML}{B91C1C}         % red
+\definecolor{shObstacle}{HTML}{475569}     % slate
+\definecolor{shCObstacle}{HTML}{B45309}    % amber
+\definecolor{shGraph}{HTML}{1D4ED8}        % blue
+\definecolor{shPathCol}{HTML}{6D28D9}      % purple
+\definecolor{shRobot}{HTML}{C2410C}        % orange
+\newcommand{\startterm}[1]{\textcolor{shStart}{#1}}
+\newcommand{\goalterm}[1]{\textcolor{shGoal}{#1}}
+\newcommand{\obstacleterm}[1]{\textcolor{shObstacle}{#1}}
+\newcommand{\cobstacleterm}[1]{\textcolor{shCObstacle}{#1}}
+\newcommand{\graphterm}[1]{\textcolor{shGraph}{#1}}
+\newcommand{\pathterm}[1]{\textcolor{shPathCol}{#1}}
+\newcommand{\robotterm}[1]{\textcolor{shRobot}{#1}}
+
+% The legend, for figures and the front matter.
+\newcommand{\shswatch}[2]{%
+  \raisebox{0.4pt}{\textcolor{#1}{\rule{7pt}{7pt}}}\hspace{3pt}%
+  {\fontsize{8.5}{10}\selectfont\color{shInkSecondary}#2}}
+\newcommand{\shcolorkey}{%
+  \par\vspace{3pt}\noindent
+  \shswatch{shPrior}{prior}\hspace{9pt}%
+  \shswatch{shPrediction}{prediction}\hspace{9pt}%
+  \shswatch{shMeasurement}{measurement}\hspace{9pt}%
+  \shswatch{shPosterior}{posterior}\hspace{9pt}%
+  \shswatch{shTruth}{ground truth}\par\vspace{3pt}}
+\newcommand{\shplanningkey}{%
+  \par\vspace{3pt}\noindent
+  \shswatch{shStart}{start}\hspace{9pt}%
+  \shswatch{shGoal}{goal}\hspace{9pt}%
+  \shswatch{shObstacle}{obstacle}\hspace{9pt}%
+  \shswatch{shCObstacle}{C-obstacle}\hspace{9pt}%
+  \shswatch{shGraph}{roadmap / tree}\hspace{9pt}%
+  \shswatch{shPathCol}{path}\hspace{9pt}%
+  \shswatch{shRobot}{robot}\par\vspace{3pt}}
+
+% -----------------------------------------------------------------------------
+%  Typography
+% -----------------------------------------------------------------------------
+\ifPDFTeX
+  \RequirePackage[T1]{fontenc}
+  \RequirePackage[utf8]{inputenc}
+  \RequirePackage{newpxtext}   % Palatino-like serif for body — long-read comfort
+  \RequirePackage{newpxmath}
+  \RequirePackage[scaled=0.92]{helvet}  % stands in for Space Grotesk
+  \RequirePackage[scaled=0.85]{beramono}
+  \newcommand{\displayfont}{\sffamily}
+\else
+  \RequirePackage{fontspec}
+  \RequirePackage{unicode-math}
+  % Space Grotesk if the system has it; the \IfFontExistsTF guard keeps the
+  % document compilable everywhere.
+  \IfFontExistsTF{Space Grotesk}{%
+    \newfontfamily\spacegrotesk{Space Grotesk}[
+      UprightFont={* Light}, BoldFont={* Bold}, ItalicFont={* Light Italic}]
+    \newcommand{\displayfont}{\spacegrotesk}
+  }{%
+    \newcommand{\displayfont}{\sffamily}
+  }
+  \IfFontExistsTF{TeX Gyre Pagella}{\setmainfont{TeX Gyre Pagella}}{}
+  \IfFontExistsTF{JetBrains Mono}{\setmonofont{JetBrains Mono}[Scale=0.85]}{}
+\fi
+
+% -----------------------------------------------------------------------------
+%  Sectioning — flat, wide-tracked labels in the display face
+% -----------------------------------------------------------------------------
+\titleformat{\chapter}[display]
+  {\displayfont\bfseries}
+  {\normalfont\displayfont\fontsize{11}{13}\selectfont\bfseries\color{shAccent}%
+   \MakeUppercase{Chapter \thechapter}}
+  {6pt}
+  {\color{shInk}\fontsize{30}{34}\selectfont\raggedright}
+  [\vspace{4pt}{\color{shTeal}\rule{\textwidth}{2pt}}]
+
+\titleformat{name=\chapter,numberless}[display]
+  {\displayfont\bfseries}
+  {}
+  {0pt}
+  {\color{shInk}\fontsize{30}{34}\selectfont\raggedright}
+  [\vspace{4pt}{\color{shTeal}\rule{\textwidth}{2pt}}]
+
+\titlespacing*{\chapter}{0pt}{-12pt}{26pt}
+
+\titleformat{\section}
+  {\displayfont\bfseries\fontsize{15.5}{18}\selectfont\color{shInk}}
+  {\color{shAccent}\thesection}{0.6em}{}
+\titlespacing*{\section}{0pt}{20pt}{7pt}
+
+\titleformat{\subsection}
+  {\displayfont\bfseries\fontsize{12.5}{15}\selectfont\color{shInk}}
+  {\color{shAccent}\thesubsection}{0.55em}{}
+\titlespacing*{\subsection}{0pt}{14pt}{5pt}
+
+\titleformat{\subsubsection}
+  {\displayfont\bfseries\fontsize{11}{13}\selectfont\color{shInkSecondary}}
+  {}{0pt}{}
+\titlespacing*{\subsubsection}{0pt}{11pt}{3pt}
+
+% -----------------------------------------------------------------------------
+%  Running heads
+% -----------------------------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+\fancyhead[LE]{\displayfont\fontsize{8.5}{10}\selectfont\color{shInkMuted}\leftmark}
+\fancyhead[RO]{\displayfont\fontsize{8.5}{10}\selectfont\color{shInkMuted}\rightmark}
+\fancyfoot[C]{\displayfont\fontsize{9}{11}\selectfont\color{shInkMuted}\thepage}
+\renewcommand{\chaptermark}[1]{\markboth{\thechapter\ \ #1}{}}
+\renewcommand{\sectionmark}[1]{\markright{\thesection\ \ #1}}
+
+\fancypagestyle{plain}{%
+  \fancyhf{}\renewcommand{\headrulewidth}{0pt}%
+  \fancyfoot[C]{\displayfont\fontsize{9}{11}\selectfont\color{shInkMuted}\thepage}}
+
+% The verso that `openright` inserts before a chapter should be genuinely blank:
+% no running head, no folio.
+\let\sh@origcleardoublepage\cleardoublepage
+\renewcommand{\cleardoublepage}{%
+  \clearpage
+  \ifodd\value{page}\else
+    \hbox{}\thispagestyle{empty}\newpage
+  \fi
+  \sh@origcleardoublepage}
+
+% -----------------------------------------------------------------------------
+%  Blocks — flat cards with a coloured leading rule
+% -----------------------------------------------------------------------------
+\tcbset{
+  shblock/.style={
+    enhanced, breakable, sharp corners,
+    boxrule=0pt, leftrule=2.5pt,
+    colback=shSlate50, colframe=shAccent,
+    left=10pt, right=10pt, top=8pt, bottom=8pt,
+    before skip=11pt, after skip=11pt,
+    fontupper=\normalsize
+  }
+}
+
+% Generic callout: \begin{shcallout}{colour}{icon}{Label} … \end{shcallout}
+\newtcolorbox{shcallout}[3]{%
+  shblock, colframe=#1,
+  colback=#1!4!white,
+  title={},
+  before upper={%
+    {\displayfont\bfseries\fontsize{8.5}{10}\selectfont\color{#1}%
+     #2\hspace{0.4em}\MakeUppercase{#3}}\par\vspace{4pt}}
+}
+
+\newenvironment{shfoundation}[1][Foundation]
+  {\begin{shcallout}{shFoundation}{\faCalculator}{#1}}{\end{shcallout}}
+\newenvironment{shconceptual}[1][Conceptual]
+  {\begin{shcallout}{shConceptual}{\faEye}{#1}}{\end{shcallout}}
+\newenvironment{shpractical}[1][Practical]
+  {\begin{shcallout}{shPractical}{\faMicrochip}{#1}}{\end{shcallout}}
+\newenvironment{shinsight}[1][Key idea]
+  {\begin{shcallout}{shTealDark}{\faLightbulb}{#1}}{\end{shcallout}}
+\newenvironment{shwarning}[1][Where robots break this]
+  {\begin{shcallout}{shWarning}{\faExclamationTriangle}{#1}}{\end{shcallout}}
+\newenvironment{shnote}[1][Note]
+  {\begin{shcallout}{shSlate500}{\faInfoCircle}{#1}}{\end{shcallout}}
+\newenvironment{shrobot}[1][Robot thread]
+  {\begin{shcallout}{shSkyDark}{\faRobot}{#1}}{\end{shcallout}}
+
+% -----------------------------------------------------------------------------
+%  Theorem environments
+% -----------------------------------------------------------------------------
+\newtheoremstyle{shannon}
+  {9pt}{9pt}{}{0pt}
+  {\displayfont\bfseries\color{shAccent}}{.}
+  {0.5em}
+  {\thmname{#1}\thmnumber{ #2}\thmnote{ \normalfont\color{shInkSecondary}--- #3}}
+\theoremstyle{shannon}
+\newtheorem{shtheorem}{Theorem}[chapter]
+\newtheorem{shdefinition}[shtheorem]{Definition}
+\newtheorem{shlemma}[shtheorem]{Lemma}
+\newtheorem{shproposition}[shtheorem]{Proposition}
+\newtheorem{shcorollary}[shtheorem]{Corollary}
+
+% Boxed theorem wrapper so statements read as objects on the page.
+\tcolorboxenvironment{shtheorem}{shblock, colframe=shSkyDark, colback=shSkyDark!4!white}
+\tcolorboxenvironment{shdefinition}{shblock, colframe=shSkyDark, colback=shSkyDark!4!white}
+\tcolorboxenvironment{shlemma}{shblock, colframe=shSkyDark, colback=shSkyDark!4!white}
+\tcolorboxenvironment{shproposition}{shblock, colframe=shSkyDark, colback=shSkyDark!4!white}
+\tcolorboxenvironment{shcorollary}{shblock, colframe=shSkyDark, colback=shSkyDark!4!white}
+
+% Delegate end-marker placement to amsthm's \pushQED/\popQED, which knows how to
+% attach the symbol to the final line — including inside a closing display via
+% \qedhere — instead of stranding it in a paragraph of its own.
+\renewcommand{\qedsymbol}{{\color{shAccent}$\blacksquare$}}
+\renewenvironment{proof}[1][\proofname]{%
+  \par\pushQED{\qed}%
+  \vspace{5pt}\noindent
+  {\displayfont\bfseries\fontsize{8.5}{10}\selectfont\color{shInkMuted}\MakeUppercase{#1}}\par
+  \vspace{2pt}\noindent\ignorespaces
+}{\popQED\par\vspace{7pt}}
+
+% -----------------------------------------------------------------------------
+%  Code listings — Rust, styled flat
+% -----------------------------------------------------------------------------
+\definecolor{shCodeBg}{HTML}{F8FAFC}
+\definecolor{shCodeKeyword}{HTML}{0F766E}
+\definecolor{shCodeString}{HTML}{B45309}
+\definecolor{shCodeComment}{HTML}{64748B}
+\definecolor{shCodeType}{HTML}{0369A1}
+
+\lstdefinelanguage{Rust}{
+  keywords={as,async,await,break,const,continue,crate,dyn,else,enum,extern,false,fn,
+    for,if,impl,in,let,loop,match,mod,move,mut,pub,ref,return,self,Self,static,struct,
+    super,trait,true,type,unsafe,use,where,while},
+  keywordstyle=\color{shCodeKeyword}\bfseries,
+  ndkeywords={f32,f64,i8,i16,i32,i64,u8,u16,u32,u64,usize,isize,bool,char,str,String,
+    Vec,Option,Some,None,Result,Ok,Err,Box,Tensor,Backend},
+  ndkeywordstyle=\color{shCodeType},
+  sensitive=true,
+  comment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morecomment=[l]{///},
+  morestring=[b]",
+}
+
+\lstdefinestyle{shannoncode}{
+  language=Rust,
+  backgroundcolor=\color{shCodeBg},
+  basicstyle=\ttfamily\fontsize{8}{9.6}\selectfont\color{shInk},
+  commentstyle=\color{shCodeComment}\itshape,
+  stringstyle=\color{shCodeString},
+  numbers=left,
+  numberstyle=\ttfamily\fontsize{6.5}{8}\selectfont\color{shSlate400},
+  numbersep=9pt,
+  frame=leftline,
+  framerule=2pt,
+  rulecolor=\color{shTeal},
+  framesep=8pt,
+  xleftmargin=16pt,
+  breaklines=true,
+  breakatwhitespace=false,
+  breakindent=12pt,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+  upquote=true,
+  literate={μ}{{$\mu$}}1 {τ}{{$\tau$}}1 {γ}{{$\gamma$}}1 {δ}{{$\delta$}}1
+           {α}{{$\alpha$}}1 {β}{{$\beta$}}1 {λ}{{$\lambda$}}1 {θ}{{$\theta$}}1
+           {π}{{$\pi$}}1 {σ}{{$\sigma$}}1 {ε}{{$\epsilon$}}1 {φ}{{$\phi$}}1
+           {ω}{{$\omega$}}1 {Δ}{{$\Delta$}}1 {Σ}{{$\Sigma$}}1 {Φ}{{$\Phi$}}1
+           {ψ}{{$\psi$}}1 {η}{{$\eta$}}1 {κ}{{$\kappa$}}1 {ρ}{{$\rho$}}1
+           {ξ}{{$\xi$}}1 {≤}{{$\leq$}}1 {≥}{{$\geq$}}1 {≠}{{$\neq$}}1
+           {→}{{$\rightarrow$}}1 {←}{{$\leftarrow$}}1 {⁻}{{$^-$}}1 {∞}{{$\infty$}}1
+           {·}{{$\cdot$}}1 {×}{{$\times$}}1 {ᵀ}{{$^\top$}}1 {∈}{{$\in$}}1
+           {⊙}{{$\odot$}}1 {ℓ}{{$\ell$}}1 {ẏ}{{$\dot y$}}1 {ÿ}{{$\ddot y$}}1
+           {≈}{{$\approx$}}1 {∥}{{$\|$}}1 {ᵗ}{{$^t$}}1 {ᴴ}{{$^H$}}1
+           {’}{{'}}1 {“}{{``}}1 {”}{{''}}1 {–}{{--}}1 {—}{{---}}1
+}
+\lstset{style=shannoncode}
+
+% Rust listing with a caption bar: \begin{shrust}{path}{caption} … \end{shrust}
+\newenvironment{shrust}[2]{%
+  \par\vspace{9pt}\noindent
+  {\displayfont\bfseries\fontsize{7.5}{9}\selectfont
+   \colorbox{shTeal}{\textcolor{white}{\,RUST\,}}\hspace{0.5em}%
+   \color{shInk}\texttt{#1}}\par\vspace{2pt}%
+  \def\shrustcaption{#2}%
+  \ignorespaces
+}{%
+  \par\vspace{1pt}\noindent
+  {\fontsize{8.2}{10}\selectfont\color{shInkMuted}\shrustcaption}\par\vspace{9pt}%
+}
+
+% -----------------------------------------------------------------------------
+%  Chapter opener: epigraph + overview
+% -----------------------------------------------------------------------------
+% \shepigraph{text}{author}{affiliation}{source}
+\newcommand{\shepigraph}[4]{%
+  \begin{tcolorbox}[shblock, colframe=shTeal, colback=shSlate50,
+                    left=13pt, right=13pt, top=11pt, bottom=10pt]
+    {\color{shTeal}\faQuoteLeft}\par\vspace{3pt}
+    {\fontsize{11.5}{15.5}\selectfont\itshape\color{shInk} #1}\par
+    \vspace{7pt}{\color{shRule}\rule{\linewidth}{0.4pt}}\vspace{4pt}\par
+    {\displayfont\fontsize{8.5}{11}\selectfont
+     \textbf{\color{shInk}#2}%
+     \ifx\relax#3\relax\else{\color{shInkMuted}\ \textperiodcentered\ #3}\fi\par
+     \ifx\relax#4\relax\else{\color{shInkMuted}\itshape #4}\fi}
+  \end{tcolorbox}}
+
+% \shoverview{summary}{F}{C}{P} followed by an shoutcomes list
+\newcommand{\shoverview}[4]{%
+  \noindent{\fontsize{11}{15}\selectfont\color{shInkSecondary} #1}\par\vspace{9pt}
+  \begin{tcolorbox}[shblock, colframe=shFoundation, colback=shFoundation!3!white,
+                    left=10pt, right=10pt, top=6pt, bottom=6pt,
+                    before skip=5pt, after skip=5pt]
+    {\displayfont\bfseries\fontsize{8}{10}\selectfont\color{shFoundation}%
+     \faCalculator\hspace{0.4em}FOUNDATION}\par\vspace{2pt}
+    {\fontsize{9.5}{12}\selectfont\color{shInkSecondary} #2}
+  \end{tcolorbox}
+  \begin{tcolorbox}[shblock, colframe=shConceptual, colback=shConceptual!3!white,
+                    left=10pt, right=10pt, top=6pt, bottom=6pt,
+                    before skip=5pt, after skip=5pt]
+    {\displayfont\bfseries\fontsize{8}{10}\selectfont\color{shConceptual}%
+     \faEye\hspace{0.4em}CONCEPTUAL}\par\vspace{2pt}
+    {\fontsize{9.5}{12}\selectfont\color{shInkSecondary} #3}
+  \end{tcolorbox}
+  \begin{tcolorbox}[shblock, colframe=shPractical, colback=shPractical!3!white,
+                    left=10pt, right=10pt, top=6pt, bottom=6pt,
+                    before skip=5pt, after skip=9pt]
+    {\displayfont\bfseries\fontsize{8}{10}\selectfont\color{shPractical}%
+     \faMicrochip\hspace{0.4em}PRACTICAL}\par\vspace{2pt}
+    {\fontsize{9.5}{12}\selectfont\color{shInkSecondary} #4}
+  \end{tcolorbox}}
+
+\newenvironment{shoutcomes}{%
+  \begin{tcolorbox}[shblock, colframe=shSlate300, colback=shSlate100]
+  {\displayfont\bfseries\fontsize{8.5}{10}\selectfont\color{shInkMuted}%
+   \faBullseye\hspace{0.4em}AFTER THIS CHAPTER YOU CAN}\par\vspace{4pt}
+  \begin{itemize}[leftmargin=13pt, itemsep=2.5pt, topsep=1pt, parsep=0pt,
+                  label={\color{shTeal}\footnotesize$\bullet$}]
+}{\end{itemize}\end{tcolorbox}}
+
+% -----------------------------------------------------------------------------
+%  Widget figures — the interactive's static fallback, as the style guide requires
+% -----------------------------------------------------------------------------
+% \shwidget{id}{Title}{What it shows and what the reader manipulates}
+\newcommand{\shwidget}[3]{%
+  \begin{tcolorbox}[shblock, colframe=shSky, colback=shSky!3!white,
+                    left=11pt, right=11pt, top=8pt, bottom=8pt]
+    {\displayfont\bfseries\fontsize{8}{10}\selectfont\color{shSkyDark}%
+     \faDesktop\hspace{0.4em}INTERACTIVE\ \ \textperiodcentered\ \ \texttt{\small #1}}\par
+    \vspace{3pt}
+    {\displayfont\bfseries\fontsize{10.5}{13}\selectfont\color{shInk} #2}\par
+    \vspace{3pt}
+    {\fontsize{9.5}{12.5}\selectfont\color{shInkSecondary} #3}\par
+    \vspace{5pt}
+    {\fontsize{8}{10}\selectfont\color{shInkMuted}%
+     Run this simulation in the web edition: \texttt{/chapters/\shchapterslug\ \##1}}
+  \end{tcolorbox}}
+
+\newcommand{\shchapterslug}{}
+\newcommand{\setchapterslug}[1]{\renewcommand{\shchapterslug}{#1}}
+
+% -----------------------------------------------------------------------------
+%  Exercises
+% -----------------------------------------------------------------------------
+\newcounter{shexercise}[chapter]
+\newenvironment{shexercises}{%
+  \setcounter{shexercise}{0}%
+  \par\vspace{4pt}
+}{\par\vspace{6pt}}
+
+% \shexercise{F|C|P}{difficulty 1-3}{Title}{body}
+\newcommand{\shexercise}[4]{%
+  \refstepcounter{shexercise}%
+  \def\shlayercolor{shFoundation}\def\shlayername{Foundation}\def\shlayericon{\faCalculator}%
+  \ifx#1C\def\shlayercolor{shConceptual}\def\shlayername{Conceptual}\def\shlayericon{\faEye}\fi
+  \ifx#1P\def\shlayercolor{shPractical}\def\shlayername{Practical}\def\shlayericon{\faMicrochip}\fi
+  \begin{tcolorbox}[shblock, colframe=\shlayercolor, colback=white,
+                    left=10pt, right=10pt, top=6pt, bottom=6pt,
+                    before skip=5pt, after skip=5pt]
+    {\displayfont\fontsize{8}{10}\selectfont
+     \textbf{\color{shInkMuted}\theshexercise}\hspace{0.5em}%
+     \colorbox{\shlayercolor!12!white}{\textcolor{\shlayercolor}{%
+       \shlayericon\,\textbf{\MakeUppercase{\shlayername}}}}\hspace{0.5em}%
+     \textcolor{shSlate400}{\ifcase#2\or$\bullet$\or$\bullet\bullet$\or$\bullet\bullet\bullet$\fi}%
+     \hspace{0.5em}{\displayfont\bfseries\fontsize{9.5}{12}\selectfont\color{shInk}#3}}\par
+    \vspace{2.5pt}
+    {\fontsize{9.5}{12.5}\selectfont\color{shInkSecondary} #4}
+  \end{tcolorbox}}
+
+% Coding task
+\newenvironment{shcodingtask}[2]{%
+  \begin{tcolorbox}[shblock, colframe=shPractical, colback=shPractical!3!white]
+  {\displayfont\bfseries\fontsize{8}{10}\selectfont
+   \colorbox{shPractical}{\textcolor{white}{\,\faMicrochip\ CODING TASK\,}}%
+   \ifx\relax#2\relax\else\hspace{0.6em}{\ttfamily\color{shInkSecondary}#2}\fi}\par
+  \vspace{4pt}
+  {\displayfont\bfseries\fontsize{11}{14}\selectfont\color{shInk} #1}\par\vspace{3pt}
+  \ignorespaces
+}{\end{tcolorbox}}
+
+% -----------------------------------------------------------------------------
+%  References
+% -----------------------------------------------------------------------------
+\newenvironment{shreferences}[1][References]{%
+  \par\vspace{6pt}
+  \begin{list}{}{%
+    \setlength{\leftmargin}{11pt}\setlength{\itemindent}{0pt}
+    \setlength{\labelwidth}{0pt}\setlength{\labelsep}{0pt}
+    \setlength{\itemsep}{4pt}\setlength{\parsep}{0pt}\setlength{\topsep}{2pt}}
+}{\end{list}\par\vspace{4pt}}
+
+% \shref{authors}{year}{title}{venue}{note}
+\newcommand{\shref}[5]{%
+  \item[]\hspace{-11pt}%
+  \textcolor{shRule}{\rule[-1pt]{1.6pt}{11pt}}\hspace{6pt}%
+  \begin{minipage}[t]{\dimexpr\linewidth-8pt\relax}
+    {\fontsize{9.5}{12}\selectfont
+     \color{shInkSecondary}#1\ {\color{shInkMuted}(#2).}\ %
+     {\color{shInk}#3}\ifx\relax#4\relax\else{\color{shInkSecondary}\itshape\ #4}\fi.}%
+    \ifx\relax#5\relax\else\par{\fontsize{8.5}{10.5}\selectfont\color{shInkMuted}#5}\fi
+  \end{minipage}}
+
+% Marks one of the four baseline works.
+\newcommand{\shbaseline}{{\displayfont\bfseries\fontsize{7}{8}\selectfont
+  \colorbox{shTealDark}{\textcolor{white}{\,BASELINE\,}}}\hspace{3pt}}
+
+% -----------------------------------------------------------------------------
+%  Notation — the book's KaTeX macro table, ported so that the two editions
+%  render identical mathematics from identical source.
+% -----------------------------------------------------------------------------
+\providecommand{\R}{}\renewcommand{\R}{\mathbb{R}}
+\renewcommand{\P}{\operatorname{p}}
+\providecommand{\Prob}{}\renewcommand{\Prob}{\operatorname{p}}
+\providecommand{\E}{}\renewcommand{\E}{\mathbb{E}}
+\providecommand{\Var}{}\renewcommand{\Var}{\operatorname{Var}}
+\providecommand{\Cov}{}\renewcommand{\Cov}{\operatorname{Cov}}
+\providecommand{\given}{}\renewcommand{\given}{\mid}
+\providecommand{\Normal}{}\renewcommand{\Normal}{\mathcal{N}}
+\providecommand{\KL}{}\renewcommand{\KL}{\operatorname{KL}}
+\providecommand{\bel}{}\renewcommand{\bel}{\operatorname{bel}}
+\providecommand{\belbar}{}\renewcommand{\belbar}{\overline{\operatorname{bel}}}
+\newcommand{\SOtwo}{\mathrm{SO}(2)}
+\newcommand{\SOthree}{\mathrm{SO}(3)}
+\newcommand{\SEtwo}{\mathrm{SE}(2)}
+\newcommand{\SEthree}{\mathrm{SE}(3)}
+\newcommand{\sotwo}{\mathfrak{so}(2)}
+\newcommand{\sethree}{\mathfrak{se}(3)}
+\newcommand{\bplus}{\boxplus}
+\newcommand{\bminus}{\boxminus}
+\providecommand{\Ad}{}\renewcommand{\Ad}{\operatorname{Ad}}
+\providecommand{\tr}{}\renewcommand{\tr}{\operatorname{tr}}
+\providecommand{\diag}{}\renewcommand{\diag}{\operatorname{diag}}
+\providecommand{\rank}{}\renewcommand{\rank}{\operatorname{rank}}
+\providecommand{\T}{}\renewcommand{\T}{^{\mathsf{T}}}
+\providecommand{\norm}{}\renewcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\providecommand{\abs}{}\renewcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\providecommand{\vv}{}\renewcommand{\vv}[1]{\mathbf{#1}}
+\providecommand{\mat}{}\renewcommand{\mat}[1]{\mathbf{#1}}
+% \N and \Z collide with nothing in this class, but guard anyway.
+\providecommand{\N}{\mathbb{N}}
+\providecommand{\Z}{\mathbb{Z}}
+
+% -----------------------------------------------------------------------------
+%  Derivations — the web edition folds the algebra away behind a disclosure
+%  triangle. On paper it becomes a marked block the reader may skip on a first
+%  pass, with the result stated on the rule so skipping costs nothing.
+% -----------------------------------------------------------------------------
+% \begin{shderivation}{title}{result or empty}
+\newenvironment{shderivation}[2]{%
+  \begin{tcolorbox}[shblock, colframe=shFoundation, colback=shFoundation!3!white,
+                    left=11pt, right=11pt, top=8pt, bottom=8pt]
+  {\displayfont\bfseries\fontsize{8}{10}\selectfont\color{shFoundation}%
+   \faCalculator\hspace{0.4em}DERIVATION}\hspace{0.6em}%
+  {\displayfont\bfseries\fontsize{10}{13}\selectfont\color{shInk}#2}\par
+  \ifx\relax#1\relax\else
+    \vspace{3pt}{\fontsize{9}{11.5}\selectfont\color{shInkMuted}#1}\par
+  \fi
+  \vspace{4pt}{\color{shFoundation!25}\rule{\linewidth}{0.4pt}}\vspace{5pt}\par
+  \ignorespaces
+}{\end{tcolorbox}}
+
+% -----------------------------------------------------------------------------
+%  Algorithms — Thrun's numbered-table style, which the book follows so that
+%  readers can move between this text and the literature without translating.
+% -----------------------------------------------------------------------------
+% \begin{shalgorithm}{name}{inputs}{outputs}{complexity}
+\newenvironment{shalgorithm}[4]{%
+  \begin{tcolorbox}[shblock, colframe=shInk, colback=white,
+                    left=11pt, right=11pt, top=7pt, bottom=8pt]
+  {\displayfont\bfseries\fontsize{8}{10}\selectfont\color{shInkMuted}ALGORITHM}%
+  \hspace{0.5em}{\ttfamily\fontsize{9.5}{12}\selectfont\color{shInk}#1}%
+  \ifx\relax#4\relax\else
+    \hfill{\displayfont\fontsize{7.5}{9}\selectfont\color{shInkMuted}COST}\
+    {\ttfamily\fontsize{8}{10}\selectfont\color{shInkMuted}#4}%
+  \fi\par
+  \ifx\relax#2\relax\else
+    \vspace{2pt}{\fontsize{8.5}{11}\selectfont\color{shInkMuted}%
+      \textbf{in}\ \ #2}\par
+  \fi
+  \ifx\relax#3\relax\else
+    {\fontsize{8.5}{11}\selectfont\color{shInkMuted}\textbf{out}\ \ #3}\par
+  \fi
+  \vspace{4pt}{\color{shSlate200}\rule{\linewidth}{0.4pt}}\vspace{3pt}\par
+  \begingroup
+  \setlist[enumerate]{leftmargin=20pt, itemsep=1pt, topsep=2pt, parsep=0pt,
+                      label={\ttfamily\color{shInkMuted}\footnotesize\arabic*:}}
+  \ignorespaces
+}{\endgroup\end{tcolorbox}}
+
+% -----------------------------------------------------------------------------
+%  Notation tables
+% -----------------------------------------------------------------------------
+\newenvironment{shnotation}{%
+  \par\vspace{7pt}
+  \begingroup\footnotesize
+  \setlength{\tabcolsep}{6pt}
+  \begin{longtable}{@{}>{$\displaystyle}p{0.26\linewidth}<{$}
+                       >{\raggedright\arraybackslash}p{0.70\linewidth}@{}}
+  \toprule
+}{%
+  \bottomrule
+  \end{longtable}
+  \endgroup\par\vspace{4pt}}
+
+% -----------------------------------------------------------------------------
+%  Chapter opener pieces specific to this book
+% -----------------------------------------------------------------------------
+\newenvironment{shgoals}{%
+  \begin{tcolorbox}[shblock, colframe=shTeal, colback=shSlate50,
+                    left=10pt, right=10pt, top=6pt, bottom=6pt]
+  {\displayfont\bfseries\fontsize{8.5}{10}\selectfont\color{shAccent}%
+   \faBullseye\hspace{0.4em}AFTER THIS CHAPTER YOU CAN}\par\vspace{4pt}
+  \begin{itemize}[leftmargin=13pt, itemsep=2.5pt, topsep=1pt, parsep=0pt,
+                  label={\color{shTeal}\footnotesize$\bullet$}]
+}{\end{itemize}\end{tcolorbox}}
+
+\newenvironment{shprereqs}{%
+  \begin{tcolorbox}[shblock, colframe=shSlate300, colback=white,
+                    left=10pt, right=10pt, top=6pt, bottom=6pt]
+  {\displayfont\bfseries\fontsize{8.5}{10}\selectfont\color{shInkMuted}%
+   \faLayerGroup\hspace{0.4em}ASSUMED}\par\vspace{4pt}
+  \begin{itemize}[leftmargin=13pt, itemsep=2pt, topsep=1pt, parsep=0pt,
+                  label={\color{shSlate400}\footnotesize$\circ$}]
+}{\end{itemize}\end{tcolorbox}}
+
+% The chapter's metadata strip: part, difficulty, reading time.
+\newcommand{\shchaptermeta}[3]{%
+  \par\vspace{-6pt}\noindent
+  {\displayfont\fontsize{8}{10}\selectfont\color{shInkMuted}%
+   \MakeUppercase{#1}%
+   \ifx\relax#2\relax\else\ \ \textperiodcentered\ \ #2\fi
+   \ifx\relax#3\relax\else\ \ \textperiodcentered\ \ #3\fi}%
+  \par\vspace{9pt}}
+
+% -----------------------------------------------------------------------------
+%  Inline helpers
+% -----------------------------------------------------------------------------
+\newcommand{\shrobotname}[1]{\textbf{\color{shSkyDark}#1}}
+\newcommand{\shterm}[1]{\textbf{#1}}
+
+\captionsetup{
+  font={footnotesize, color=shInkMuted},
+  labelfont={bf, color=shAccent},
+  labelsep=period,
+  skip=5pt
+}
+
+\setlist[itemize]{leftmargin=14pt, itemsep=2.5pt, topsep=4pt, parsep=0pt,
+                  label={\color{shTeal}\footnotesize$\bullet$}}
+\setlist[enumerate]{leftmargin=16pt, itemsep=2.5pt, topsep=4pt, parsep=0pt}
+
+% Tables: hairline rules in the slate scale.
+\arrayrulecolor{shSlate300}
+\renewcommand{\arraystretch}{1.25}
+
+\endinput

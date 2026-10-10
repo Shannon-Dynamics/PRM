@@ -1,0 +1,1203 @@
+---
+title: "Bug Algorithms: Planning with a Contact Sensor"
+description: Bug1, Bug2, and Tangent Bug — provable sensor-based planning from almost no mathematics, two bounds you can check by hand, the comb that makes greed lose, and boundary following as curve tracing with the implicit function theorem.
+chapter: 3
+part: PART I
+partTitle: Foundations — Robots, Worlds, and Configuration Space
+difficulty: Foundational
+readingTime: 55 min
+quote: "These algorithms require two behaviors: move on a straight line and follow a boundary."
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 2
+---
+
+import { BugArena } from '@/components/ch/ch03/bug-arena';
+import { BoundaryFollower } from '@/components/ch/ch03/boundary-follower';
+import { TangentScope } from '@/components/ch/ch03/tangent-scope';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'State Bug1, Bug2 and Tangent Bug precisely, as two behaviors and a switching rule each',
+    'Prove the Bug1 bound L ≤ d + 1.5 Σ pᵢ and the Bug2 bound L ≤ d + ½ Σ nᵢ pᵢ, and build the obstacle on which greedy Bug2 loses',
+    'Read a range scan the way Tangent Bug does: intervals of continuity, their endpoints Oᵢ, and the heuristic that chooses among them',
+    'Derive D(x) and ∇D from range data, and the tangent (∇D)⊥ of the offset curve',
+    'Trace the offset curve G(x) = D(x) − W* = 0 with a predictor–corrector, and say exactly which theorem guarantees each half of it',
+    'Implement all of it in Rust, with the worked example reproduced to machine precision and both bounds property-tested',
+  ]}
+  prerequisites={[
+    'Bug1 informally, from Chapter 1',
+    'The Apartment, rayCast and the point/disc reduction of Chapter 2',
+    'Gradients and the chain rule; the implicit function theorem is restated here',
+  ]}
+>
+Choset opens *Principles of Robot Motion* with the Bug algorithms because they prove something
+surprising with almost no mathematics. A point robot that knows only where the goal is, how far it
+has walked, and whether it is touching something can be *guaranteed* to reach any reachable goal,
+with a path whose length is bounded before it sets off. No map, no search, no configuration space
+yet — just two behaviors and a rule for switching between them.
+
+This chapter keeps that order of business and sharpens it. The claim to carry away is this:
+**a planner is two behaviors and a switching rule, and the whole difference between a heuristic
+and a theorem is the switching rule.** Bug1 switches exhaustively — circumnavigate, then leave from
+the best point — and pays for its certainty. Bug2 switches greedily — leave the first time the fixed
+m-line is closer — and can be made arbitrarily worse than Bug1 by an obstacle shaped like a comb.
+Tangent Bug buys shorter paths with a range sensor by *seeing* the discontinuities of the raw
+distance function and heading for them.
+
+Underneath all three sits a problem the rest of the book keeps meeting: how do you follow a curve
+you have not been given? Choset's answer — treat the offset curve as the zero set of
+$G(x) = D(x) - W^*$ and trace it with a predictor–corrector justified by the implicit function
+theorem — becomes this chapter's owned artifact, `trace_curve`. [Chapter 7](/chapters/ch07-potential-functions)
+uses it to follow level sets, [Chapter 8](/chapters/ch08-roadmaps-i) the Voronoi diagram,
+[Chapter 9](/chapters/ch09-roadmaps-ii) the sensor-based GVG, and [Chapter 10](/chapters/ch10-cell-decompositions)
+the slices of a coverage decomposition.
+</Overview>
+
+## A blindfolded walker with one hand on the wall
+
+Imagine walking across an unfamiliar room blindfolded. You know where the door is — you can
+point at it — and you can tell when your outstretched hand touches a wall. Nothing else. Could you
+promise to reach the door?
+
+You could. Walk straight toward it. When you touch something, keep one hand on it and walk all the
+way around, noting as you go the point where you were closest to the door. Come back to that point,
+step off toward the door, and repeat. If the point of the wall closest to the door is one from
+which stepping toward the door walks you straight back into the wall, the door is on the other side
+of a closed room and you can stop: it is not reachable. That is Bug1, and it is a complete planner.
+
+Three robots run that idea below, on the same map, toward the same goal. The first is Bug1. The
+second, Bug2, is impatient: it leaves the wall the first time it gets back to the straight line from
+start to goal at a point closer than where it hit. The third, Tangent Bug, carries a range sensor and
+heads for the corners it can see.
+
+<Deferred minHeight={560}>
+  <BugArena />
+</Deferred>
+
+Watch the first race through. Bug1 walks 34 units, Bug2 walks 16, and the counters stop against
+their bounds — 37 and 28 — with room to spare. Greedy wins by a wide margin, and every intuition says
+it should: why walk all the way around an obstacle when the far side is right there?
+
+Then the map changes to a spiral, Choset's figure 2.4 made concrete, and Bug2 turning right walks
+132 units to Bug1's 125. Not because the spiral is large — Bug1 pays for it once — but because the
+m-line crosses the spiral's boundary ten times, and almost every crossing is on the *wrong side*:
+stepping toward the goal from it would re-enter the wall. Bug2 can only leave at a crossing that is
+closer than its hit point *and* free, and with its fixed turn direction it has to walk nearly the whole
+boundary it has already seen to find the next one. Flip the turn direction and Bug2 wins again, at 52.
+The algorithm did not change. The obstacle did, and with it the cost of being greedy.
+
+<KeyIdea title="The one sentence version">
+A sensor-based planner is two behaviors — move toward the goal, follow the boundary — and a rule for
+switching between them. Bug1's rule is exhaustive and buys a bound that holds everywhere; Bug2's is
+greedy and buys speed on simple obstacles at the price of an unbounded worst case; Tangent Bug's is
+informed by range data and buys shorter paths without a proof of completeness at all.
+</KeyIdea>
+
+## Building intuition
+
+### Two behaviors
+
+Every Bug in this chapter has exactly two behaviors.
+
+**Motion-to-goal** is gradient descent on the distance to a point: toward $\qgoal$, or, for Tangent
+Bug, toward whichever sensed point $n$ minimizes $d(x, n) + d(n, \qgoal)$. It is the behavior you
+would write first, and it is the one that fails first — it stops the moment it touches anything.
+
+**Boundary-following** is the behavior that repairs it. The robot keeps the obstacle at a fixed
+distance and walks along it. It sounds trivial — "keep your hand on the wall" — and the second half of
+the chapter is about why it is not: the robot does not know the wall's shape, it only knows the
+nearest point and the direction to it, and from those two facts it has to *construct* the curve as it
+goes. That construction is root-finding, and it has hypotheses.
+
+What distinguishes the three algorithms is only *when they switch*. Watch the arena with that lens:
+the orange path is identical for all three until the first hit point; after that the hit and leave
+points — the switches — are the whole story.
+
+### What a range sensor sees
+
+Tangent Bug replaces the contact sensor with a ring of range finders: for each bearing $\theta$ it
+knows $\rho(x, \theta)$, the distance to the first obstacle along that ray, saturated at the sensor's
+range $R$. The sensor does not return a map. It returns a function of one angle, and the only things
+in that function worth planning on are its *discontinuities*: the bearings where one obstacle ends
+and empty space (or a farther obstacle) begins. Those are the corners of what the robot can see, and
+in the figure below they are the points $O_i$.
+
+<Deferred minHeight={520}>
+  <TangentScope />
+</Deferred>
+
+Two things the scope makes visible. First, the heuristic $d(x, O_i) + d(O_i, \qgoal)$ is a guess
+about a path it cannot see: "if I go to that corner, how far is the goal from there as the crow
+flies?" Second, that guess can be wrong in a way the robot can sometimes detect and sometimes cannot.
+In Choset's figure 2.8, loaded by default, the corner that looks best with a 3 m sensor is one from
+which the straight line to the goal cuts through a second obstacle. With a 6 m sensor the robot can
+see that obstacle, assigns the corner infinite cost, and chooses differently. More range is more
+information; it is never a map.
+
+### The curve you were not given
+
+Boundary following at a safe distance $W^*$ means walking along the set of points whose distance to
+the nearest obstacle is exactly $W^*$ — the *offset curve*. The robot can measure that distance
+$D(x)$ (it is the shortest range in its scan) and its gradient $\nabla D$ (the direction of that
+shortest ray, reversed). It does not know the curve. The widget in the algorithm section below
+shows how it constructs the curve anyway: predict a step along the tangent, fall off, correct back
+with Newton's method, repeat — and what happens when the curve it is chasing has a cusp.
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: 'q^H_i,\\; q^L_i', meaning: 'The i-th hit point and leave point.' },
+    { sym: '\\text{m-line}', meaning: 'Bug1: the segment from the last leave point q^L_{i-1} to the goal. Bug2: the fixed segment from q_start to q_goal.' },
+    { sym: 'p_i,\\; n_i', meaning: 'Perimeter of WO_i; number of times the Bug2 m-line crosses the boundary of WO_i.' },
+    { sym: 'L_{\\mathrm{Bug1}},\\; L_{\\mathrm{Bug2}}', meaning: 'Path lengths.' },
+    { sym: 'B_r(x)', meaning: 'The open ball of radius r about x. The workspace is bounded: W ⊂ B_r(x) for some finite r.' },
+    { sym: '\\rho(x, \\theta),\\; \\rho_R(x, \\theta)', meaning: 'Raw distance along the ray from x at bearing θ (Choset eq. 2.3), and its saturated version: ∞ when ρ ≥ R.' },
+    { sym: 'O_i,\\; T', meaning: 'Endpoints of the intervals of continuity of ρ_R(x, ·); the point of the sensing circle on the segment x q_goal.' },
+    { sym: 'd_{\\mathrm{reach}},\\; d_{\\mathrm{followed}}', meaning: 'Tangent Bug’s two bookkeeping distances: goal distance of the closest visible point of the followed obstacle, and of the closest point sensed so far.' },
+    { sym: 'D(x),\\; \\nabla D(x)', meaning: 'Distance from x to the nearest obstacle (eq. 2.4) and its gradient, the unit vector along the minimizing ray, away from the obstacle.' },
+    { sym: 'W^*', meaning: 'The safety offset of the followed curve.' },
+    { sym: 'G(x) = D(x) - W^*,\\; DG,\\; D_Y G', meaning: 'The offset curve’s defining function, its differential, and the differential on the correcting line Y.' },
+    { sym: '\\Delta\\lambda', meaning: 'The predictor step along the tangent.' },
+  ]}
+/>
+
+### Definitions
+
+<KeyIdea title="Definition: contact sensor, raw distance, saturated raw distance">
+A **contact (tactile) sensor** reports whether the point robot touches $\partial\WO_i$; it is a range
+sensor with $R = 0$. The **raw distance function** (Choset eq. 2.3) is
+
+$$
+\rho(x, \theta) \;=\; \min\bigl\{\, \lambda \ge 0 \;:\; x + \lambda\,[\cos\theta, \sin\theta]^{\mathsf T}
+\in \textstyle\bigcup_i \WO_i \,\bigr\},
+$$
+
+the distance to the first obstacle along the ray at bearing $\theta$. The **saturated** version is
+$\rho_R(x, \theta) = \rho(x, \theta)$ when $\rho(x, \theta) < R$ and $\infty$ otherwise.
+</KeyIdea>
+
+<KeyIdea title="Definition: interval of continuity and its endpoints">
+For fixed $x$, an **interval of continuity** is a connected set of boundary points
+$x + \rho(x, \theta)[\cos\theta, \sin\theta]^{\mathsf T}$ over which $\rho_R(x, \cdot)$ is finite and
+continuous in $\theta$. Its endpoints $O_i$ arise in two ways: one obstacle occludes another — the
+ray is tangent to the nearer one — or the boundary leaves sensing range.
+</KeyIdea>
+
+<KeyIdea title="Definition: distance to the nearest obstacle and the offset curve">
+$D(x) = \min_{c \in \bigcup_i \WO_i} d(x, c)$ (Choset eq. 2.4). Wherever the minimizer $c^*$ is
+unique, $D$ is differentiable and $\nabla D(x) = (x - c^*)/\|x - c^*\|$: the unit vector pointing from
+the nearest obstacle point to $x$. The **offset curve** at distance $W^*$ is
+$\{x : D(x) = W^*\} = G^{-1}(0)$ with $G = D - W^*$; its tangent at $x$ is $(\nabla D(x))^\perp$.
+</KeyIdea>
+
+<KeyIdea title="Definition: followed and blocking obstacle">
+Tangent Bug's **followed obstacle** $\WO_f$ is the one whose boundary it is tracking; the **blocking
+obstacle** is the nearest in-range obstacle intersecting the segment from $x$ to $\qgoal$. When
+boundary-following begins they coincide. With $\Lambda = \{y \in \partial\WO_f : \text{the segment } xy
+\text{ is free}\}$ the visible part of the followed obstacle,
+$d_{\mathrm{reach}} = \min_{c \in \Lambda} d(\qgoal, c)$.
+</KeyIdea>
+
+### Bug1 is complete, and its path is bounded
+
+<LinkedMath>
+$$
+\htmlClass{term-robot}{L_{\mathrm{Bug1}}} \;\le\;
+d(\htmlClass{term-start}{\qstart}, \htmlClass{term-goal}{\qgoal}) \;+\; 1.5 \sum_{i=1}^{n} \htmlClass{term-obstacle}{p_i}
+\tag{2.1}
+$$
+</LinkedMath>
+
+**Statement.** In a bounded workspace with finitely many obstacles, Bug1 reaches $\qgoal$ whenever a
+path exists, otherwise halts with "unreachable" in finite time, and its path obeys (2.1).
+
+<Derivation title="Bug1 is complete and L ≤ d + 1.5 Σ pᵢ (Choset eq. 2.1)" result="L_{Bug1} \le d(q_{start}, q_{goal}) + 1.5 \sum_i p_i">
+**Step 1 — leave points get strictly closer.** The leave point $q^L_i$ is, by construction, the
+perimeter point of $\WO_i$ closest to the goal. The hit point $q^H_i$ is also on that perimeter, so
+$d(q^L_i, \qgoal) \le d(q^H_i, \qgoal)$, with equality only if the hit point *is* the closest
+perimeter point. Motion-to-goal from $q^L_i$ moves along the straight line to the goal, so every
+later point of the path is closer to the goal than $q^L_i$ — unless the line immediately re-enters
+$\WO_i$, which is exactly the failure test on line 13.
+
+**Step 2 — no obstacle is hit twice.** Suppose $\WO_i$ were hit again later, at $q^H_j$. By Step 1,
+$d(q^H_j, \qgoal) < d(q^L_i, \qgoal)$. But $q^H_j \in \partial\WO_i$ and $q^L_i$ was the *closest*
+point of $\partial\WO_i$ to the goal — contradiction. Hence at most $n$ circumnavigations occur, and
+the algorithm terminates: each loop is a finite walk, and there are finitely many.
+
+**Step 3 — the cost of one obstacle.** A full circumnavigation costs exactly $p_i$. Returning to
+$q^L_i$ the shorter way round costs at most $p_i/2$ — the robot knows the perimeter it just walked
+and the arc length at which it recorded the best point, so it can choose. Total per obstacle:
+at most $1.5\,p_i$.
+
+**Step 4 — the straight-line budget.** Every motion-to-goal segment moves straight toward the goal
+from a point closer to it than the start of the previous segment (Step 1). Laid end to end, those
+segments total at most $d(\qstart, \qgoal)$: each one spends goal distance, and there is only
+$d(\qstart, \qgoal)$ of it to spend.
+
+**Step 5 — sum.** $L_{\mathrm{Bug1}} \le d(\qstart, \qgoal) + \sum_i 1.5\,p_i$. The sum ranges over
+*all* obstacles, including ones the robot never meets, which is why (2.1) is an upper bound and not
+an estimate.
+
+**Step 6 — the failure test is sound.** If the robot stands at $q^L_i$ — the perimeter point closest
+to the goal — and a step toward the goal re-enters $\WO_i$, then the goal direction points *into* the
+obstacle at the point of the boundary nearest the goal. That happens only if the goal is enclosed by
+$\WO_i$: otherwise there would be a boundary point even closer to the goal, on the far side. So Bug1
+reports "unreachable" only when it is. $\blacksquare$
+
+**Why grazing needs no following.** If the line to the goal merely touches $\partial\WO_i$ at a
+point, the robot can continue: the contact is a point of tangency, there is no direction in which the
+obstacle blocks the goal, and Choset says so explicitly (p. 18). Our implementation treats a move
+collinear with an edge as a miss for the same reason.
+
+**In the worked example** the slack is exactly 3: the bound budgets the straight-line distance 10 but
+the robot never walks the 2 + 1 units of m-line *inside* the two rectangles. The return legs
+(4 and 5) are the worst cases $p_i/2$ — both obstacles are symmetric about the m-line, so both ways
+round are equal.
+</Derivation>
+
+### Bug2's bound, and why greed can lose
+
+<LinkedMath>
+$$
+\htmlClass{term-robot}{L_{\mathrm{Bug2}}} \;\le\;
+d(\htmlClass{term-start}{\qstart}, \htmlClass{term-goal}{\qgoal}) \;+\; \tfrac12 \sum_{i=1}^{n}
+\htmlClass{term-path}{n_i}\, \htmlClass{term-obstacle}{p_i}
+\tag{2.2}
+$$
+</LinkedMath>
+
+**Statement.** $L_{\mathrm{Bug2}}$ obeys (2.2), where $n_i$ is the number of times the line through
+$\qstart$ and $\qgoal$ crosses $\partial\WO_i$; and for every $K$ there is a workspace with
+$L_{\mathrm{Bug2}} > K \cdot L_{\mathrm{Bug1}}$.
+
+<Derivation title="Bug2's bound and the comb that defeats it (Choset eq. 2.2)" result="L_{Bug2} \le d + \tfrac12 \sum_i n_i p_i,\;\; \text{and } L_{Bug2}/L_{Bug1} \text{ is unbounded}">
+**Step 1 — candidates.** Bug2 may leave $\WO_i$ only at a point of the fixed m-line that lies on
+$\partial\WO_i$. The m-line crosses that boundary $n_i$ times, so there are at most $n_i$ candidate
+leave points on $\WO_i$ in the whole run.
+
+**Step 2 — half of them are on the wrong side.** The m-line enters and exits the obstacle
+alternately along its length. At an *entry* crossing, stepping toward the goal re-enters the
+obstacle, so the third leave condition fails: at most $n_i/2$ crossings are valid leave points.
+
+**Step 3 — each leave may cost nearly a perimeter.** Between hitting $\WO_i$ and reaching a valid
+leave point the robot follows the boundary in its fixed turn direction. In the worst case the next
+valid crossing is almost a full loop away: nearly $p_i$ per leave, and $n_i/2$ leaves, for a total of
+at most $\tfrac12 n_i p_i$ on $\WO_i$.
+
+**Step 4 — add the straight-line budget.** Motion-to-goal runs along the m-line, so its segments
+total at most $d(\qstart, \qgoal)$. Summing gives (2.2). As with (2.1), the sum is over all
+obstacles, so this is an upper bound.
+
+**Step 5 — the comb.** Nothing in (2.2) stops $n_i$ from being large. Take a boundary that the
+m-line crosses $n_1$ times — the spiral in the arena, where $n_1 = 10$ — arranged so that from every
+hit point the turn direction leads first past wrong-side crossings and only then to a valid one. Bug2
+pays close to a perimeter per crossing, roughly $n_1 p_1/2$ in total, while Bug1 pays $p_1$ once and
+at most $p_1/2$ to walk back: $L_{\mathrm{Bug2}}/L_{\mathrm{Bug1}} \gtrsim n_1/3$, which grows without
+bound as the comb grows more teeth. $\blacksquare$
+
+**The exhaustive-versus-greedy reading** (Choset p. 22). For each obstacle Bug1 performs an
+*exhaustive* search for the best leave point — it looks at the entire perimeter and is certain to have
+found the optimum. Bug2 is *opportunistic*: it commits to the first leave point better than its hit
+point. When obstacles are simple the greedy choice pays off at once; when they are complex the
+conservative choice wins. This is the book's first instance of a trade-off that returns, dressed as
+best-first versus uniform-cost search, in [Chapter 6](/chapters/ch06-graph-search).
+
+**What the spiral actually does.** Our spiral has one obstacle of perimeter $p_1 = 85.2$ and the
+m-line crosses it $n_1 = 10$ times, so (2.2) promises $L_{\mathrm{Bug2}} \le 6.5 + 426 = 432.5$ and
+(2.1) promises $L_{\mathrm{Bug1}} \le 6.5 + 127.8 = 134.3$. The runs come in at 132.4 and 124.9. Both
+bounds hold; one of them is tight to within eight percent and the other is a factor three loose,
+which is the honest picture of what (2.2) is: a statement about the worst arrangement of crossings,
+not a prediction.
+</Derivation>
+
+### Distance is the minimum of the rays, and the gradient is the minimizing ray
+
+**Statement (Choset problem 2.1).** $D(x) = \min_s \rho(x, s)$. Wherever the minimizer $s^*$ is
+unique, $\nabla D(x) = -[\cos s^*, \sin s^*]^{\mathsf T}$.
+
+<Derivation title="D(x) = minₛ ρ(x, s) and ∇D is the minimizing ray (Choset eq. 2.4)" result="D(x) = \min_s \rho(x,s),\quad \nabla D(x) = -[\cos s^*, \sin s^*]^{\mathsf T}">
+**Step 1 — every obstacle point is on some ray.** For $c \in \bigcup_i \WO_i$, let $s$ be the bearing
+of $c - x$. The first obstacle point along that ray is at distance $\rho(x, s) \le d(x, c)$, so
+$\min_s \rho(x, s) \le D(x)$.
+
+**Step 2 — every ray's first hit is an obstacle point.** $x + \rho(x, s)[\cos s, \sin s]^{\mathsf T}$
+lies in some $\WO_i$ by definition of $\rho$, so $D(x) \le \rho(x, s)$ for every $s$, hence
+$D(x) \le \min_s \rho(x, s)$. With Step 1, equality.
+
+**Step 3 — the envelope argument.** Write $D(x) = \min_{c \in \mathcal{C}} \|x - c\|$ over the closed
+set $\mathcal{C} = \bigcup_i \WO_i$. Where the minimizing $c^*$ is unique, the minimum is attained
+by a single smooth function of $x$ in a neighborhood, and the derivative of a minimum of smooth
+functions is the derivative of the active one: $\nabla D(x) = (x - c^*)/\|x - c^*\|$. That unit vector
+points from $c^*$ to $x$, i.e. *away* from the obstacle along the minimizing ray — $-[\cos s^*, \sin
+s^*]^{\mathsf T}$. $\blacksquare$
+
+**Non-uniqueness.** Where two obstacle points tie for nearest, $D$ is continuous but not
+differentiable: $\nabla D$ jumps. That set — the points equidistant from two or more obstacles — is
+the *medial axis*, and [Chapter 8](/chapters/ch08-roadmaps-i) builds the generalized Voronoi diagram
+out of exactly it. For this chapter it is where the tracer's hypotheses fail, and the widget below
+walks into it on purpose.
+
+**What a finite scan gives you.** With $n$ rays the minimum is attained on a grid of bearings, so the
+estimate never undershoots $D$ and overshoots it by $D(1 - \cos(\pi/n))$ on a flat wall — $10^{-5}$ of
+$D$ with 720 rays. Near a corner seen edge-on no finite set of rays can see the nearest point, and the
+estimate can be badly high. The self-check prints both facts: at 90 % of a thousand seeded Apartment
+points the 720-ray estimate is within 0.11 % of $D$ and $\nabla D$ within 0.19°, and the worst
+case is off by 65 %. Problem 2.1 is a statement about infinite resolution.
+</Derivation>
+
+### The offset curve is a curve where $D_Y G$ is invertible
+
+**Statement (Choset §2.3.3 and Theorem D.1.1).** Write $x = (\lambda, y)$ in coordinates along the
+tangent and the normal of the offset curve at a point $x_0$ with $G(x_0) = 0$. If $D_Y G(x_0) \ne 0$,
+there is a neighborhood of $x_0$ in which the zero set of $G$ is the graph of a unique smooth function
+$y(\lambda)$.
+
+<Derivation title="The offset curve is locally the graph y(λ) (implicit function theorem, App. D.1)" result="G(\lambda, y(\lambda)) = 0 \text{ near } x_0 \text{ whenever } D_Y G(x_0) \ne 0">
+**Theorem D.1.1 (Implicit Function Theorem).** Let $f : \R^m \times \R^n \to \R^n$ be smooth and
+suppose $D_y f(x_0, y_0)$ is invertible. Then there exist neighborhoods $X_0$ of $x_0$ and $Z_0$ of
+$f(x_0, y_0)$ and a unique smooth $g : X_0 \times Z_0 \to \R^n$ with $f(x, g(x, z)) = z$.
+
+**Step 1 — $D$ is smooth off the medial axis with $|\nabla D| = 1$.** By the previous derivation,
+$\nabla D$ is a unit vector wherever the nearest point is unique, and $D$ is as smooth as the obstacle
+boundary there.
+
+**Step 2 — the differential in the $(\lambda, y)$ frame.** Along the tangent $\lambda$ the distance
+does not change to first order, so $\partial G/\partial\lambda = 0$; along the normal $y$ it changes at
+unit rate, so $\partial G/\partial y = \pm 1$. Hence $DG = [\,0 \;\; D_Y G\,]$ with $D_Y G = \pm 1 \ne 0$
+on the curve.
+
+**Step 3 — apply the theorem with $m = n = 1$.** Take $f(\lambda, y) = G(\lambda, y)$, $z = 0$. The
+hypothesis is $D_Y G \ne 0$, which Step 2 gives; the conclusion is a unique smooth $y(\lambda)$ with
+$G(\lambda, y(\lambda)) = 0$ near $x_0$.
+
+**Step 4 — the graph is the curve.** Points of the zero set near $x_0$ are exactly the graph points,
+by the uniqueness clause. So the offset curve is, locally, a smooth curve parameterized by arc length
+along the tangent — the object the predictor–corrector traces. $\blacksquare$
+
+**The general version Chapters 8–9 use.** For $G : \R^m \times \R^n \to \R^n$ — equidistance to
+several obstacles at once — the same theorem produces an $m$-dimensional zero set wherever $D_Y G$
+has full rank. And because the nonsingular matrices form an open set, full rank at a point persists
+in a neighborhood: Choset's reason (p. 37) that the corrector can be run at every step, not just on
+the curve.
+</Derivation>
+
+### The corrector converges quadratically
+
+**Statement (Theorem D.2.1).** Let $f : \R^n \to \R^n$ with $f(y^*) = 0$. Suppose $Df(y^*)$ is
+nonsingular with $\|(Df(y^*))^{-1}\| \le \beta$, and $Df$ is $\gamma$-Lipschitz on $B_\rho(y^*)$ with
+$\gamma \le 2/(\rho\beta)$. Then from any $y_0 \in B_\rho(y^*)$ the sequence
+$y_{h+1} = y_h - (Df(y_h))^{-1} f(y_h)$ stays in the ball and converges quadratically:
+$\|y_{h+1} - y^*\| \le a\,\|y_h - y^*\|^2$ with $a = \beta\gamma / (2(1 - \rho\beta\gamma)) < 1/\rho$.
+
+<Derivation title="Newton–Raphson converges quadratically (App. D.2), and what it means for eq. 2.5" result="\|y_{h+1} - y^*\| \le a\,\|y_h - y^*\|^2">
+**Step 1 — Taylor about $y_h$.** Since $f(y^*) = 0$,
+$0 = f(y^*) = f(y_h) + Df(y_h)(y^* - y_h) + r_h$ with remainder
+$\|r_h\| \le \tfrac{\gamma}{2}\|y^* - y_h\|^2$ by the Lipschitz bound on $Df$.
+
+**Step 2 — subtract the Newton step.** $y_{h+1} - y^* = y_h - y^* - (Df(y_h))^{-1} f(y_h)
+= (Df(y_h))^{-1}\bigl[Df(y_h)(y_h - y^*) - f(y_h)\bigr] = (Df(y_h))^{-1} r_h$.
+
+**Step 3 — bound the inverse.** On $B_\rho(y^*)$, $\|Df(y_h) - Df(y^*)\| \le \gamma\rho$, and a
+standard perturbation bound gives $\|(Df(y_h))^{-1}\| \le \beta/(1 - \rho\beta\gamma)$ — finite
+because $\gamma \le 2/(\rho\beta)$ keeps the denominator positive. Multiply:
+$\|y_{h+1} - y^*\| \le \frac{\beta}{1 - \rho\beta\gamma}\cdot\frac{\gamma}{2}\|y_h - y^*\|^2 = a\|y_h - y^*\|^2$,
+and $a\rho < 1$ keeps every iterate inside the ball. $\blacksquare$
+
+**The specialization in the tracer (eq. 2.5).** On the correcting line $Y$ through the predicted point,
+$f = G$ restricted to $Y$ is a scalar function of one variable, and $Df = D_Y G = \nabla G \cdot n$ with
+$n$ the unit normal of the line — a number the robot computes from the distance gradient, i.e. from
+its sensor. The Newton step becomes
+
+$$
+y_{h+1} \;=\; y_h \;-\; \frac{G(y_h)}{D_Y G(y_h)}\, n .
+\tag{2.5}
+$$
+
+**What quadratic looks like.** On the kidney obstacle of the widget, at $W^* = 0.5$ with a long
+predictor step $\Delta\lambda = 0.4$, the residuals $|G(y_h)|$ run
+$3.96\times10^{-2} \to 6.47\times10^{-5} \to 2.02\times10^{-10} \to 5.6\times10^{-17}$. The ratios
+$|G(y_{h+1})|/|G(y_h)|^2$ are 0.041 and 0.048 — the same constant $a$ twice, which is what
+"quadratic" means and what the self-check asserts.
+
+**When $D_Y G \to 0$.** $\beta = 1/|D_Y G|$ blows up, the admissible $\gamma$ shrinks to nothing, and
+the theorem promises nothing. Our tracer refuses to divide: below $|D_Y G| < 0.2$ it stops and reports
+`singular`. The widget shows the moment.
+</Derivation>
+
+### The length of a convex obstacle's offset curve
+
+**Statement.** For a convex polygon of perimeter $p$, the offset curve at distance $W^*$ has length
+$p + 2\pi W^*$.
+
+<Derivation title="Offset length p + 2πW* (the Steiner formula), the tracer's test" result="\operatorname{len}\{D = W^*\} = p + 2\pi W^*">
+**Step 1 — edges translate.** Each edge of the polygon contributes a parallel segment of the same
+length at distance $W^*$: total $p$.
+
+**Step 2 — vertices become arcs.** At each vertex the offset curve is a circular arc of radius $W^*$
+whose angle equals the vertex's exterior turning angle.
+
+**Step 3 — the turning angles sum to $2\pi$.** A simple closed convex curve turns through exactly
+$2\pi$, so the arcs total $2\pi W^*$. Adding Step 1 gives $p + 2\pi W^*$. $\blacksquare$
+
+This is the Steiner formula for the perimeter of a Minkowski sum with a disc — the same geometry that
+[Chapter 4](/chapters/ch04-configuration-space-i) uses to inflate obstacles into C-obstacles. Reflex
+vertices contribute no arc (the two offset edges meet at a corner), and when $W^*$ exceeds a concave
+radius of curvature the offset *set* self-intersects — the cusp the tracer must survive.
+
+**The number the tracer must hit.** For $\WO_1 = [2, 4] \times [-1, 1]$, $p = 8$ and $W^* = 0.5$ give
+$8 + \pi = 11.1416$. Our tracer with $\Delta\lambda = 0.02$ closes the curve after 558 steps with length
+11.1414 — the inscribed polygon undershoots the arcs by $2 \times 10^{-4}$ — and every sample
+satisfies $|G| < 10^{-13}$.
+</Derivation>
+
+## The algorithm
+
+Choset numbers the three Bugs as Algorithms 1–3. We state them in his form, then make the one
+line that all of them hide — "follow the boundary" — into an algorithm of its own.
+
+<Algorithm
+  name="BUG1(sensor: Contact, q_start, q_goal)  — C Alg. 1"
+  inputs="a point robot with a tactile sensor; q_start, q_goal"
+  outputs="a path to q_goal, or the conclusion that none exists"
+  complexity="L ≤ d(q_start, q_goal) + 1.5 Σ pᵢ; O(1) sensing per step"
+>
+1. **while** forever **do**
+2. &nbsp;&nbsp;&nbsp;&nbsp;**repeat** from $q^L_{i-1}$, move toward $\qgoal$ **until** $\qgoal$ is reached or an obstacle is encountered at $q^H_i$
+3. &nbsp;&nbsp;&nbsp;&nbsp;**if** goal is reached **then** exit
+4. &nbsp;&nbsp;&nbsp;&nbsp;**repeat** follow the obstacle boundary **until** $\qgoal$ is reached or $q^H_i$ is re-encountered
+5. &nbsp;&nbsp;&nbsp;&nbsp;determine the point $q^L_i$ on the perimeter with the shortest distance to the goal
+6. &nbsp;&nbsp;&nbsp;&nbsp;go to $q^L_i$ (the shorter way round)
+7. &nbsp;&nbsp;&nbsp;&nbsp;**if** moving toward the goal from $q^L_i$ would re-enter the obstacle **then** conclude $\qgoal$ is not reachable and exit
+8. **end while**
+</Algorithm>
+
+Line 5 is the exhaustive search and line 7 is the completeness test; everything else is bookkeeping.
+Our implementation records, on every straight piece of the boundary walk, the closest point of that
+piece to the goal and its arc length from the hit point, so line 5 costs nothing extra and line 6
+knows which way is shorter.
+
+<Algorithm
+  name="BUG2(sensor: Contact, q_start, q_goal)  — C Alg. 2"
+  inputs="a point robot with a tactile sensor; the fixed m-line from q_start to q_goal"
+  outputs="a path to q_goal, or the conclusion that none exists"
+  complexity="L ≤ d(q_start, q_goal) + ½ Σ nᵢ pᵢ"
+>
+1. **while** true **do**
+2. &nbsp;&nbsp;&nbsp;&nbsp;**repeat** from $q^L_{i-1}$, move toward $\qgoal$ along the m-line **until** $\qgoal$ is reached or an obstacle is encountered at $q^H_i$
+3. &nbsp;&nbsp;&nbsp;&nbsp;turn left (or right)
+4. &nbsp;&nbsp;&nbsp;&nbsp;**repeat** follow the boundary **until**
+5. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$\qgoal$ is reached, **or** $q^H_i$ is re-encountered (conclude unreachable), **or**
+6. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;the m-line is re-encountered at a point $m$ with $m \ne q^H_i$, $d(m, \qgoal) < d(q^H_i, \qgoal)$, and a move toward the goal from $m$ would not hit the obstacle
+7. &nbsp;&nbsp;&nbsp;&nbsp;$q^L_{i} \leftarrow m$; increment $i$
+8. **end while**
+</Algorithm>
+
+The three conditions on line 6 are the greedy leave rule. Our implementation evaluates them on each
+straight piece of the follower's move, intersects the piece with the m-line analytically, and seeks
+the follower back to the exact crossing — so a leave point is *on* the m-line, not a step past it,
+and the worked example lands on 16 to machine precision rather than 16.03.
+
+<Algorithm
+  name="TANGENT BUG(sensor: RangeSensor(R), q_start, q_goal)  — C Alg. 3"
+  inputs="a point robot with a range sensor of radius R"
+  outputs="a path to q_goal, or the conclusion that none exists"
+  complexity="O(n_rays) per step for {Oᵢ}, d_reach, d_followed; completeness is Choset's problem 2.9"
+>
+1. **while** true **do**
+2. &nbsp;&nbsp;&nbsp;&nbsp;**repeat** continuously move toward the $n \in \{T, O_i\}$ minimizing $d(x, n) + d(n, \qgoal)$
+3. &nbsp;&nbsp;&nbsp;&nbsp;**until** the goal is encountered, **or** that direction begins to increase $d(x, \qgoal)$ — a local minimum $M$
+4. &nbsp;&nbsp;&nbsp;&nbsp;choose the boundary-following direction that continues the most recent motion-to-goal direction
+5. &nbsp;&nbsp;&nbsp;&nbsp;**repeat** continuously update $d_{\mathrm{reach}}$, $d_{\mathrm{followed}}$ and $\{O_i\}$; move toward the $O_i$ in the chosen direction
+6. &nbsp;&nbsp;&nbsp;&nbsp;**until** the goal is reached, **or** a cycle around the obstacle is completed (conclude unreachable), **or** $d_{\mathrm{reach}} < d_{\mathrm{followed}}$
+7. **end while**
+</Algorithm>
+
+Two implementation facts the pseudocode hides. First, with a finite ray count an endpoint created by
+the *range limit* is a horizon, not a feature: it recedes as the robot approaches, and two such horizons
+either side of the goal ray can trade places every step. Our planner keeps its current side of the goal
+ray unless a rival wins by a full step. Second, $d_{\mathrm{followed}}$ — the goal distance of the closest
+boundary sensed *so far* — is kept across behaviors, so that "$d_{\mathrm{reach}} < d_{\mathrm{followed}}$"
+is a statement of progress rather than a trigger that fires on the first step; and the robot leaves only
+when motion-to-goal from the current point would actually decrease $d(x, \qgoal)$, which is what stops
+the two behaviors chattering at the same point.
+
+### Boundary following as curve tracing
+
+All three Bugs say "follow the boundary". Choset's §2.3 asks the three questions an implementation
+must answer — what information does the robot need, how does it infer it from sensors, how does it
+use it — and answers them in order: the **tangent** $(\nabla D)^\perp$ (§2.3.1); the tangent from the
+**shortest ray** of the scan (§2.3.2); and a **continuation method** that predicts along the tangent
+and corrects back onto $G^{-1}(0)$ (§2.3.3). That continuation method is this chapter's owned artifact.
+
+<Algorithm
+  name="trace_curve(G, DG, x₀, direction, Δλ)  — App. D predictor–corrector, eq. 2.5"
+  inputs="a scalar field G with gradient DG; a point x₀ near the zero set; a direction; the predictor step Δλ"
+  outputs="samples on G⁻¹(0), and a stop reason: closed, reached, singular, budget"
+  complexity="O(steps × Newton iterations); the corrector converges quadratically (Theorem D.2.1)"
+>
+1. $x \leftarrow$ Newton-correct $x_0$ along $\nabla G(x_0)$ until $|G(x)| < \mathrm{tol}$
+2. **repeat**
+3. &nbsp;&nbsp;&nbsp;&nbsp;$n \leftarrow \nabla G(x) / \|\nabla G(x)\|$; $\quad t \leftarrow \pm n^\perp$ with the sign fixed by `direction` (which side the obstacle is kept on)
+4. &nbsp;&nbsp;&nbsp;&nbsp;**predict** $y_0 \leftarrow x + \Delta\lambda\, t$
+5. &nbsp;&nbsp;&nbsp;&nbsp;**correct** for $h = 0, 1, 2$: $D_Y G \leftarrow \nabla G(y_h) \cdot n$; **if** $|D_Y G| < \epsilon$ **then** stop with **singular**; $\;y_{h+1} \leftarrow y_h - G(y_h)/D_Y G \cdot n$
+6. &nbsp;&nbsp;&nbsp;&nbsp;$x \leftarrow y_{h+1}$; record $x$ and the residuals $|G(y_h)|$
+7. **until** $x$ returns within $\Delta\lambda$ of the start (**closed**), `stop(x)` fires (**reached**), or the step budget is spent
+</Algorithm>
+
+The tracer "hovers" around the curve, as Choset's figure 2.20 draws it: it produces *samples* of the
+curve, not the curve, and its guarantee is local — conditioned on $D_Y G \ne 0$ in a neighborhood.
+The widget below is the algorithm box running, one line at a time.
+
+<Deferred minHeight={620}>
+  <BoundaryFollower />
+</Deferred>
+
+Three things to try. Drag $\Delta\lambda$ down to 0.05: the prediction barely leaves the curve and the
+first Newton iterate already lands within $10^{-6}$. Drag it up to 0.6: the prediction falls visibly
+off the curve, the first correction is large, the second is tiny, and the third is machine precision —
+the exponents doubling in the residual strip are Theorem D.2.1 in numbers. Then press the cusp
+preset. The offset curve now enters the dent on the obstacle's west side, whose bottom has a radius of
+curvature of about 0.05 — far smaller than $W^* = 0.25$ — so the offset *set* $\{D = 0.25\}$ has a
+cusp there. Approaching it, $\nabla D$ swings through nearly 180° within a single predictor step, the
+correcting line becomes almost tangent to the level set, $|D_Y G|$ drops to 0.002, and the tracer
+stops after 52 steps and says `singular`. It could have divided by that 0.002 and landed somewhere
+on the far branch, and a less honest tracer would have. Ours reports that the hypothesis of
+Theorem D.1.1 has failed and lets the caller decide.
+
+<Callout type="info">
+The Bugs' boundary follower is built on the same tracer, with one pragmatic addition the pure tracer
+refuses to make: at an *inside* corner of the Apartment's walls, where $\nabla D$ jumps by 90° and the
+fixed-plane corrector is exactly singular, the follower corrects along the current gradient instead and
+turns the corner. The tracer's contract is to report the failure; the follower's is to survive it. Both
+behaviors are deliberate, and the Rust below keeps them in separate functions for that reason.
+</Callout>
+
+## Implementation in Rust
+
+The `bugs` crate sits on Chapter 2's `collide` (the `Scene` and its distance and witness queries) and
+`robots` (the `RangeSensor`). Four modules: `scan.rs` for everything that can be computed from a scan
+alone, `trace.rs` for the owned tracer, and `bug1.rs`, `bug2.rs`, `tangent.rs` for the planners. The
+TypeScript in `web/lib/bugs/` is a port of the same code, module for module, and the arena above runs it.
+
+```rust title="crates/bugs/src/scan.rs"
+use nalgebra::{Point2, Vector2};
+
+/// One ray of ρ_R(x, ·): the raw distance, or +∞ when the ray saturates at R.
+/// A scan is sensor data and nothing else — no scene access anywhere in this file.
+pub struct Scan {
+    pub x: Point2<f64>,
+    pub angles: Vec<f64>,
+    pub ranges: Vec<f64>, // f64::INFINITY where ρ ≥ R
+    pub max_range: f64,
+}
+
+/// A maximal run of rays over which ρ_R is finite and continuous (C §2.2).
+/// `to < from` means the run wraps past bearing 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Interval { pub from: usize, pub to: usize, pub count: usize }
+
+impl Scan {
+    /// D(x) = min_s ρ(x, s): the shortest ray (C eq. 2.4, problem 2.1). With finitely many
+    /// rays this never undershoots D and overshoots by D(1 − cos(π/n)) on a flat wall.
+    pub fn distance(&self) -> f64 {
+        self.ranges.iter().cloned().fold(f64::INFINITY, f64::min)
+    }
+
+    /// ∇D(x): the unit vector along the shortest ray, pointing *away* from the obstacle.
+    pub fn gradient(&self) -> Vector2<f64> {
+        let (k, _) = self.argmin();
+        let s = self.angles[k];
+        -Vector2::new(s.cos(), s.sin())
+    }
+
+    /// (∇D)⊥ with its sign fixed by the side the obstacle is kept on. `Turn::Left`
+    /// keeps it on the robot's right (clockwise around a convex obstacle).
+    pub fn tangent(&self, turn: Turn) -> Vector2<f64> {
+        let g = self.gradient();
+        let t = Vector2::new(-g.y, g.x);
+        match turn { Turn::Left => -t, Turn::Right => t }
+    }
+
+    /// Two consecutive hits belong to one surface when their endpoints are closer than
+    /// the spacing a wall at steep incidence would produce: κ·ρ·Δθ, with κ = 8 good to
+    /// an incidence of ~83°, floored at `jump_abs` so a hairline step is not a corner.
+    fn continuous(&self, k: usize, l: usize, kappa: f64, jump_abs: f64) -> bool {
+        let (rk, rl) = (self.ranges[k], self.ranges[l]);
+        if !rk.is_finite() || !rl.is_finite() { return false; }
+        let dtheta = std::f64::consts::TAU / self.ranges.len() as f64;
+        let gap = (self.point(k) - self.point(l)).norm();
+        gap <= jump_abs.max(kappa * rk.min(rl) * dtheta)
+    }
+
+    /// The intervals of continuity. O(n_rays). Runs straddling the 0/2π seam are merged;
+    /// an all-finite, all-continuous scan (inside a closed room) is one interval with no
+    /// endpoints — the robot sees no corner to aim for.
+    pub fn continuity_intervals(&self, kappa: f64, jump_abs: f64) -> Vec<Interval> {
+        let n = self.ranges.len();
+        let wrap = |k: isize| ((k % n as isize + n as isize) % n as isize) as usize;
+        // Start at a break so wrapped runs come out whole.
+        let Some(start) = (0..n).find(|&k| !self.continuous(wrap(k as isize - 1), k, kappa, jump_abs)) else {
+            return if self.ranges[0].is_finite() { vec![Interval { from: 0, to: n - 1, count: n }] } else { vec![] };
+        };
+        let (mut out, mut k, mut visited) = (Vec::new(), start, 0);
+        while visited < n {
+            if !self.ranges[k].is_finite() { k = wrap(k as isize + 1); visited += 1; continue; }
+            let mut count = 1;
+            while visited + count < n
+                && self.continuous(wrap(k as isize + count as isize - 1), wrap(k as isize + count as isize), kappa, jump_abs)
+            { count += 1; }
+            out.push(Interval { from: k, to: wrap(k as isize + count as isize - 1), count });
+            k = wrap(k as isize + count as isize);
+            visited += count;
+        }
+        out
+    }
+
+    fn point(&self, k: usize) -> Point2<f64> {
+        let (r, a) = (self.ranges[k], self.angles[k]);
+        self.x + r * Vector2::new(a.cos(), a.sin())
+    }
+}
+```
+
+The endpoints $O_i$ of those intervals are refined with the sensor: starting from the last ray inside
+the interval, the bearing is marched toward the first ray outside with a step that doubles after each
+accepted move and halves after each rejection, accepting a move while the hit stays continuous with the
+one before — a short hop on a smooth surface, a vanishing hop at a corner, or a hit collinear with the
+last two on a wall seen edge-on. On a polygon world it converges on the silhouette vertex itself to
+$10^{-8}$, which is what the tangent-line self-check compares against brute force.
+
+```rust title="crates/bugs/src/trace.rs — THE OWNED ARTIFACT"
+use nalgebra::{Point2, Vector2};
+
+#[derive(Clone, Copy, Debug)]
+pub enum Turn { Left, Right }
+
+pub struct TraceParams {
+    /// Δλ, the predictor step along the tangent.
+    pub step: f64,
+    /// Newton iterations per correction; three is usually one too many.
+    pub newton_iters: usize,
+    /// Stop correcting once |G| falls below this.
+    pub tol: f64,
+    /// |D_Y G| below this means the correcting line is tangent to the level set.
+    pub singular_tol: f64,
+    pub max_steps: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceStop { Closed, Reached, Singular, Budget, Diverged }
+
+/// One predictor–corrector step, kept whole so a figure can draw every hop.
+pub struct TraceRecord {
+    pub from: Point2<f64>,
+    pub tangent: Vector2<f64>,
+    pub predicted: Point2<f64>,
+    pub corrections: Vec<Point2<f64>>,
+    /// |G(y_h)| for h = 0, 1, 2, … — the squares Theorem D.2.1 promises.
+    pub residuals: Vec<f64>,
+    pub dy_g: f64,
+}
+
+pub struct Trace {
+    pub points: Vec<Point2<f64>>,
+    pub records: Vec<TraceRecord>,
+    pub stop: TraceStop,
+    pub length: f64,
+    pub max_residual: f64,
+}
+
+/// Newton along a fixed direction n — the corrector of eq. 2.5 with D_Y G = ∇G·n.
+/// `singular` is set when the directional derivative vanished before the tolerance was met.
+fn correct_along(
+    g: &impl Fn(Point2<f64>) -> f64,
+    dg: &impl Fn(Point2<f64>) -> Vector2<f64>,
+    y0: Point2<f64>,
+    n: Vector2<f64>,
+    p: &TraceParams,
+) -> (Point2<f64>, Vec<Point2<f64>>, Vec<f64>, f64, bool) {
+    let (mut y, mut corr, mut res) = (y0, Vec::new(), vec![g(y0).abs()]);
+    let dy_g0 = dg(y0).dot(&n);
+    for _ in 0..p.newton_iters {
+        let gy = g(y);
+        if gy.abs() <= p.tol { break; }
+        let dy_g = dg(y).dot(&n);
+        if dy_g.abs() < p.singular_tol {
+            return (y, corr, res, dy_g0, true); // Theorem D.1.1's hypothesis has failed: say so
+        }
+        y -= n * (gy / dy_g);                   // eq. 2.5
+        corr.push(y);
+        res.push(g(y).abs());
+    }
+    (y, corr, res, dy_g0, false)
+}
+
+/// Trace the zero set of G from x₀ until it closes, `stop(x)` fires, the corrector goes
+/// singular, or the budget runs out. Generic over G: Chapters 7–10 pass their own.
+pub fn trace_curve(
+    g: impl Fn(Point2<f64>) -> f64,
+    dg: impl Fn(Point2<f64>) -> Vector2<f64>,
+    x0: Point2<f64>,
+    direction: Turn,
+    p: TraceParams,
+    stop: impl Fn(Point2<f64>) -> bool,
+) -> Trace {
+    // x₀ need not be on the curve: Newton along the full gradient first.
+    let mut x = x0;
+    for _ in 0..8 {
+        let (gx, grad) = (g(x), dg(x));
+        if gx.abs() <= p.tol || grad.norm_squared() < 1e-18 { break; }
+        x -= grad * (gx / grad.norm_squared());
+    }
+    let start = x;
+    let (mut points, mut records, mut length) = (vec![start], Vec::new(), 0.0);
+    let mut max_residual = g(start).abs();
+    let mut outcome = TraceStop::Budget;
+
+    for _ in 0..p.max_steps {
+        let grad = dg(x);
+        let n = grad / grad.norm();
+        let perp = Vector2::new(-n.y, n.x);
+        let t = match direction { Turn::Left => -perp, Turn::Right => perp };
+        let predicted = x + t * p.step;                                   // predict
+        let (y, corr, res, dy_g, singular) = correct_along(&g, &dg, predicted, n, &p); // correct
+        records.push(TraceRecord { from: x, tangent: t, predicted, corrections: corr, residuals: res, dy_g });
+        if singular { outcome = TraceStop::Singular; break; }
+        let hop = (y - x).norm();
+        if !hop.is_finite() || hop > 4.0 * p.step { outcome = TraceStop::Diverged; break; }
+        length += hop;
+        x = y;
+        points.push(x);
+        max_residual = max_residual.max(g(x).abs());
+        if stop(x) { outcome = TraceStop::Reached; break; }
+        if length > 3.0 * p.step && (x - start).norm() < 0.75 * p.step {
+            length += (x - start).norm();
+            points.push(start);
+            outcome = TraceStop::Closed;
+            break;
+        }
+    }
+    Trace { points, records, stop: outcome, length, max_residual }
+}
+
+/// Convenience: the offset curve of a scene at W*, with G = D − W* and ∇G = ∇D from
+/// `Collision::witness` — the nearest wall point and the unit vector away from it.
+pub fn offset_curve(scene: &Scene, w_star: f64, x0: Point2<f64>, dir: Turn, p: TraceParams) -> Trace {
+    trace_curve(
+        |x| scene.distance(x) - w_star,
+        |x| scene.witness(x).gradient,
+        x0, dir, p, |_| false,
+    )
+}
+```
+
+The planners are state machines so the arena can animate them. Bug1 below is the whole of
+Algorithm 1; Bug2 and Tangent Bug follow the same shape with their own switching rules. The
+`Contact` trait is the two behaviors as an interface — one implementation walks polygon edges
+exactly (zero clearance, exact lengths), the other follows the offset curve at $W^*$ on any scene
+through `trace_curve`, which is how Rusty, reduced to a point by Chapter 2's disc argument, runs the
+Bugs in the Apartment.
+
+```rust title="crates/bugs/src/bug1.rs" {36-52}
+use nalgebra::Point2;
+use crate::follow::{Contact, Follower, Piece};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase { ToGoal, Circumnavigate, Return }
+
+pub struct BugState {
+    pub x: Point2<f64>,
+    pub path: Vec<Point2<f64>>,
+    pub length: f64,
+    pub hits: Vec<Point2<f64>>,
+    pub leaves: Vec<Point2<f64>>,
+    pub done: bool,
+    pub failed: bool,
+}
+
+/// C Alg. 1. `step` is the motion resolution; the leave point and the perimeter are
+/// exact regardless of it, because the bookkeeping is done on the follower's pieces.
+pub struct Bug1<'c, C: Contact> {
+    contact: &'c C,
+    goal: Point2<f64>,
+    step: f64,
+    turn: Turn,
+    pub state: BugState,
+    phase: Phase,
+    follower: Option<C::Follower>,
+    /// Best leave candidate on this obstacle: point, arc length from the hit, goal distance.
+    best: (Point2<f64>, f64, f64),
+    remaining: f64,
+}
+
+impl<'c, C: Contact> Bug1<'c, C> {
+    pub fn step(&mut self) {
+        if self.state.done || self.state.failed { return; }
+        match self.phase {
+            Phase::ToGoal => {
+                // Lines 2–3: toward the goal until we touch something.
+                let heading = (self.goal - self.state.x).normalize();
+                let (x, hit) = self.contact.move_toward(self.state.x, self.goal, self.step);
+                self.push(x);
+                if (x - self.goal).norm() < 1e-9 { self.state.done = true; return; }
+                if hit {
+                    self.state.hits.push(x);
+                    self.follower = Some(self.contact.follow(x, heading, self.turn));
+                    self.best = (x, 0.0, (x - self.goal).norm());
+                    self.phase = Phase::Circumnavigate;
+                }
+            }
+            Phase::Circumnavigate => {
+                // Line 4: a full loop, remembering the closest perimeter point (line 5).
+                let f = self.follower.as_mut().unwrap();
+                for Piece { a, b, s0 } in f.advance(self.step) {
+                    let (q, t, d) = closest_on_segment(self.goal, a, b);
+                    if d < self.best.2 - 1e-12 { self.best = (q, s0 + t * (b - a).norm(), d); }
+                    self.push(b);
+                }
+                if f.closed() {
+                    // Line 6: the shorter way round.
+                    let p = f.perimeter().unwrap();
+                    let (fwd, back) = (self.best.1, p - self.best.1);
+                    if back < fwd { f.reverse(); }
+                    self.remaining = fwd.min(back);
+                    self.phase = Phase::Return;
+                }
+            }
+            Phase::Return => {
+                let f = self.follower.as_mut().unwrap();
+                let ds = self.step.min(self.remaining);
+                for Piece { b, .. } in f.advance(ds) { self.push(b); }
+                self.remaining -= ds;
+                if self.remaining <= 1e-12 {
+                    self.push(self.best.0);
+                    self.state.leaves.push(self.best.0);
+                    // Line 7: would heading for the goal re-enter the obstacle?
+                    if self.contact.blocked(self.best.0, self.goal) { self.state.failed = true; return; }
+                    self.follower = None;
+                    self.phase = Phase::ToGoal;
+                }
+            }
+        }
+    }
+
+    fn push(&mut self, p: Point2<f64>) {
+        self.state.length += (p - self.state.x).norm();
+        self.state.path.push(p);
+        self.state.x = p;
+    }
+}
+```
+
+### The worked example, and the test that pins it
+
+```rust title="crates/bugs/examples/two_rectangles.rs"
+fn main() {
+    // WO₁ = [2,4]×[−1,1] (p₁ = 8), WO₂ = [6,7]×[−2,2] (p₂ = 10); q_start = (0,0), q_goal = (10,0).
+    let scene = Scene::from_polygons(&[rect(2.0, -1.0, 4.0, 1.0), rect(6.0, -2.0, 7.0, 2.0)]);
+    let (start, goal) = (Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+    let contact = PolygonContact::new(&scene);
+
+    let b1 = bug1(&contact, start, goal, 0.05, Turn::Left);
+    let b2 = bug2(&contact, start, goal, 0.05, Turn::Left);
+    let d = (goal - start).norm();
+    let p: Vec<f64> = scene.polygons().iter().map(perimeter).collect();
+    let n: Vec<usize> = scene.polygons().iter().map(|o| line_crossings(o, start, goal)).collect();
+
+    println!("Bug1   length {:.4}  bound d + 1.5·Σp = {:.4}   hits {}  leaves {}",
+             b1.length(), d + 1.5 * p.iter().sum::<f64>(), fmt(&b1.hits), fmt(&b1.leaves));
+    println!("Bug2   length {:.4}  bound d + ½·Σ nᵢpᵢ = {:.4}   hits {}  leaves {}",
+             b2.length(), d + 0.5 * n.iter().zip(&p).map(|(n, p)| *n as f64 * p).sum::<f64>(),
+             fmt(&b2.hits), fmt(&b2.leaves));
+
+    // Tangent Bug's first decision with infinite range: the √5 + √65 tie.
+    let tb = TangentBug::new(&scene, start, goal, TangentOptions { range: f64::INFINITY, clearance: 0.1, ..Default::default() });
+    let e = tb.evaluate(start);
+    println!("TBug∞  first subgoal: tie {:.4} between O=(2,1) and O=(2,-1) → {:?}; length {:.4}",
+             e.candidates[0].h, Turn::Left, tangent_bug(&scene, start, goal, 0.05, f64::INFINITY).length());
+
+    // The tracer against Derivation 6: p + 2πW* = 8 + π.
+    let tr = offset_curve(&scene.only(0), 0.5, Point2::new(1.4, 0.0), Turn::Left,
+                          TraceParams { step: 0.02, newton_iters: 3, tol: 1e-12, singular_tol: 0.2, max_steps: 5000 });
+    println!("offset curve of WO1 at W*=0.5: {:?} after {} steps of Δλ=0.02, length {:.4} (8+π = {:.4}), max |G| {:.1e}",
+             tr.stop, tr.points.len() - 1, tr.length, 8.0 + std::f64::consts::PI, tr.max_residual);
+}
+```
+
+```text title="cargo run -p bugs --example two_rectangles"
+Bug1   length 34.0000  bound d + 1.5·Σp = 37.0000   hits (2,0) (6,0)  leaves (4,0) (7,0)
+Bug2   length 16.0000  bound d + ½·Σ nᵢpᵢ = 28.0000   hits (2,0) (6,0)  leaves (4,0) (7,0)
+TBug∞  first subgoal: tie 10.2983 between O=(2,1) and O=(2,-1) → Left; length 11.2128
+offset curve of WO1 at W*=0.5: Closed after 558 steps of Δλ=0.02, length 11.1414 (8+π = 11.1416), max |G| 3.0e-14
+```
+
+Read those four lines against the §3 arithmetic. Bug1: $2 + 8 + 4 + 2 + 10 + 5 + 3 = 34$, against a
+bound of $10 + 1.5(8 + 10) = 37$. Bug2: $2 + 4 + 2 + 5 + 3 = 16$, against $10 + \tfrac12(2 \cdot 8 + 2
+\cdot 10) = 28$. Tangent Bug with infinite range sees both corners of $\WO_1$ at
+$\sqrt5 + \sqrt{65} = 10.2983$, breaks the tie by its turn direction, and walks 11.21 — shorter than
+Bug2's 16 because it cuts the corners it can see. And the tracer closes the offset curve of $\WO_1$
+at $8 + \pi$ to two parts in $10^{5}$.
+
+```rust title="crates/bugs/tests/bounds.rs"
+use proptest::prelude::*;
+
+#[test]
+fn bug1_two_rectangles() {
+    let (scene, start, goal) = two_rectangles();
+    let s = bug1(&PolygonContact::new(&scene), start, goal, 0.05, Turn::Left);
+    assert_relative_eq!(s.length(), 34.0, epsilon = 1e-6);
+    assert_eq!(s.hits, vec![Point2::new(2.0, 0.0), Point2::new(6.0, 0.0)]);
+    assert_eq!(s.leaves, vec![Point2::new(4.0, 0.0), Point2::new(7.0, 0.0)]);
+}
+
+#[test]
+fn bug2_two_rectangles() {
+    let (scene, start, goal) = two_rectangles();
+    assert_relative_eq!(bug2(&PolygonContact::new(&scene), start, goal, 0.05, Turn::Left).length(), 16.0, epsilon = 1e-6);
+}
+
+proptest! {
+    /// Both bounds, on seeded fields of 1–6 disjoint convex polygons with random queries.
+    /// `Unreachable` must come back iff the goal's component differs from the start's.
+    #[test]
+    fn bounds_hold(seed in 0u64..500) {
+        let field = random_convex_field(SmallRng::seed_from_u64(seed));
+        let contact = PolygonContact::new(&field.scene);
+        let d = (field.goal - field.start).norm();
+        let p: f64 = field.scene.polygons().iter().map(perimeter).sum();
+        let np: f64 = field.scene.polygons().iter()
+            .map(|o| line_crossings(o, field.start, field.goal) as f64 * perimeter(o)).sum();
+        for turn in [Turn::Left, Turn::Right] {
+            match bug1(&contact, field.start, field.goal, 0.05, turn) {
+                BugOutcome::Reached(path) => prop_assert!(path.length() <= d + 1.5 * p + 1e-9),
+                BugOutcome::Unreachable(_) => prop_assert!(!field.connected()),
+            }
+            match bug2(&contact, field.start, field.goal, 0.05, turn) {
+                BugOutcome::Reached(path) => prop_assert!(path.length() <= d + 0.5 * np + 1e-9),
+                BugOutcome::Unreachable(_) => prop_assert!(!field.connected()),
+            }
+        }
+    }
+}
+
+#[test]
+fn offset_square_length() {
+    let tr = offset_curve(&Scene::from_polygons(&[rect(2.0, -1.0, 4.0, 1.0)]), 0.5,
+                          Point2::new(1.4, 0.0), Turn::Left, TraceParams::fine(0.02));
+    assert_eq!(tr.stop, TraceStop::Closed);
+    assert_relative_eq!(tr.length, 8.0 + std::f64::consts::PI, epsilon = 1e-3);
+    assert!(tr.max_residual < 1e-8);
+}
+
+#[test]
+fn tracer_reports_singular() {
+    // Into the kidney's dent at W* = 0.25: the offset set has a cusp, D_Y G → 0.
+    let tr = offset_curve(&kidney(), 0.25, Point2::new(0.0, -1.75), Turn::Left, TraceParams::fine(0.05));
+    assert_eq!(tr.stop, TraceStop::Singular);
+}
+```
+
+The TypeScript port's `__checks_ch03__.ts` asserts the same thirteen facts — 34, 16, the tie, 558
+steps and $8 + \pi$, the squares in the residuals, `singular` at $W^* = 0.25$, the bounds over forty
+seeded fields, and the Apartment lab below — and `npm run check` runs them every time the book is
+built.
+
+## Putting it together: the Apartment lab
+
+Everything so far ran on polygons the planner could walk exactly. Rusty's world is the Apartment of
+[Chapter 2](/chapters/ch02-the-lab): forty wall segments, doorways, a kitchen counter, no polygons at
+all, and a robot with a radius. Chapter 2's disc reduction says to shrink Rusty to a point and inflate
+every wall by $r$; here that means the point robot keeps $W^* = 0.11$ from every wall, hits when
+$D(x)$ reaches $W^*$, and follows the offset curve $G = D - 0.11 = 0$ with `trace_curve`. The query is
+the one every chapter of this book runs: from room A at $(1, 1)$ to the bedroom at $(11, 8)$.
+
+| Planner | Path length | Hits / local minima | What it did |
+|---|---|---|---|
+| Bug1 | 173.37 m | 1 | Hit the party wall of room A, followed the offset curve of the *entire* connected wall network — every room, both sides of every interior wall — found the perimeter point closest to the bedroom, walked back to it, and went in. |
+| Bug2 | 112.34 m | 2 | Hit the same wall, followed it until the fixed m-line was crossed closer to the goal with a free step ahead, left, hit once more in the corridor, left again, arrived. |
+| Tangent Bug ($R = 3$) | 13.51 m | 0 | Saw the doorway as a discontinuity of $\rho_R$ from the start, steered through it, never switched behaviors. The straight-line distance is 12.21 m. |
+
+Three honest observations. First, both contact-sensor Bugs *arrive*, and never come closer than
+$W^*$ to a wall — the self-check asserts a minimum clearance of exactly 0.1100 along all three paths.
+Completeness is real. Second, Bug1's number is absurd, and correctly so: the Apartment's walls are one
+connected obstacle whose offset curve is about 115 m long, and the exhaustive rule walks all of it.
+There is no "$\sum p_i$" to quote here — the perimeter of a wall network viewed from inside is not a
+quantity Choset's bound was written for — which is itself a lesson about what "bounded workspace with
+finitely many obstacles" assumes. Third, Tangent Bug is 1.1 times the straight line. A range sensor
+with a 3 m horizon turns a 173 m ordeal into a 13.5 m stroll, and it does so with exactly the
+information Choset's §2.3 says a robot needs: discontinuities, the shortest ray, and its direction.
+
+The design doc's phrase for the chapter is *a blindfolded walker with one hand on the wall*. The lab
+is where the metaphor earns its keep: with the blindfold on, you can still promise to arrive — Bug1 —
+and with a cane that reaches three metres you can promise it in a tenth of the distance. Neither
+promise needs a map.
+
+### What the Bugs assume, and what breaks without it
+
+Every guarantee in this chapter rests on four assumptions Choset states up front: a point robot;
+perfect position (the robot knows $d(x, \qgoal)$ exactly, recognizes when it is back at $q^H_i$, and can
+return to $q^L_i$); a bounded workspace; finitely many obstacles. Drop perfect position and Bug1's
+"re-encountered $q^H_i$" becomes a tolerance band, Bug2's "closer than the hit point" a hysteresis —
+Exercise 6 asks you to put them in and measure the failure rate. Drop the point robot and the
+disc-to-point reduction of Chapter 2 is what you reach for; our lab did exactly that. And Tangent
+Bug's completeness is not proved anywhere in this chapter — Choset leaves it as problem 2.9, and we
+leave it there too: our implementation terminates on an enclosed goal by recognizing a completed cycle,
+and carries a step budget besides, because an algorithm without a proof should not be allowed to loop
+forever in a figure.
+
+Production stacks do not navigate with Bugs. Nav2's local planners and the MPC of
+[Chapter 19](/chapters/ch19-trajectory-optimization) replaced them long ago, with maps and replanning
+at costmap rate. But look inside any recovery behavior — back up, spin, follow the wall until the
+corridor opens — and the two-behavior architecture is still there, switching rule and all. The Bugs are
+not practical navigation. They are the shortest honest route to a complete sensor-based planner, and
+the chapter where the curve tracer that [Chapters 8](/chapters/ch08-roadmaps-i) and
+[9](/chapters/ch09-roadmaps-ii) build roadmaps with was born. Rusty's unknown-Apartment navigation in
+the [capstone](/chapters/ch23-capstone) starts from these behaviors before replanning takes over.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Tighten the Bug1 bound (C problem 2.7)">
+    Prove that in Bug1 the robot never contacts an obstacle lying entirely outside the disk of radius
+    $d(\qstart, \qgoal)$ centered at $\qgoal$. Use Step 1 of the completeness derivation: every point of
+    the path after the first leave point is strictly closer to the goal than the start was. Conclude that
+    the sum in (2.1) may be taken over the obstacles that meet that disk, and compute the tightened
+    bound for the worked example — then say in one sentence why it does *not* change there.
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Write out D_Y G (C problems 2.11 and 2.12)">
+    For planar boundary following at offset $W^*$, with $n$ the unit normal of the correcting line,
+    write $D_Y G$ explicitly in terms of $\nabla D$ and show it equals $\pm 1$ exactly on the offset
+    curve. Then explain why $G_1 = D + 1$ and $G_2 = D + 2$ have the same Jacobian, and what that means
+    for a tracer that only ever sees $\nabla G$. Finally, name the precise hypothesis of Theorem D.2.1
+    that fails at a point of the medial axis, and relate it to the number 0.002 printed by the cusp preset.
+    <Hints>
+      <>$G$ and $D$ differ by a constant. What does differentiation do to constants?</>
+      <>Theorem D.2.1 asks for $\|(Df(y^*))^{-1}\| \le \beta$. Which quantity is $Df$ here, and what happens to $\beta$ as it tends to zero?</>
+      <>On the medial axis $\nabla D$ is not defined — two nearest points tie — so no neighborhood on which $Df$ is Lipschitz with any finite $\gamma$ exists. The tracer's 0.002 is $|D_Y G|$ one step before that.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the spiral">
+    Load the spiral preset in the Bug Arena and pause before it finishes.
+    <CheckAnswer
+      id="ch03.e3a"
+      prompt="How many times does the line through q_start and q_goal cross the spiral's boundary — Choset's n₁ in eq. (2.2)?"
+      answer={10}
+      tolerance={0}
+    >
+    Each of the five left arms of the spiral is crossed twice, once per face: $n_1 = 10$. With
+    $p_1 = 85.2$ the bound (2.2) is $6.5 + \tfrac12 \cdot 10 \cdot 85.2 = 432.5$, and Bug2 turning
+    right actually walks 132.4 — the bound is a factor three loose, because only the arms the robot
+    *reaches* cost it anything.
+    </CheckAnswer>
+    <Predict
+      id="ch03.e3b"
+      question="Now flip the turn direction to left and reset. Which Bug walks the shortest path?"
+      options={[
+        { label: 'Bug1', because: 'Bug1 does not care about the turn direction beyond which way it circumnavigates: it still walks the whole perimeter once (124.9 or 131.3). It only wins when Bug2 is forced to re-walk the boundary.' },
+        { label: 'Bug2', correct: true, because: 'Turning left, Bug2 goes up the outer arm, round the outside, and spirals inward along faces whose m-line crossings are all wrong-side — until the innermost one, which is valid. One pass, 52.2 units, and it never re-walks anything. Greed won because the geometry let it.' },
+        { label: 'Tangent Bug', because: 'Tangent Bug does well here (it sees the channels), but its path still has to wind into the spiral; it is not shorter than Bug2 turning left on this map.' },
+      ]}
+    >
+    The algorithm did not change between the two runs. The obstacle and the turn direction decided
+    whether the greedy leave rule paid a perimeter per crossing or nothing at all — which is exactly
+    what (2.2) says: the bound is about the worst arrangement of crossings, and a lucky arrangement
+    beats it by a mile.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Count the Newton iterations">
+    In the Boundary Follower set $W^* = 0.5$ and $\Delta\lambda = 0.4$ — roughly a third of the obstacle's
+    convex radius of curvature — and step once.
+    <CheckAnswer
+      id="ch03.e4"
+      prompt="From the first residual |G(y₀)| ≈ 4 × 10⁻², how many Newton iterations does the quadratic rate predict before |G| < 10⁻⁸?"
+      answer={2}
+      tolerance={0}
+    >
+    With $a \approx 0.045$, the residuals go $4 \times 10^{-2} \to 7 \times 10^{-5} \to 2 \times
+    10^{-10}$: two iterations. Now raise $W^*$ past the dent's radius of curvature by pressing the
+    cusp preset, and read what the tracer did: it stopped and reported <em>singular</em> at the
+    bottom of the dent, where $|D_Y G| = 0.002$. Theorem D.1.1 needs $D_Y G$ invertible in a
+    neighborhood; at a cusp of the offset set there is no such neighborhood, and the tracer declines
+    to pretend otherwise.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="A limited field of view (C problem 2.10)">
+    Give `TangentBug` a sensor that sees only a $\pm 90°$ wedge about its heading. Which $O_i$ can it
+    still find, and which of $d_{\mathrm{reach}}$ and $d_{\mathrm{followed}}$ becomes unsafe — i.e. can be
+    *wrong* rather than merely stale — when the robot cannot see behind it while following a boundary?
+    Add a fourth lane to the arena with your wedge sensor and compare lengths over 100 seeded random
+    fields against the full-circle sensor. Report the mean ratio and the number of seeds on which the
+    wedge sensor failed to arrive.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="A robust Bug1 (C problem 2.6)">
+    Replace perfect position with the sister book's odometry drift and noisy LiDAR
+    (<a href="https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch04-rusty-and-sensors">its Chapter 4</a>)
+    and make Bug1 robust: a tolerance $\epsilon$ for "re-encountered $q^H_i$", a hysteresis band for the
+    leave test so the robot does not leave on noise. Over 200 seeds in the Apartment, measure the failure
+    rate (did not arrive, or declared unreachable) as a function of the noise level, and report the smallest
+    $\epsilon$ that keeps the measured path length within 10 % of the noise-free 173.37 m. State which of
+    the four assumptions in "What the Bugs assume" you had to relax, and which one you could not.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G. A., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="The spine of this chapter and the source of its epigraph. Chapter 2 is Bug1, Bug2 and Tangent Bug with Algorithms 1–3 and eqs. 2.1–2.5; Appendix D is the implicit function theorem and the Newton–Raphson convergence theorem. Its bibliography carries Tangent Bug's original papers (Kamon, Rivlin and Rimon, 1996 and 1998) and the continuation-methods literature behind §2.3.3."
+  />
+  <Reference
+    authors="Lumelsky, V. J. and Stepanov, A. A."
+    year={1987}
+    title="Path-Planning Strategies for a Point Mobile Automaton Moving Amidst Unknown Obstacles of Arbitrary Shape"
+    venue="Algorithmica 2(1), 403–430"
+    doi="10.1007/BF01840369"
+    note="Bug1 and Bug2, with the completeness proofs and the path-length bounds this chapter restates as eqs. 2.1 and 2.2. The original already contains the observation that Bug2 can be made arbitrarily worse than Bug1."
+  />
+  <Reference
+    authors="Khatib, O."
+    year={1986}
+    title="Real-Time Obstacle Avoidance for Manipulators and Mobile Robots"
+    venue="The International Journal of Robotics Research 5(1), 90–98"
+    doi="10.1177/027836498600500106"
+    note="Motion-to-goal is gradient descent on d(·, n), and Chapter 7 turns that observation into a potential field — with the local minima the Bugs' boundary following is designed to escape."
+  />
+  <Reference
+    authors="Rimon, E. and Koditschek, D. E."
+    year={1992}
+    title="Exact Robot Navigation Using Artificial Potential Functions"
+    venue="IEEE Transactions on Robotics and Automation 8(5), 501–518"
+    doi="10.1109/70.163777"
+    note="The other way to a complete sensor-free planner: a navigation function with a single minimum. Chapter 7 contrasts it with the Bugs' two-behavior architecture."
+  />
+  <Reference
+    authors="Allgower, E. L. and Georg, K."
+    year={1990}
+    title="Numerical Continuation Methods: An Introduction"
+    venue="Springer Series in Computational Mathematics 13, Springer"
+    doi="10.1007/978-3-642-61257-2"
+    note="The predictor–corrector family trace_curve belongs to, including the implicit-function-theorem argument of Appendix D and the step-length control this chapter's tracer leaves to the reader."
+  />
+  <Reference
+    authors="Macenski, S., Moore, T., Lu, D. V., Merzlyakov, A., and Ferguson, M."
+    year={2023}
+    title="From the Desks of ROS Maintainers: A Survey of Modern and Capable Mobile Robotics Algorithms in the Robot Operating System 2"
+    venue="Robotics and Autonomous Systems 168, 104493"
+    doi="10.1016/j.robot.2023.104493"
+    note="What production navigation actually does instead of Bugs — map-based planners replanning at costmap rate — and where the two-behavior idea survives: in the recovery behaviors."
+  />
+</References>

@@ -1,0 +1,1098 @@
+---
+title: Bayesian Localization and Mapping
+description: Recursive Bayesian localization derived once and run on a grid and as a particle cloud, Choset's physical sensor model, occupancy grids in log odds, Rao-Blackwellized SLAM as a statement — and the half neither Choset nor the sister book writes down, what a planner does when the start is a distribution.
+chapter: 16
+part: PART IV
+partTitle: Planning with Uncertainty
+difficulty: Intermediate
+readingTime: 60 min
+quote: Most important, the resulting estimate may be an arbitrary distribution instead of a Gaussian.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 9
+---
+
+import { KidnapHook } from '@/components/ch/ch16/kidnap-hook';
+import { GridVsParticles } from '@/components/ch/ch16/grid-vs-particles';
+import { FiveCellCorridor } from '@/components/ch/ch16/five-cell-corridor';
+import { PlanOnBelief } from '@/components/ch/ch16/plan-on-belief';
+import { LinkedMath, RoleTag } from '@/components/book/linked-math';
+import { Scrub } from '@/components/book/scrub';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Derive recursive Bayesian localization once (Choset 9.7–9.15), name its two independence assumptions, and say when the second one lies',
+    'Run the same recursion as a grid (Algorithm 16) and as a particle set (Algorithms 17–18), and read mean, mode, entropy and p̃ off either',
+    'Build Choset\'s four-component proximity sensor model, cache it as 256 histograms, and know why its σ is wider than the laser\'s',
+    'State the log-odds occupancy recursion (Algorithm 19) and the Rao-Blackwellized SLAM factorization (Algorithm 20), with the sister book carrying the machinery',
+    'Plan on a belief: sample it, score every first action against a cost-to-go field computed once by backward Dijkstra, take the expected minimum, sense, repeat — and name that loop honestly as the QMDP approximation',
+  ]}
+  prerequisites={[
+    'Rusty, the Apartment, and the ray-cast range sensor ρ(x, s) (Chapter 2) — the sensor model is a likelihood over its readings',
+    'Search, D*, and the universal plan as backward Dijkstra (Chapter 6); the distance transform as a clearance cost (Chapter 7)',
+    'The Gaussian belief of Chapter 15 as one representation among three; the estimate crate this chapter extends',
+  ]}
+>
+Chapter 15 gave the planner a Gaussian. This chapter takes it away. Rusty is switched on in the
+Apartment without being told where; three doors look alike; the belief has three peaks and no mean
+worth driving toward. Choset's Chapter 9 answers the estimation half — recursive Bayesian filtering
+over *any* posterior, on a grid or by particles, a physical sensor model, occupancy-grid mapping,
+Rao-Blackwellized SLAM — and the sister book treats every piece in depth, so what stays here is
+compressed and linked.
+
+What neither book writes down is the half a *planner* needs: what do Parts II–III do when $\qstart$
+is a distribution? Not "plan from the mean" — the mean can be inside a wall. Not "solve a POMDP" —
+that is the sister's
+[Chapter 22](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch22-pomdps). The
+answer every fielded robot runs is a loop: **sample the belief, score each first action against a
+cost-to-go field computed once by backward Dijkstra, take the cheapest in expectation, sense,
+update, repeat.** The Chapter 6 universal plan is exactly what makes planning on a belief cheap.
+This chapter owns one artifact, `replan_on_belief`, and the capstone's navigation panel is that
+artifact running.
+</Overview>
+
+## The problem: switched on, told nothing
+
+Rusty was last seen in room A. Someone carried it to room B and switched it on. The belief Chapter 15
+would hand a planner — a tight Gaussian around the last known pose — is confident and wrong, and a
+confident, wrong belief is worse than no belief at all.
+
+<Deferred minHeight={520}>
+  <KidnapHook />
+</Deferred>
+
+On the left the planner does exactly what Part II taught it: from the believed cell it follows the
+cost-to-go field Up, through room A's doorway, toward the goal. In room B that doorway is a wall.
+The wheels slip, the odometry reports the move, the predict-only belief sails into the corridor and
+the chassis stays where it was. On the right a uniform particle cloud over all free space knows
+nothing, which is the honest state. It moves where *every* hypothesis stays cheap, each scan kills
+the rooms that do not match what it sees, and it arrives. The check file pins both outcomes on the
+default seed: the Gaussian bumps and never reaches the goal; the cloud has its mode within half a
+metre of the truth inside twenty scans and arrives with at most three bumps.
+
+Choset calls the three situations *position tracking* (initial configuration approximately known),
+*global localization* (unknown), and the *kidnapped robot problem* (believed wrongly, to be unlearned).
+The Kalman filter handles the first. This chapter is about the other two, and about what a planner
+can do while the belief is still a cloud.
+
+One line of bookkeeping, carried over from [Chapter 15](/chapters/ch15-kalman-observer): for Rusty
+the planner's configuration $q \in \SEtwo$ and the filter's state $x(k)$ are the same object, and a
+grid belief lives on the Chapter 6 lattice, so the cost-to-go $J$ and the belief share cells. The
+sister book writes $x_t, u_t, z_t$ and $\bel(x_t)$; this chapter keeps Choset's
+$P(x(k) \mid u(0{:}k{-}1), y(1{:}k))$ because his derivation reads better in it.
+
+## Building intuition
+
+### One recursion, two tables
+
+Here is one recorded Apartment run — seeded odometry increments and 36-beam scans from the Chapter 2
+simulator — replayed into two localizers that start uniform over free space. Left: Choset's
+Algorithm 16 on a grid over $\SEtwo$. Right: Algorithms 17–18 as a particle cloud. Same data, same
+sensor model, same recursion; only the way the posterior is written down differs.
+
+<Deferred minHeight={560}>
+  <GridVsParticles />
+</Deferred>
+
+Watch three things. First, the <RoleTag role="posterior">mode</RoleTag> and the <RoleTag role="posterior">mean</RoleTag> are
+different markers for a reason: during the bimodal phase, when rooms A and C look identical from
+inside, the mean (Choset's eq. 9.17, a weighted average of positions and a circular average of
+headings) sits in the corridor wall between them. "The mean of a bimodal distribution might lie
+within an obstacle so that no meaningful commands can be generated." The mode is always a possible
+location, but it can jump between peaks from one step to the next. Neither is what a planner should
+drive toward; that is the subject of the last section.
+
+Second, the cost meters. At the default budget the grid is $30 \times 23 \times 18 = 12\,420$ cells
+and its one-byte expected-distance table cost $10\,782$ ray casts to build, once; the cloud is 600
+particles at four doubles each, and every step costs it 600 ray casts per beam it uses. Slide the
+budget down and the two fail *differently*: the grid blurs — a 0.6 m cell cannot say which side of a
+doorway you are on — while the cloud starves — 150 particles over 90 m² of free space leave whole
+rooms unrepresented, and a hypothesis with no particle near it is gone for good. That is the
+misconception the widget kills: the particle filter is not a cheaper grid. It is a different
+approximation with a different failure mode.
+
+Third, press *kidnap*. The $\tilde p$ strip under each panel is Choset's monitor from §9.1.4: the
+average observation likelihood $\tilde p = N^{-1}\sum_j P(y(i) \mid x_j)$, here on a per-beam scale so
+one threshold serves every budget. When the robot is carried to room C the grid's $\tilde p$ dives
+and, with auto-restart on, it does what Burgard et al. did — begins global localization again from
+uniform. The plain cloud has no particles in room C and nothing to resample toward. The remedies
+Choset lists — random particles in the motion model (Fox et al.), restart on a $\tilde p$ threshold
+(Burgard et al.), a random fraction scaled by $\tilde p$ (Lenser and Veloso), a smoothed $\tilde p$
+(Gutmann and Fox) — are all switchable in the library, and the hook's cloud uses two of them.
+
+### Five cells, by hand
+
+Everything the widget does is this figure done many times. Choset's Figure 9.1 is a corridor with
+doors; shrink it to five cells on a loop with doors at 1 and 3, and use the numbers of his problems 6
+and 7: $P(\text{door} \mid \text{door cell}) = 0.8$, $P(\text{door} \mid \text{wall cell}) = 0.4$,
+and "move right one" succeeds with probability $0.8$ and stays put with $0.2$.
+
+<Deferred minHeight={420}>
+  <FiveCellCorridor />
+</Deferred>
+
+Start uniform, <RoleTag role="prior">$0.2$ everywhere</RoleTag>, entropy $\log_2 5 = 2.3219$ bits. The
+robot sees a door. Multiply each cell by the <RoleTag role="measurement">likelihood</RoleTag> — $0.8$ at
+cells 1 and 3, $0.4$ elsewhere — to get the unnormalized $[0.08, 0.16, 0.08, 0.16, 0.08]$; the sum is
+$\eta^{-1} = 0.56$; divide and the <RoleTag role="posterior">posterior</RoleTag> is
+$[\tfrac17, \tfrac27, \tfrac17, \tfrac27, \tfrac17] \approx [0.1429, 0.2857, 0.1429, 0.2857, 0.1429]$,
+entropy $2.2359$ bits. Sensing sharpened the belief, and it is bimodal: two doors look alike. Now
+move right. Each cell receives $0.8$ of its left neighbour and keeps $0.2$ of itself:
+$bel'(c) = 0.8\,bel(c{-}1) + 0.2\,bel(c)$, which gives $\tfrac17[1.0, 1.2, 1.8, 1.2, 1.8] \approx
+[0.1429, 0.1714, 0.2571, 0.1714, 0.2571]$ and entropy $2.2811$ bits. Moving smeared it. Every
+number here is produced by `fiveCellSenseMove()` in the library and asserted to $10^{-4}$ by the
+check file; the figure prints what the code returns.
+
+The two steps are the whole chapter. Sensing is a multiplication by a likelihood and a
+renormalization; moving is a convolution with a stochastic kernel. A convolution with a kernel that
+has any spread can only increase entropy, so the belief sharpens only when the robot looks.
+
+<NotationTable
+  rows={[
+    { sym: 'P(x(k) \\mid u(0{:}k{-}1), y(1{:}k))', meaning: 'The posterior over configurations after k steps.', note: 'Sister book: bel(x_t)' },
+    { sym: 'P(x(k) \\mid u(k{-}1), x(k{-}1)),\\ P(y(k) \\mid x(k))', meaning: 'Motion model and sensor model; the map m is background knowledge in both.', note: 'Sister: p(x_t | u_t, x_{t−1}), p(z_t | x_t)' },
+    { sym: '\\eta(k);\\quad \\mathcal{M} = \\{(x_j, \\omega_j)\\}_{j=1}^N', meaning: 'Normalizer, computed on the fly (9.6); particle set with importance weights.' },
+    { sym: '(\\alpha, \\beta, d)', meaning: 'Choset\'s odometry increment: initial rotation, translation, final rotation (Fig. 9.5).', note: 'Sister: (δ_rot1, δ_trans, δ_rot2)' },
+    { sym: 'd(x),\\ h_{i,j}', meaning: 'Ray-cast expected distance; sensor-model histogram bin for expected d_i and reading d_j.' },
+    { sym: 'm_l,\\ \\operatorname{Odds}(\\cdot)', meaning: 'Occupancy of cell l; odds P/(1 − P).' },
+    { sym: '\\tilde p', meaning: 'Average observation likelihood over the cloud — the kidnap monitor of §9.1.4.' },
+    { sym: 'J(c)', meaning: 'Cost-to-go of lattice cell c to q_goal: the Chapter 6 universal plan, backward Dijkstra.' },
+    { sym: '\\mathcal{J}_{bel}(a) = \\sum_j \\omega_j [\\,1 + J(f(x_j, a))\\,]', meaning: 'Expected one-step-plus-cost-to-go of action a under the sampled belief.' },
+    { sym: '\\lambda,\\ \\beta_{info}', meaning: 'Collision / off-grid penalty (what J reads outside the free set); information-bonus weight.' },
+  ]}
+/>
+
+### What a planner does with a belief
+
+The metaphor for the whole chapter is one line: **don't drive from where you probably are — drive so
+that wherever you are, the rest of the trip stays cheap.**
+
+Take a $3 \times 3$ grid, rows numbered top to bottom, four-connected, unit step cost, an obstacle at
+$(1, 0)$ and the goal at $(0, 1)$. Backward Dijkstra from the goal labels every free cell with its
+cost-to-go $J$: $0$ at the goal, $1$ at its three neighbours, $2$ at $(1, 2)$ and $(2, 1)$, $3$ at the
+bottom corners, and $\lambda$ at the obstacle. Suppose the belief says the robot is at $(2, 1)$ with
+weight $0.6$ — the mode — or at $(2, 0)$ with weight $0.4$. From the mode, Up is obviously best:
+$1 + J(1, 1) = 2$. But Up from $(2, 0)$ drives into the obstacle. Score every action by its
+*expected* cost under the belief:
+
+<LinkedMath>
+$$
+\htmlClass{term-path}{\mathcal{J}_{bel}(\text{Up})} = 0.6 \cdot 2 + 0.4 \cdot \lambda, \qquad
+\htmlClass{term-path}{\mathcal{J}_{bel}(\text{Right})} = 0.6 \cdot 4 + 0.4 \cdot 3 = 3.6, \qquad
+\htmlClass{term-path}{\mathcal{J}_{bel}(\text{Left})} = 0.6 \cdot 4 + 0.4 \cdot \lambda .
+$$
+</LinkedMath>
+
+At $\lambda = 10$ these are $5.2$, $3.6$, $6.4$, and Down is off-grid for both hypotheses at $10$.
+**Right wins.** The planner first moves *sideways*, into the column that is safe under both
+hypotheses, and only then Up. Set the collision penalty with
+<Scrub id="ch16.lambda" value={20} min={1} max={30} step={0.5} role="path" label="collision penalty λ" />
+and the inset table in the last widget recomputes: Up and Right tie when $0.6 \cdot 2 + 0.4\lambda =
+3.6$, at $\lambda^* = 6$; below it the planner gambles on the mode, and at $\lambda = 4$ Up costs
+$2.8$ and wins. The break-even is printed, not hidden, because the answer depends on it.
+
+## The mathematics
+
+### Definitions
+
+**Position tracking, global localization, kidnapped robot** (§9.1). The initial configuration is
+known approximately, unknown, or believed wrongly and to be unlearned. **Posterior representation.**
+Mathematically $P : X \to \mathbb{R}$ lives in an infinite-dimensional space; a filter stores a finite
+approximation — a Gaussian $(\hat x, P)$, a grid over $\SEtwo$, or weighted samples. §9.1.4 treats all
+three; this chapter's `Belief` trait is what a planner needs from any of them: weighted samples on
+the lattice, the mode, the entropy.
+
+**Sensor model** (§9.1.5). $P(y \mid x) = P(y \mid d(x))$ (9.22): the likelihood depends on the pose
+only through the ray-cast expected distance $d(x)$, and $P(y \mid d)$ is a mixture of four densities —
+hit, short, random, max-range (9.23) — binned at resolution $\Delta$ so each histogram $h_i$ sums to
+one (9.24).
+
+**Occupancy grid** (§9.2.1). A map $m$ of binary cells $m_l$ assumed independent, $P(m) = \prod_l
+P(m_l)$ (9.40), each updated by the inverse model $P(m_l \mid x(k), y(k))$.
+
+**Belief-replanning policy** (this book). $a^* = \arg\min_a \mathcal{J}_{bel}(a)$, recomputed after
+every sense–update. An expectation-of-cost rule with replanning — *not* a POMDP policy.
+
+### Recursive Bayesian localization, derived once
+
+<KeyIdea title="Statement (eqs. 9.1, 9.15)">
+<LinkedMath>
+$$
+\htmlClass{term-posterior}{P(x(k) \mid u(0{:}k{-}1), y(1{:}k))} = \eta(k)\,
+\htmlClass{term-measurement}{P(y(k) \mid x(k))}
+\sum_{x(k-1) \in X} \htmlClass{term-prediction}{P(x(k) \mid u(k{-}1), x(k{-}1))}\,
+\htmlClass{term-prior}{P(x(k{-}1) \mid u(0{:}k{-}2), y(1{:}k{-}1))} .
+$$
+</LinkedMath>
+The continuous form (9.2) replaces the sum by an integral, and the Kalman filter of Chapter 15 is its
+Gaussian special case (Choset's problem 2).
+</KeyIdea>
+
+<Derivation title="Seven steps and two assumptions (§9.1.3)" result="(9.7) → (9.15)">
+**Step 1 — Bayes rule with the past as background.** Treat $u(0{:}k{-}1), y(1{:}k{-}1)$ as
+background knowledge $E$ and apply $P(A \mid B, E) = P(B \mid A, E)P(A \mid E)/P(B \mid E)$ (problem 1)
+with $A = x(k)$, $B = y(k)$:
+$$
+P(x(k) \mid u(0{:}k{-}1), y(1{:}k)) = \frac{P(y(k) \mid u(0{:}k{-}1), y(1{:}k{-}1), x(k))\,P(x(k) \mid u(0{:}k{-}1), y(1{:}k{-}1))}{P(y(k) \mid u(0{:}k{-}1), y(1{:}k{-}1))} .
+\tag{9.7}
+$$
+
+**Step 2 — Assumption A: the measurement is conditionally independent of the past.** Once $x(k)$
+is known, $y(k)$ does not depend on earlier measurements or controls, so the first factor collapses
+to $P(y(k) \mid x(k))$ (9.8). This is where the map enters: it holds given $x(k)$ *and* $m$, and
+fails when $m$ is unknown — Choset's problem 8 and Exercise 2.
+
+**Step 3 — the denominator is a constant.** It does not depend on $x(k)$; call it $\eta(k)^{-1}$ (9.9).
+
+**Step 4 — total probability over the previous state.** Expand the remaining factor:
+$P(x(k) \mid u(0{:}k{-}1), y(1{:}k{-}1)) = \sum_{x(k-1)} P(x(k) \mid u(0{:}k{-}1), y(1{:}k{-}1), x(k{-}1))\,
+P(x(k{-}1) \mid u(0{:}k{-}1), y(1{:}k{-}1))$ (9.10).
+
+**Step 5 — Assumption B: the motion is Markov.** Given $x(k{-}1)$ and $u(k{-}1)$, $x(k)$ is
+independent of everything older: $P(x(k) \mid u(0{:}k{-}1), y(1{:}k{-}1), x(k{-}1)) = P(x(k) \mid
+u(k{-}1), x(k{-}1))$ (9.11).
+
+**Step 6 — drop $u(k{-}1)$ from the previous belief.** The second factor conditions $x(k{-}1)$ on
+$u(k{-}1)$, a motion carried out *after* the robot was at $x(k{-}1)$. Choset argues that for small
+motions the fact that the robot moved a few inches tells you nothing about where it was, so
+$P(x(k{-}1) \mid u(0{:}k{-}1), y(1{:}k{-}1)) = P(x(k{-}1) \mid u(0{:}k{-}2), y(1{:}k{-}1))$ (9.13).
+*This is the step that lies.* His counterexample: two rooms, one small and one large, no door between
+them; if the robot moved farther than the small room's diameter, it must now be in the large room,
+and the motion *did* carry information about $x(k{-}1)$. Small time steps make the lie harmless.
+
+**Step 7 — substitute.** (9.13) into (9.10) gives the prediction (9.14); (9.14) into (9.9) gives
+(9.15), which is (9.1).
+
+*Collapsibles.* The sister book proves the same recursion by induction on $t$ in its
+[Chapter 5](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch05-bayes-filter),
+with the Markov assumption named once and tested by its Markov Breaker widget. Problem 2 — rederive
+the Kalman filter from (9.2) by assuming Gaussian motion and sensor models — is the bridge back to
+Chapter 15.
+</Derivation>
+
+### The normalizer is free
+
+<KeyIdea title="Statement (eqs. 9.5–9.6)">
+$$
+\eta(k) = \Bigl[\sum_{x(k) \in X} P(y(k) \mid x(k))\,P(x(k) \mid u(0{:}k{-}1), y(1{:}k{-}1))\Bigr]^{-1} .
+$$
+</KeyIdea>
+
+<Derivation title="One running sum" result="η⁻¹ = Σ_x P(y | x) P(x)">
+**Step 1.** $\eta^{-1} = P(y(k) \mid u(0{:}k{-}1), y(1{:}k{-}1))$ is the marginal likelihood of the
+reading, "which generally is hard to compute" because consecutive measurements are dependent when the
+location is unknown (9.5).
+
+**Step 2.** Apply total probability over $x(k)$: $\eta^{-1} = \sum_x P(y(k) \mid x)\,P(x \mid
+u(0{:}k{-}1), y(1{:}k{-}1))$ (9.6).
+
+**Step 3.** Every term in that sum is a product the update (9.4) already forms. Algorithm 16 lines
+6–10 accumulate $\eta$ while multiplying; lines 11–13 divide. In the five-cell example the sum is
+$0.56$, and the check file confirms over 240 random updates that the normalizer the filter returns
+equals $\sum_x P(y \mid x)P(x)$ computed independently, to $10^{-15}$.
+
+*Collapsible.* Divide $\eta^{-1}$ by the number of beams and you have $\tilde p$ on a per-beam scale
+— the quantity the kidnapped-robot monitors of §9.1.4 threshold. It costs nothing extra.
+</Derivation>
+
+### Three representations, two of them here
+
+**Kalman filters** keep a Gaussian: efficient, floating-point resolution, high dimensions — and
+unable to say "one of three doors." Jensfeld and Christensen's mixture of Gaussians stretches it; this
+book stops at [Chapter 15](/chapters/ch15-kalman-observer).
+
+**Grids** (Burgard, Fox, and coworkers) store $P$ on a three-dimensional lattice over
+$(x_r, y_r, \theta_r)$; Choset reports 10–30 cm and 2–10° as sufficient. The prediction step is
+$O(N^2)$ if done as written on line 4 of Algorithm 16. Fox, Burgard, and Thrun's remedy: shift every
+$(x, y)$-plane by the offsets $\Delta x, \Delta y$ its heading implies, then convolve with a bounded
+separable kernel for the motion noise,
+$$
+P'(x, y, \theta) = 0.5\,P(x, y, \theta) + 0.25\,\bigl(P(x{-}1, y, \theta) + P(x{+}1, y, \theta)\bigr),
+\tag{9.16}
+$$
+once per axis, $\tfrac23/\tfrac13$ at the borders — $O(NW)$ for kernel width $W$. The mean is a
+weighted average of cell centres, with the heading by the circular average
+$\hat\varphi = \operatorname{atan2}(\sum P(i)\sin\varphi(i), \sum P(i)\cos\varphi(i))$ (9.17); the mode
+is one max, sharpened to sub-cell accuracy by averaging around it.
+
+**Particles** store $\mathcal{M} = \{(x_j, \omega_j)\}$ and run sequential importance sampling with
+resampling — "a survival of the fittest scheme." Motion is sampled, not convolved: Choset encodes an
+increment as $(\alpha, \beta, d)$ (Fig. 9.5) and perturbs each with Gaussians whose widths grow with
+both rotations and the translation,
+$$
+\alpha' = \alpha + \alpha\,\Normal(0,\sigma_1) + d\,\Normal(0,\sigma_2),\quad
+\beta' = \beta + \beta\,\Normal(0,\sigma_3) + d\,\Normal(0,\sigma_4),\quad
+d' = d + d\,\Normal(0,\sigma_5) + (\alpha + \beta)\,\Normal(0,\sigma_6),
+\tag{9.19–9.21}
+$$
+then applies (9.18): $x' = x + d'\cos(\theta + \alpha')$, $y' = y + d'\sin(\theta + \alpha')$,
+$\theta' = \theta + \alpha' + \beta'$. With all $\sigma_i = 0$ this is the exact increment, and the
+check confirms the sampler's mean displacement is unbiased to a millimetre over 20 000 draws. Samples
+that would cross a wall are rejected, as Choset suggests. The sister's
+[Chapter 8](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch08-nonparametric-filters)
+owns resampling variance, KLD-adaptive sample sizes and the histogram filter's bookkeeping; its
+[Chapter 12](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch12-localization-global)
+owns Augmented MCL and the grid-versus-MCL comparison table. Both are vendored unchanged under
+`web/lib/localize/`, and nothing in this chapter re-implements a filter.
+
+### The sensor model, and why its σ is not the laser's
+
+<KeyIdea title="Statement (eqs. 9.22–9.25)">
+$P(y \mid x) = P(y \mid d(x))$, with $d(x)$ by ray casting. For expected distance $d_i$ the histogram
+$h_i$ has bins
+$$
+h_{i,j} = \alpha\,\Normal(d_j; d_i, \sigma) + \beta\,\lambda e^{-\lambda d_j} + \gamma \quad (j < n{-}1),
+\qquad h_{i,n-1} = \delta,
+\qquad \sum_j h_{i,j} = 1,
+\tag{9.23–9.24}
+$$
+each continuous term integrated over its bin of width $\Delta$. A scan is scored as a product over
+beams, $P(y_1, \dots, y_m \mid x) = \prod_i P(y_i \mid x)$ (9.25).
+</KeyIdea>
+
+The four situations come straight from Choset's Figure 9.9, one ultrasound scan from a B21: most
+beams hit the nearest object (Gaussian); some are shorter — crosstalk, a person, a refrigerator not
+in the map (exponential); some pass through a bookshelf and return nonsense (uniform); some never
+return (max range). Fit the weights by log-likelihood maximization: the library's EM over
+$(\alpha, \beta, \gamma, \delta)$ recovers $(0.6, 0.15, 0.15, 0.1)$ from 6000 synthetic readings to
+within $0.03$. Two honesty items Choset insists on, and the code keeps:
+
+- **Beams are not independent.** (9.25) is false and useful; neighbouring beams see the same
+  unmodeled chair. Fox et al. used 60 of the 181 beams of a SICK scanner; the `every` parameter in
+  `scan_likelihood` is that remedy, and the widgets default to every third beam.
+- **The variance encodes the map, not just the sensor.** "The variances of the Gaussians do not
+  depend solely on the accuracy of the sensor. They also encode the uncertainty of the map." A SICK
+  laser's $\sigma$ is a few centimetres; the localizer uses $\sigma = 0.25$ m. The check file runs
+  the same 600 particles both ways on the same log: at $0.25$ m the mode ends within $0.6$ m of the
+  truth; at the raw $0.08$ m no particle ever lands within one $\sigma$ of the right answer and the
+  cloud starves, six metres off. That is Choset's problem 9, and the sister's
+  [Chapter 10](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch10-sensor-models)
+  is where beam intrinsics and the likelihood-field alternative are fitted properly.
+
+The cost trick is also his: discretize distances to 256 values and $P(y \mid d)$ is "only 256
+histograms with 256 bins each," 88 kB at double precision; precompute $d(x)$ for every grid cell and
+heading bin as one byte each, and the grid localizer's correction is a table lookup per beam. The
+widget's 0.4 m grid built that table from $10\,782$ ray casts and reads it for the rest of the run.
+
+### Log-odds occupancy mapping
+
+<KeyIdea title="Statement (eqs. 9.35–9.36)">
+With poses known, each cell's posterior odds update by
+$$
+\log\operatorname{Odds}(m \mid x(1{:}k), y(1{:}k)) = \log\operatorname{Odds}(m \mid x(k), y(k))
+- \log\operatorname{Odds}(m) + \log\operatorname{Odds}(m \mid x(1{:}k{-}1), y(1{:}k{-}1)) ,
+$$
+and with prior $P(m) = 0.5$ the middle term vanishes.
+</KeyIdea>
+
+<Derivation title="Why the hard denominator cancels (§9.2.1)" result="(9.26) → (9.39)">
+**Step 1 — Bayes on $m$ with the pose history as background.** $P(m \mid x(1{:}k), y(1{:}k)) =
+P(y(k) \mid m, x(1{:}k), y(1{:}k{-}1))\,P(m \mid x(1{:}k), y(1{:}k{-}1)) / P(y(k) \mid x(1{:}k), y(1{:}k{-}1))$ (9.26).
+
+**Step 2 — the reading depends only on the map and the current pose.** $P(y(k) \mid m, x(1{:}k),
+y(1{:}k{-}1)) = P(y(k) \mid m, x(k))$ (9.27).
+
+**Step 3 — Bayes again, to swap the forward model for the inverse one.** $P(y(k) \mid m, x(k)) =
+P(m \mid x(k), y(k))\,P(y(k) \mid x(k)) / P(m \mid x(k))$, and $P(m \mid x(k)) = P(m)$ because a pose
+alone says nothing about occupancy (9.28–9.29). The posterior now contains the *inverse sensor model*
+$P(m \mid x(k), y(k))$ — the thing a designer can actually write down — and two denominators nobody
+wants to compute.
+
+**Step 4 — do the same for $\neg m$ and divide.** $P(y(k) \mid x(k))$ and $P(y(k) \mid x(1{:}k),
+y(1{:}k{-}1))$ appear identically in both and cancel (9.30–9.31). What remains is a product of three
+odds ratios.
+
+**Step 5 — take logs.** Products become sums: the log-odds recursion above (9.35); prior $0.5$ kills
+the prior term (9.36). Algorithm 19 line 3 is the same statement in probabilities,
+$$
+P_m \leftarrow \Bigl[1 + \tfrac{1 - P(m \mid x(i), y(i))}{P(m \mid x(i), y(i))}\;\tfrac{P(m)}{1 - P(m)}\;\tfrac{1 - P_m}{P_m}\Bigr]^{-1},
+\tag{9.39}
+$$
+and the check file confirms the two forms agree to $10^{-15}$ on 500 random triples.
+
+*Collapsibles.* The cell-independence assumption (9.40) is false and useful — a detected door should
+update a door-shaped set of cells together — and the per-beam independence of §9.2.1's last paragraph
+is false again. Choset's inverse model for sonar is the piecewise-linear cone (9.41) with deviation
+$s(y, \theta) = g(y)\,\Normal(\theta; 0, \sigma_\theta)$ (9.42), $\sigma_\theta = 0.05$ rad; at
+$y = 2$ m on the optical axis he states $s \approx 0.16$, and the library's `chosetConeModel` gives
+$0.1596$. The lasers in this book use the sister's thin-beam inverse model instead; its
+[Chapter 13](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch13-occupancy-grids)
+has the independence trap and the MAP-mapping repair. Mapping the Apartment from 120 known poses
+marks $88.7\,\%$ of observed wall cells occupied and $99.8\,\%$ of observed free cells free, and the
+map's total entropy falls to under $30\,\%$ of its initial value — not monotonically, because a
+confident cell contradicted by a later beam climbs back toward one bit.
+</Derivation>
+
+### Rao-Blackwellized SLAM, as a statement
+
+<KeyIdea title="Statement (eqs. 9.45–9.47)">
+$$
+P(x(1{:}k), m \mid u(0{:}k{-}1), y(1{:}k)) = P(m \mid x(1{:}k), y(1{:}k))\;P(x(1{:}k) \mid y(1{:}k), u(0{:}k{-}1)) .
+$$
+Given the path, the map is the closed-form mapping-with-known-poses posterior of the previous
+derivation; the path is what a particle filter samples. Each particle is a path *with its own map*.
+</KeyIdea>
+
+<Derivation title="Marginalize what you can, sample the rest (§9.2.2)" result="Algorithm 20">
+**Step 1 — chain rule.** Factor the joint over path and map as $P(m \mid x(1{:}k), y(1{:}k),
+u(0{:}k{-}1))\,P(x(1{:}k) \mid y(1{:}k), u(0{:}k{-}1))$ (9.45).
+
+**Step 2 — the map does not depend on the controls once the path is known** (9.46), giving (9.47).
+
+**Step 3 — each particle carries a path $h^{(j)}(1{:}k)$ and the maximum-likelihood map for it**,
+$m^{(j)} = \arg\max_m P(m \mid h^{(j)}(1{:}k), y(1{:}k{-}1))$ (9.48), built incrementally by
+Algorithm 19.
+
+**Step 4 — the weight is the scan's likelihood under that particle's own map**, Algorithm 20 line 11:
+$\omega_j = P(y(i) \mid x_j, m^{(j)}(1{:}i{-}1))$. A particle whose map disagrees with what it now
+sees dies at the next resampling; this is what closes loops.
+
+**Step 5 — resample** (Algorithm 18). Choset's two engineering warnings: recomputing each map from
+scratch is quadratic in $k$, and copying a full map per particle on every resample is ruinous —
+hence tree-shared maps (Montemerlo et al.; Parr and Eliazar) or a bounded window of scans per
+particle (Hähnel, Burgard, Fox, and Thrun), and scan-matched odometry to cut the particle count.
+
+*Collapsibles.* Scan matching alone (9.44) — greedy maximization of
+$P(y(k) \mid x(k), \hat m)\,P(x(k) \mid u(k{-}1), \hat x(k{-}1))$ — produces locally crisp, globally
+inconsistent maps (Figs. 9.19–9.20); the particle posterior over paths is what repairs them. On a
+45-step Apartment log with slipping odometry, six particles each carrying a 0.2 m occupancy grid end
+$0.12$ m from the truth where dead reckoning ends $0.20$ m off. The sister's
+[Chapter 17](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch17-fastslam) is the
+full treatment, landmark and grid versions both.
+</Derivation>
+
+### Replanning on a belief as expected cost-to-go
+
+This derivation is the book's addition; neither Choset nor the sister states it as a planning
+primitive.
+
+<KeyIdea title="Statement">
+Let $J$ be the exact cost-to-go on the free lattice from backward Dijkstra (Chapter 6), with
+$J(\text{obstacle}) = J(\text{off-grid}) = \lambda$. For a belief given by weighted samples
+$\{(x_j, \omega_j)\}$,
+<LinkedMath>
+$$
+\htmlClass{term-path}{a^*} = \arg\min_a \sum_j \omega_j\,\bigl[\,c(a) + \htmlClass{term-graph}{J}(f(x_j, a))\,\bigr]
+$$
+</LinkedMath>
+minimizes the expected cost of "take $a$, then follow the optimal plan from wherever you actually
+are." The certainty-equivalent choice $\arg\min_a [c(a) + J(f(x_{MAP}, a))]$ coincides with it iff all
+samples agree on the ranking.
+</KeyIdea>
+
+<Derivation title="Bellman, then an expectation in the wrong place, then replanning to fix it" result="a decision costs O(K·|A|) after one Dijkstra">
+**Step 1 — known state.** With $x$ known, Bellman's principle says the optimal first action is
+$\arg\min_a [c(a) + J(f(x, a))]$, where $J$ is the optimal cost-to-go. Backward Dijkstra from the
+goal computes $J$ for *every* cell at once — the universal plan of
+[Chapter 6](/chapters/ch06-graph-search) — so following it from any start reproduces A*'s path and
+cost. The check file does this on fifty seeded Apartment queries: one sample of weight one, and the
+belief planner's path cost equals $J(\text{start})$ to $10^{-14}$.
+
+**Step 2 — unknown state, no more observations.** If the robot will never look again, the best
+open-loop first action minimizes $\E_x[c(a) + J(f(x, a))]$: the expectation of the known-state
+objective. Moving the expectation outside the $\min$ over *future* actions — assuming the state will be
+revealed after this one step — is exactly the QMDP approximation of Littman, Cassandra, and Kaelbling.
+It is optimistic: it never plans to gather information, because it assumes information will arrive
+for free.
+
+**Step 3 — the price of a decision.** $J$ depends on the goal and the map, not on the belief. Compute
+it once, $O(|V| \log |V|)$; thereafter each decision is $K$ samples times $|A|$ actions of array
+reads. This is what makes planning on a belief cheap enough to do every tick, and it is why the
+Chapter 6 universal plan was worth more than its footnote.
+
+**Step 4 — replanning restores the observations.** The QMDP rule ignores the scan that follows the
+action. Taking the action, scanning, updating, and *re-deciding* puts the observation back — not
+optimally, but at the only point where it exists. The three-by-three example shows the shape of
+the result: the planner's first move is sideways, into cells that are safe under both hypotheses,
+because the expected cost charges $\lambda$ for every hypothesis that would hit a wall. Written out,
+every $\mathcal{J}_{bel}(a)$ is affine in $\lambda$ — a feasible part $A_a$ plus the collision mass
+$B_a$ times $\lambda$ — so the break-even between two actions is exact,
+$\lambda^* = (A_2 - A_1)/(B_1 - B_2)$; for Up against Right it is $(3.6 - 1.2)/0.4 = 6$.
+
+**Step 5 — the information bonus, named as a heuristic.** Subtract $\beta_{info}\,\Delta H_a$, the
+expected one-step entropy reduction a scan would deliver after $a$. The library estimates it as the
+mutual information between "which sample is true" and the noise-free scan each sample predicts:
+positions whose predicted scans differ are told apart by one reading, mirror rooms are not. It makes
+the path hug distinctive geometry. It is a heuristic for the POMDP of the sister's
+[Chapter 22](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch22-pomdps), and
+it is switched off by default.
+
+*Collapsibles.* The belief roadmap of Prentice and Roy plans in the space of Gaussians with
+covariance propagated along roadmap edges; the sister's
+[Chapter 21](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch21-mdps) is the
+value function our $J$ specializes. When only the map changes, Chapter 6's D* repairs $J$ instead of
+rerunning Dijkstra (Exercise 6). Nav2's fielded stack is this loop with AMCL as the belief and a
+costmap-based planner as $J$.
+</Derivation>
+
+<CheckAnswer
+  id="ch16.breakeven"
+  prompt="In the 3×3 example, at what λ do Up and Right cost the same under the belief?"
+  answer={6}
+  tolerance={0.05}
+>
+$\mathcal{J}_{bel}(\text{Up}) = 0.6 \cdot 2 + 0.4\lambda$ and $\mathcal{J}_{bel}(\text{Right}) = 3.6$
+for every $\lambda$, so $1.2 + 0.4\lambda = 3.6$ gives $\lambda^* = 6$. Below it — at $\lambda = 4$,
+Up costs $2.8$ — the planner takes the mode's gamble.
+</CheckAnswer>
+
+## The algorithm
+
+Choset numbers these 16 through 20; the last two are this book's.
+
+<Algorithm
+  name="Algorithm 16 — grid_localization(bel, u(0:k−1), y(1:k))"
+  inputs="an initial belief P(x(0)) on the grid, movements and measurements"
+  outputs="the posterior P(x(k) | u(0:k−1), y(1:k)) on the grid"
+  complexity="O(N²) naive per step; O(N W) with shift + separable kernel (9.16)"
+>
+1. $P(x) \leftarrow P(x(0))$
+2. for $i = 1, \dots, k$:
+3. &nbsp;&nbsp;for all $x$: $P'(x) \leftarrow \sum_{x'} P(x \mid u(i{-}1), x')\,P(x')$ — in practice shift each $\theta$-plane by $(\Delta x, \Delta y)$, then convolve with (9.16) per axis
+4. &nbsp;&nbsp;$\eta \leftarrow 0$; for all $x$: $P(x) \leftarrow P(y(i) \mid x)\,P'(x)$, $\eta \leftarrow \eta + P(x)$ — the likelihood from the one-byte $d(x)$ table and the cached histograms
+5. &nbsp;&nbsp;for all $x$: $P(x) \leftarrow P(x)/\eta$
+6. return $P$; $\tilde p = \eta^{-1}$ per beam is the restart monitor
+</Algorithm>
+
+<Algorithm
+  name="Algorithm 17 — particle_localization(M, u(0:k−1), y(1:k))"
+  inputs="a set M of N samples (x_j, ω_j), movements and measurements"
+  outputs="M representing the posterior"
+  complexity="O(N) plus one sensor-model evaluation per particle per beam"
+>
+1. for $i = 1, \dots, k$:
+2. &nbsp;&nbsp;for $j = 1, \dots, N$: draw $x \sim P(x \mid u(i{-}1), x_j)$ by (9.18)–(9.21); $x_j \leftarrow x$; reject draws that cross a wall
+3. &nbsp;&nbsp;$\eta \leftarrow 0$; for all $j$: $\omega_j = P(y(i) \mid x_j)$ by ray casting $d(x_j)$ per beam, $\eta \leftarrow \eta + \omega_j$
+4. &nbsp;&nbsp;for all $j$: $\omega_j \leftarrow \omega_j / \eta$
+5. &nbsp;&nbsp;$M \leftarrow \text{resample}(M)$ — Algorithm 18, in this book only when $N_{eff}$ falls below $N/2$, with Augmented-MCL injection or a sensor-resetting floor when $\tilde p$ asks for it
+6. return $M$
+</Algorithm>
+
+<Algorithm
+  name="Algorithm 18 — resample(M)"
+  inputs="N weighted samples"
+  outputs="N equally weighted samples drawn with probability proportional to ω"
+  complexity="O(N), one uniform draw"
+>
+1. $M' \leftarrow \emptyset$; $\Delta \leftarrow \text{rand}((0, N^{-1}])$; $c \leftarrow \omega_0$; $i \leftarrow 0$
+2. for $j = 0, \dots, N{-}1$: $u \leftarrow \Delta + j N^{-1}$; while $u > c$: $i \leftarrow i + 1$, $c \leftarrow c + \omega_i$; $M' \leftarrow M' \cup \{(x_i, N^{-1})\}$
+3. return $M'$ — the low-variance comb; Isard and Blake's binary search is the $O(N \log N)$ alternative
+</Algorithm>
+
+<Algorithm
+  name="Algorithm 19 — occupancy_grid_mapping(y(1:k), x(1:k), P₀(m))"
+  inputs="measurements, the known poses they were taken from, an initial occupancy prior"
+  outputs="P(m | x(1:k), y(1:k)) per cell"
+  complexity="O(cells in the beam or cone) per scan"
+>
+1. $P_m \leftarrow P_0(m)$ for every cell
+2. for $i = 1, \dots, k$, for every cell the scan touches: $P_m \leftarrow \bigl[1 + \tfrac{1 - P(m \mid x(i), y(i))}{P(m \mid x(i), y(i))}\,\tfrac{P(m)}{1 - P(m)}\,\tfrac{1 - P_m}{P_m}\bigr]^{-1}$ — (9.39); in code, the log-odds sum (9.35)
+3. return $P_m$; threshold at $0.5$ for the maximum-likelihood map
+</Algorithm>
+
+<Algorithm
+  name="Algorithm 20 — rbpf_slam(M, u(0:k−1), y(1:k))"
+  inputs="N particles, each a path with its own map"
+  outputs="M representing P(x(1:k), m | u(0:k−1), y(1:k))"
+  complexity="O(N · scan) per step with incremental maps"
+>
+1. for all $j$: $x_j \leftarrow (0, 0, 0)$, $m^{(j)} \leftarrow P_0(m)$
+2. for $i = 1, \dots, k$:
+3. &nbsp;&nbsp;for all $j$: draw $x \sim P(x \mid u(i{-}1), x_j)$; $x_j \leftarrow x$
+4. &nbsp;&nbsp;$\eta \leftarrow 0$; for all $j$: $\omega_j = P(y(i) \mid x_j, m^{(j)}(1{:}i{-}1))$, $\eta \leftarrow \eta + \omega_j$ — the scan scored against *this particle's* map
+5. &nbsp;&nbsp;normalize; $M \leftarrow \text{resample}(M)$; integrate $y(i)$ at $x_j$ into $m^{(j)}$ by Algorithm 19
+6. return $M$
+</Algorithm>
+
+<Algorithm
+  name="cost_to_go(lattice, goal, λ) and replan_on_belief(J, samples, actions, λ, β_info)"
+  inputs="the Chapter 6 lattice and goal; a sampled belief {(x_j, ω_j)}; the action set"
+  outputs="J on every cell; the argmin action and the full per-action table"
+  complexity="O(|V| log |V|) once per goal; O(K · |A|) per decision"
+>
+1. $J \leftarrow$ backward Dijkstra from the goal (Chapter 6 `universal_plan`); $J \leftarrow \lambda$ on obstacles, off-grid, and cells the goal cannot reach
+2. for each action $a$: $\mathcal{J}_{bel}(a) \leftarrow \sum_j \omega_j\,[\,c(a) + J(f(x_j, a))\,]$, with $J = \lambda$ whenever $a$ is infeasible from $x_j$; record the collision mass $B_a = \sum_{j : a \text{ infeasible}} \omega_j$
+3. if $\beta_{info} > 0$: $\mathcal{J}_{bel}(a) \leftarrow \mathcal{J}_{bel}(a) - \beta_{info}\,\Delta H_a$
+4. return $\arg\min_a \mathcal{J}_{bel}(a)$ and the table — the widget's inset *is* this table
+5. the loop: act, scan, fold the bumper reading in, update the belief, go to 2; rerun 1 only when the goal or the map changes (or let D* repair it)
+</Algorithm>
+
+## Implementation in Rust
+
+The `estimate` crate of Chapter 15 gains a `bayes` module. Nothing in it re-implements a filter: the
+sister book's `HistogramFilter`, `ParticleFilter`, `low_variance_resample`, `GridLocalizer`, `Mcl`,
+`AugmentedMcl`, `OccGrid`, and `GridRbpf` are vendored unchanged. What the module adds is Choset's
+vocabulary around them, the `Belief` trait a planner consumes, and the one owned artifact.
+
+```rust title="crates/estimate/src/bayes/mod.rs"
+pub use filters::nonparametric::{HistogramFilter, ParticleFilter, ParticleSet, low_variance_resample};
+pub use filters::localize::{GridLocalizer, Mcl, AugmentedMcl};
+pub use filters::occgrid::OccGrid;
+use search::{Lattice, CellIdx};   // the Chapter 6 grid and its moves
+use rand::rngs::Pcg64;
+
+/// What a planner needs from any posterior: weighted samples on the planning
+/// lattice plus the two statistics Choset discusses (§9.1.4). Implemented for the
+/// grid belief, the particle set, and the Chapter 15 Gaussian, so
+/// `replan_on_belief` never knows which representation it was handed.
+pub trait Belief {
+    /// K cells with weights summing to one. The grid returns its K heaviest
+    /// marginal cells; the cloud draws K by the low-variance comb (Alg. 18).
+    fn samples(&self, k: usize, lattice: &Lattice, rng: &mut Pcg64) -> Vec<(CellIdx, f64)>;
+    /// Choset: "the mode has the advantage that it generally corresponds to a
+    /// possible location of the vehicle" — unlike the mean (9.17).
+    fn mode(&self, lattice: &Lattice) -> CellIdx;
+    fn entropy_bits(&self) -> f64;
+}
+
+/// Choset's increment (Fig. 9.5): rotate α toward the target, drive d, rotate β.
+/// The sister's (δ_rot1, δ_trans, δ_rot2) under other letters; `From` both ways.
+#[derive(Clone, Copy, Debug)]
+pub struct Increment { pub alpha: f64, pub d: f64, pub beta: f64 }
+
+/// σ₁…σ₆ of (9.19)–(9.21). Widths grow with the rotations *and* the translation,
+/// which is why a long straight run still fans out in heading.
+pub type Sigmas = [f64; 6];
+
+pub fn sample_motion(x: &SE2, u: Increment, s: &Sigmas, rng: &mut Pcg64) -> SE2 {
+    let n = |sigma: f64| if sigma > 0.0 { Normal::new(0.0, sigma).unwrap().sample(rng) } else { 0.0 };
+    let alpha = u.alpha + u.alpha * n(s[0]) + u.d * n(s[1]);
+    let beta  = u.beta  + u.beta  * n(s[2]) + u.d * n(s[3]);
+    let d     = u.d     + u.d     * n(s[4]) + (u.alpha + u.beta) * n(s[5]);
+    SE2::new(x.x() + d * (x.theta() + alpha).cos(),       // (9.18)
+             x.y() + d * (x.theta() + alpha).sin(),
+             wrap(x.theta() + alpha + beta))
+}
+```
+
+The five-cell corridor is the sister's one-dimensional histogram filter with Choset's problem 6–7
+parameters, and nothing more. It exists so the §3 numbers have one source.
+
+```rust title="crates/estimate/src/bayes/corridor.rs"
+use filters::nonparametric::HistogramFilter;
+
+/// Choset's Fig. 9.1 corridor on a loop of `N` unit cells. `sense` is the
+/// filter's `correct`, `step` its `predict` with the two-point kernel of
+/// problem 7 — no new filter code lives here.
+pub struct Corridor<const N: usize> {
+    pub filter: HistogramFilter<N>,
+    pub doors: Vec<usize>,
+    pub p_door_at_door: f64,   // 0.8
+    pub p_door_at_wall: f64,   // 0.4
+    pub p_move: f64,           // 0.8 succeeds, 0.2 stays
+}
+
+pub struct Sense { pub likelihood: [f64; 5], pub unnormalized: [f64; 5], pub evidence: f64, pub posterior: [f64; 5] }
+
+impl<const N: usize> Corridor<N> {
+    /// Update (9.4)–(9.6): multiply, sum, divide — and hand back the sum, because
+    /// η⁻¹ is free and the kidnap monitors of §9.1.4 want it.
+    pub fn sense(&mut self, saw_door: bool) -> Sense {
+        let lik = |c: usize| {
+            let p = if self.doors.contains(&c) { self.p_door_at_door } else { self.p_door_at_wall };
+            if saw_door { p } else { 1.0 - p }
+        };
+        let prior = self.filter.belief();
+        let unnormalized: Vec<f64> = (0..N).map(|c| prior[c] * lik(c)).collect();
+        let evidence: f64 = unnormalized.iter().sum();                 // Alg. 16 lines 6–10
+        self.filter.correct(|c| lik(c));                               // lines 11–13 inside
+        Sense { likelihood: array(lik), unnormalized: array(|c| unnormalized[c]),
+                evidence, posterior: self.filter.belief() }
+    }
+
+    /// Prediction (9.3) for "move `steps` places": land with p_move, stay otherwise,
+    /// written on the displacement error the filter hands us, with the loop's wrap.
+    pub fn step(&mut self, steps: i64) -> [f64; N] {
+        let (n, p) = (N as i64, self.p_move);
+        let wrap = |d: i64| d - n * ((d as f64 / n as f64).round() as i64);
+        self.filter.predict(steps, |d| if wrap(d) == 0 { p } else if wrap(d + steps) == 0 { 1.0 - p } else { 0.0 });
+        self.filter.belief()
+    }
+}
+```
+
+`cargo run --example five_cells -p estimate` builds the instance with doors $\{1, 3\}$, runs sense
+then move, and prints the table the figure above draws:
+
+```text
+prior       0.2000 0.2000 0.2000 0.2000 0.2000   H = 2.3219 bits
+sense door  0.1429 0.2857 0.1429 0.2857 0.1429   η⁻¹ = 0.56, H = 2.2359 bits
+move right  0.1429 0.1714 0.2571 0.1714 0.2571   H = 2.2811 bits
+```
+
+`#[test] fn reproduces_five_cell_sense_move()` asserts every entry to $10^{-4}$; the TypeScript
+check does the same. Choset's problem 6 — ten places, landmarks at $\{0, 3, 6\}$, detect, move 3,
+detect, move 4, detect nothing — runs on the same type with $N = 10$ and gives $P(7) = 0.30$,
+$P(4) = 0.15$, $P(0) = 0.10$; with problem 7's $0.8/0.2$ motion the mode stays at 7 but drops to
+$0.2578$ (Exercise 1).
+
+The sensor model is a cache first and a formula second.
+
+```rust title="crates/estimate/src/bayes/sensor.rs"
+/// Choset (9.23): hit N(y; d, σ) + short λe^{−λy} + random γ + max-range δ, binned
+/// at Δ. The expected distance d(x) comes from the Chapter 2 ray cast — never
+/// re-implemented here. σ is *not* the laser's: it also encodes the map's uncertainty.
+pub struct ProximityModel {
+    pub sigma: f64, pub lambda: f64,
+    pub alpha: f64, pub beta: f64, pub gamma: f64, pub delta: f64,
+    pub delta_bin: f64, pub max_range: f64,
+    rows: Vec<OnceCell<Box<[f64]>>>,              // the 256 histograms of §9.1.5, lazily
+}
+
+impl ProximityModel {
+    pub fn n_bins(&self) -> usize { (self.max_range / self.delta_bin).ceil() as usize + 1 }
+
+    /// h_i: P(bin j | expected distance in bin i). The three continuous terms are
+    /// each normalized on [0, d_max) and the row is scaled so Σ_j h_{i,j} = 1 (9.24),
+    /// which is what Choset's problem 3(b) asks for by "appropriate values for δ_i".
+    pub fn row(&self, i: usize) -> &[f64] {
+        self.rows[i].get_or_init(|| {
+            let d = self.bin_center(i.min(self.n_bins() - 2));
+            let m = self.n_bins() - 1;
+            let mut h = vec![0.0; m + 1];
+            let hit_norm = normal_cdf(self.max_range, d, self.sigma) - normal_cdf(0.0, d, self.sigma);
+            let short_norm = 1.0 - (-self.lambda * self.max_range).exp();
+            for j in 0..m {
+                let (lo, hi) = (j as f64 * self.delta_bin, ((j + 1) as f64 * self.delta_bin).min(self.max_range));
+                let hit   = (normal_cdf(hi, d, self.sigma) - normal_cdf(lo, d, self.sigma)) / hit_norm;
+                let short = ((-self.lambda * lo).exp() - (-self.lambda * hi).exp()) / short_norm;
+                let rand  = (hi - lo) / self.max_range;
+                h[j] = self.alpha * hit + self.beta * short + self.gamma * rand;
+            }
+            h[m] = self.delta;
+            let s: f64 = h[..m].iter().sum();
+            for v in &mut h[..m] { *v *= (1.0 - self.delta) / s; }
+            h.into_boxed_slice()
+        })
+    }
+
+    /// P(y | d) = h_{bin(d), bin(y)}, eq. (9.22) with the table doing the work.
+    pub fn likelihood(&self, y: f64, d_expected: f64) -> f64 { self.row(self.bin(d_expected))[self.bin(y)] }
+
+    /// log Π_k P(y_k | d_k) over every `every`-th beam — (9.25) with Fox et al.'s
+    /// 60-of-181 remedy for its false independence assumption.
+    pub fn log_scan_likelihood(&self, scan: &[f64], expected: &[f64], every: usize) -> f64 {
+        scan.iter().zip(expected).step_by(every.max(1))
+            .map(|(&y, &d)| self.likelihood(y, d).max(1e-300).ln()).sum()
+    }
+}
+```
+
+And the owned artifact. `J` is the Chapter 6 `UniversalPlan` with $\lambda$ outside the free set;
+the decision is a loop over samples and actions.
+
+```rust title="crates/estimate/src/bayes/replan.rs"
+use search::{Lattice, CellIdx, Action, GridGraph, universal_plan, UniversalPlan};
+
+/// K draws per decision; collision / off-grid penalty λ; information bonus weight (0 disables).
+pub struct ReplanConfig { pub k_samples: usize, pub lambda: f64, pub beta_info: f64 }
+
+/// Ch. 6 universal plan: exact cost-to-go to `goal`, with λ wherever the plan has
+/// nothing to say. Computed once per goal; D* (Ch. 6) repairs it when the map changes.
+pub struct CostToGo { plan: UniversalPlan<CellIdx>, pub lambda: f64 }
+
+pub fn cost_to_go(graph: &GridGraph, goal: CellIdx, lambda: f64) -> CostToGo {
+    CostToGo { plan: universal_plan(graph, goal), lambda }
+}
+impl CostToGo {
+    pub fn j(&self, c: CellIdx) -> f64 { self.plan.cost_to_go.get(&c).copied().unwrap_or(self.lambda) }
+    /// c(a) + J(f(x, a)), or λ when `a` leaves the free set from `x`.
+    pub fn action_cost(&self, lattice: &Lattice, x: CellIdx, a: Action) -> f64 {
+        match lattice.successor(x, a) {
+            Some(next) if lattice.is_free(next) && !lattice.cuts_corner(x, a) => a.step_cost(lattice) + self.j(next),
+            _ => self.lambda,
+        }
+    }
+}
+
+/// Expected one-step entropy reduction after `a` — a heuristic, named so.
+pub trait InfoBonus { fn expected_entropy_drop(&self, after: &[(Option<CellIdx>, f64)], a: Action) -> f64; }
+
+/// a* = argmin_a Σ_j ω_j [ c(a) + J(f(x_j, a)) ] − β_info · ΔH_a. Returns the per-action
+/// table too: the widget's inset and the §3 micro-example test both need it.
+pub fn replan_on_belief(
+    j: &CostToGo, samples: &[(CellIdx, f64)], lattice: &Lattice,
+    cfg: &ReplanConfig, info: Option<&dyn InfoBonus>,
+) -> (Action, Vec<(Action, f64)>) {
+    let table: Vec<(Action, f64)> = lattice.actions().iter().map(|&a| {
+        let expected: f64 = samples.iter().map(|&(x, w)| w * j.action_cost(lattice, x, a)).sum();
+        let bonus = match info {
+            Some(b) if cfg.beta_info > 0.0 => {
+                let after: Vec<_> = samples.iter().map(|&(x, w)| (lattice.successor(x, a).filter(|&n| lattice.is_free(n)), w)).collect();
+                cfg.beta_info * b.expected_entropy_drop(&after, a)
+            }
+            _ => 0.0,
+        };
+        (a, expected - bonus)
+    }).collect();
+    let best = table.iter().min_by(|p, q| p.1.total_cmp(&q.1)).expect("at least one action").0;
+    (best, table)
+}
+
+/// The loop every fielded robot runs: sense → update → replan → act. One loop for a
+/// grid, a cloud, or the Chapter 15 Gaussian.
+pub struct BeliefPlanner<B: Belief> { pub belief: B, pub j: CostToGo, pub cfg: ReplanConfig, pub rng: Pcg64 }
+
+impl<B: Belief + Localizer> BeliefPlanner<B> {
+    pub fn decide(&mut self, lattice: &Lattice) -> Action {
+        let samples = self.belief.samples(self.cfg.k_samples, lattice, &mut self.rng);
+        replan_on_belief(&self.j, &samples, lattice, &self.cfg, None).0
+    }
+    pub fn step(&mut self, lattice: &Lattice, rusty: &mut sim::Rusty, world: &sim::World) -> Action {
+        let a = self.decide(lattice);
+        let (u, bumped) = rusty.drive_lattice_step(a, world, &mut self.rng); // odometry reports the move either way
+        self.belief.correct_contact(&u, bumped);          // the bumper is a sensor too (Ch. 3)
+        self.belief.predict(&u, &mut self.rng);           // Alg. 17 lines 2–5
+        self.belief.correct(&rusty.scan(world, &mut self.rng)); // lines 6–13, then Alg. 18 when N_eff is low
+        a
+    }
+}
+```
+
+`cargo run --example replan_3x3` builds the lattice with the obstacle at $(1, 0)$, prints $J$, then
+the four expected costs at $\lambda \in \{10, 6, 4\}$ with the chosen action:
+
+```text
+J =  [ 1  0  1 ]
+     [ λ  1  2 ]
+     [ 3  2  3 ]
+belief: (2,1) ω=0.6  (2,0) ω=0.4
+λ = 10   Up 5.20   Right 3.60   Down 10.00   Left 6.40   → Right   (mode says Up)
+λ =  6   Up 3.60   Right 3.60   Down  6.00   Left 4.00   → tie, Up by action order
+λ =  4   Up 2.80   Right 3.60   Down  4.00   Left 3.20   → Up
+break-even λ* = 6.0
+```
+
+`#[test] fn replan_disagrees_with_mode_at_lambda_10()` asserts $\{5.2, 3.6, 6.4, 10\}$, the tie at
+$6$, and the flip at $4$; `#[test] fn point_mass_belief_equals_a_star()` checks that one sample of
+weight one reproduces the Chapter 6 path step by step on fifty seeded Apartment queries.
+
+<Callout type="info">
+The widgets on this page run the TypeScript port of these files, `web/lib/estimate/bayes.ts` and
+`replan.ts`, over the vendored `web/lib/filters`, `localize`, and `mapping/occgrid`. Fourteen checks
+in `__checks_ch16__.ts` pin every number printed above: the five-cell table to $10^{-4}$, problem
+6's posterior, the normalizer identity, the histogram rows and the ML fit, the unbiased motion
+sampler, the recorded run on both localizers (12 420 cells, 10 782 ray casts, problem 9's starving
+cloud), mapping with known poses ($88.7\,\%$ / $99.8\,\%$), the cone model's $0.16$, the $3 \times 3$
+decision and its break-even, the point-mass agreement with A*, the headless integration lab, the
+hook's two outcomes, and the Rao-Blackwellized filter's $0.12$ m against dead reckoning's $0.20$ m.
+</Callout>
+
+## Putting it together
+
+The integration lab is the owned artifact running in the Apartment, with the belief that opened
+the chapter.
+
+<Deferred minHeight={760}>
+  <PlanOnBelief />
+</Deferred>
+
+Rusty is in room B, flush under the corridor wall at $(5.0, 3.4)$. The cloud puts $0.6$ of its mass
+in room A under A's open doorway and $0.4$ in room B — the $3 \times 3$ example with the Apartment's
+walls. The goal is the west end of the corridor. The <RoleTag role="graph" /> field is $J$ on the
+0.4 m lattice inflated by Rusty's radius, computed once; every tick the planner draws
+$K = 24$ cells from the cloud, scores the eight lattice actions, executes the argmin, scans, folds the
+bumper reading in, and updates. The <RoleTag role="posterior" /> belief is drawn as dots and filled
+cells; the route the mode alone would take is the thick haloed <RoleTag role="path" /> stroke —
+two purple families on one canvas, kept apart by shape rather than hue, which is the book's rule for
+this chapter.
+
+**What happens, and what the check pins.** With $\lambda = 20$ the first action is sideways: Up
+carries about $0.4$ of collision mass — pinned above $0.3$ — because it is a door under one
+hypothesis and a wall under the other. Within a few steps the corridor walls come into view, the
+cloud collapses onto room B, the entropy falls to under half its starting value, and the path
+straightens toward the goal. The belief planner arrives without a bump. Tick *plan from the mode*
+and the first action is Up; Rusty hits room B's wall at least once before the scans sort it out.
+Both runs are in the check file on the widget's seed, and the same scene holds on six seeds.
+
+**The λ slider.** Every row of the inset table is affine in $\lambda$, so the break-even with the
+current winner is computed exactly and drawn under the slider. Drag below it and the belief planner
+gambles on the mode too; the $3 \times 3$ inset moves with the same number, and its $\lambda^* = 6$
+never changes because its geometry never does.
+
+**The information bonus.** Raise $\beta_{info}$ and the path detours toward geometry that
+distinguishes the hypotheses — the corridor's asymmetric north doorways — and the entropy sparkline
+drops sooner. It is a heuristic and the widget says so; it is also a preview of what a POMDP planner
+buys for its price.
+
+**Freeze the belief** and the planner replans on stale information: it is still the expected-cost
+rule, still better than the mode when the two hypotheses disagree, but nothing it does can shrink the
+cloud. Replanning without sensing is the QMDP approximation with no observations to put back.
+
+Three honesty items the chapter keeps, because the capstone inherits this loop. Assumption B of the
+derivation fails for large moves, and the loop takes small ones for that reason as much as for
+control. The belief planner is a one-step expectation with replanning, not an optimal POMDP policy,
+and its answer depends on $\lambda$ — a price the user sets, printed next to the decision it changes.
+And the five-cell numbers use Choset's problem parameters; they are not a figure from his text.
+
+What [Chapter 23](/chapters/ch23-capstone) takes from here is exactly `BeliefPlanner::step`:
+`AugmentedMcl` fed by the proximity model and the odometry adapter, `cost_to_go` over the Chapter 6
+lattice inflated by Chapter 7's brushfire clearance, and `replan_on_belief` every tick.
+[Chapter 19](/chapters/ch19-trajectory-optimization)'s MPC consumes the same belief's mean *and*
+covariance; [Chapter 22](/chapters/ch22-learning-and-planning) learns heuristics on the same sampled
+loop.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Choset's problem 6, then problem 7">
+    Ten places on a circle, landmarks at $\{0, 3, 6\}$ that all look alike, $P(\text{landmark} \mid
+    \text{landmark place}) = 0.8$ and $0.4$ elsewhere. The robot detects a landmark, moves 3 places
+    counterclockwise and detects a landmark, moves 4 and detects none. Compute the posterior by hand
+    with deterministic moves (problem 6). Then redo it with problem 7's motion — each unit step
+    succeeds with $0.8$ and stays with $0.2$ — and explain why the mode's probability drops while the
+    mode itself does not move.
+    <CheckAnswer id="ch16.e1" prompt="Problem 6: what is the posterior probability of place 7?" answer={0.30} tolerance={0.005}>
+    After the first detection the belief is $\propto [0.8, 0.4, 0.4, 0.8, 0.4, 0.4, 0.8, 0.4, 0.4, 0.4]$.
+    Shift by 3, multiply by the same likelihood, shift by 4, multiply by $[0.2, 0.6, \dots]$ (no landmark
+    seen), normalize: place 7 carries $0.30$, place 4 carries $0.15$, place 0 carries $0.10$. With the
+    noisy motion the library gives $P(7) = 0.2578$.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Problem 8: where the map hides in Assumption A">
+    Argue that once $x(k)$ and the map $m$ are known, $y(k)$ is independent of $y(1{:}k{-}1)$ — this
+    is step 2 of the derivation. Then exhibit the dependence when $m$ is *not* given: construct two
+    maps that agree at $x(k{-}1)$ and differ at $x(k)$, and show that $y(k{-}1)$ changes the
+    predictive distribution of $y(k)$ through the posterior over maps. Relate the result to why
+    Bayesian SLAM carries one map per particle rather than one map for all.
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Predict the first move and the flip">
+    <Predict
+      id="ch16.e3"
+      question="In Plan-on-Belief with the default belief and λ = 20, what is the first action, and roughly where does the break-even marker sit?"
+      options={[
+        { label: 'Up; break-even near λ = 2, since the mode is in room A', because: 'Up from room B is a wall for 0.4 of the mass. Its expected cost carries 0.4·λ, which at λ = 20 is already 8 — far more than any sideways step.' },
+        { label: 'A sideways step; break-even where 0.4·λ equals the extra path length of going around', correct: true, because: 'Every row is affine in λ with slope equal to its collision mass. Up has slope ≈ 0.4; the sideways actions have slope ≈ 0. They cross where 0.4·λ pays for the detour, which the widget computes exactly and draws under the slider.' },
+        { label: 'Down, away from the wall under both hypotheses', because: 'Down is safe under both hypotheses but increases J for both; the expected cost includes the cost-to-go, not only the collision risk.' },
+      ]}
+    >
+    Verify both on the widget. Then lower $K$ until the decision turns noisy: at what $K$ does the
+    marked break-even move by more than one slider step between consecutive ticks? Explain with the
+    variance of a $K$-sample estimate of the collision mass.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Kidnap during the bimodal phase">
+    <Predict
+      id="ch16.e4"
+      question="In Grid vs Particles, kidnap Rusty while the posterior is split between rooms A and C. Before the next frame is drawn, where does the mean marker land?"
+      options={[
+        { label: 'On the true position in room C', because: 'The mean of a bimodal distribution is between the modes, not at either. The filter has not yet seen the scan that will move mass toward C.' },
+        { label: 'In the wall between the rooms, roughly midway', correct: true, because: 'Eq. 9.17 averages positions by weight; with mass in A and C the average lies in the corridor wall between them, a configuration the robot cannot occupy. The heading mean is a circular average and can be equally meaningless.' },
+        { label: 'On the mode, since the filter snaps the mean to the nearest peak', because: 'Nothing in (9.17) snaps anything. The mode is a separate statistic, computed by a maximum, and it is the marker that stays in free space.' },
+      ]}
+    >
+    Then explain, from the circular average in (9.17), why the heading mean of two particles facing
+    $+90°$ and $-90°$ is $0°$ with zero resultant length — a direction neither hypothesis supports.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="A Belief for the Chapter 15 Gaussian">
+    Implement `Belief` for `Gaussian<3>` by sigma points — seven for $n = 3$, weights from the
+    unscented transform — instead of seeded draws, mapping each sigma point to its lattice cell and
+    merging duplicates. Property-test that for a tight Gaussian ($\sigma \le 0.1$ m)
+    `replan_on_belief` and A* from the mean agree on 100 seeded Apartment queries, and that for a wide
+    one ($\sigma \ge 0.8$ m) they disagree at least once. The TypeScript `consolidateCells` is the
+    merge step.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="D* Lite under the belief planner (stretch)">
+    Replace the full backward Dijkstra in `cost_to_go` with Chapter 6's D* Lite so that an occupancy
+    change repairs only the affected cells. Measure `BeliefPlanner::step` time, fixed seed, before and
+    after on a run with twenty door events (a door closes, the lattice cell becomes occupied, $J$
+    must change). Report the speedup and the number of cells touched per repair.
+    <Hints>
+      <>D* Lite searches from the goal toward the robot — which is exactly the direction backward Dijkstra already runs, so the cost-to-go labels it maintains are $J$.</>
+      <>The belief planner reads $J$ at successors of *sampled* cells, not only at the robot's cell; make sure the repaired region covers every cell a sample might query, or fall back to $\lambda$ for stale ones.</>
+      <>Twenty door events in 90 steps means Dijkstra from scratch 20 times on ~700 cells versus 20 local repairs; the speedup is the ratio of cells expanded.</>
+    </Hints>
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 9 is this chapter's source: the derivation with its two assumptions and the two-rooms caveat (§9.1.3), grids and particles with Algorithms 16–18 (§9.1.4), the sensor model (§9.1.5), occupancy grids and Algorithm 19 (§9.2.1), Rao-Blackwellized SLAM and Algorithm 20 (§9.2.2), and problems 6–9."
+  />
+  <Reference
+    authors="Fox, D., Burgard, W., and Thrun, S."
+    year={1999}
+    title="Markov Localization for Mobile Robots in Dynamic Environments"
+    venue="Journal of Artificial Intelligence Research 11, 391–427"
+    doi="10.1613/jair.616"
+    note="The grid localizer of Algorithm 16 as fielded on Rhino: shift-and-convolve prediction, the sensor model's treatment of unmodeled obstacles, and the 60-of-181 beam subsampling this chapter adopts."
+  />
+  <Reference
+    authors="Fox, D."
+    year={2003}
+    title="Adapting the Sample Size in Particle Filters Through KLD-Sampling"
+    venue="International Journal of Robotics Research 22(12), 985–1003"
+    doi="10.1177/0278364903022012001"
+    note="How many particles a cloud needs, and why the answer changes as it converges — the budget slider's missing axis, treated fully in the sister's Chapter 8."
+  />
+  <Reference
+    authors="Moravec, H. P. and Elfes, A."
+    year={1985}
+    title="High Resolution Maps from Wide Angle Sonar"
+    venue="IEEE International Conference on Robotics and Automation"
+    doi="10.1109/ROBOT.1985.1087316"
+    note="The occupancy grid. Choset's cone model (9.41)–(9.42) is an explicit approximation of Elfes's mixture of Gaussians and linear functions."
+  />
+  <Reference
+    authors="Grisetti, G., Stachniss, C., and Burgard, W."
+    year={2007}
+    title="Improved Techniques for Grid Mapping with Rao-Blackwellized Particle Filters"
+    venue="IEEE Transactions on Robotics 23(1), 34–46"
+    doi="10.1109/TRO.2006.889486"
+    note="Algorithm 20 made practical: scan-matched proposals and adaptive resampling, the recipe the vendored GridRbpf follows."
+  />
+  <Reference
+    authors="Kaelbling, L. P., Littman, M. L., and Cassandra, A. R."
+    year={1998}
+    title="Planning and Acting in Partially Observable Stochastic Domains"
+    venue="Artificial Intelligence 101(1–2), 99–134"
+    doi="10.1016/S0004-3702(98)00023-X"
+    note="The POMDP, and the QMDP approximation (first proposed by Littman, Cassandra and Kaelbling in 1995) that this chapter's expected-cost-to-go rule is an instance of — with the honest warning that it never plans to gather information."
+  />
+  <Reference
+    authors="Prentice, S. and Roy, N."
+    year={2009}
+    title="The Belief Roadmap: Efficient Planning in Belief Space by Factoring the Covariance"
+    venue="International Journal of Robotics Research 28(11–12), 1448–1465"
+    doi="10.1177/0278364909341659"
+    note="Planning in the space of Gaussian beliefs by propagating covariance along roadmap edges: the step above the one-step expectation taken here, and below the full POMDP."
+  />
+  <Reference
+    authors="Macenski, S., Martín, F., White, R., and Ginés Clavero, J."
+    year={2020}
+    title="The Marathon 2: A Navigation System"
+    venue="IEEE/RSJ International Conference on Intelligent Robots and Systems"
+    url="https://arxiv.org/abs/2003.00368"
+    note="Nav2: the fielded instance of this chapter's loop — AMCL as the belief, costmaps and a planner server as the cost-to-go, replanned continuously."
+  />
+  <Reference
+    authors="Thrun, S., Burgard, W., and Fox, D."
+    year={2005}
+    title="Probabilistic Robotics"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262201629/probabilistic-robotics/"
+    note="The depth this chapter links to rather than repeats: histogram and particle filters, beam models, grid localization and MCL, occupancy grids, FastSLAM, MDPs and POMDPs. Its chapters 4, 6, 8, 9, 13, 15 and 16 are the sister volume's 8, 10, 12, 13, 17, 21 and 22."
+  />
+  <Reference
+    authors="Shannon Dynamics"
+    year={2026}
+    title="Probabilistic Robotics via Rust — Chapters 5, 8, 10, 12, 13, 17, 21, 22"
+    venue="Sister volume, web edition"
+    url="https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch12-localization-global"
+    note="The induction proof of the recursion (Ch. 5), histogram and particle filters with KLD sizing (Ch. 8), sensor models (Ch. 10), grid localization and Augmented MCL with the comparison table (Ch. 12), occupancy grids and MAP mapping (Ch. 13), FastSLAM (Ch. 17), and the value function and POMDP this chapter's planner approximates (Chs. 21–22). The filters this chapter wraps are vendored from there."
+  />
+</References>

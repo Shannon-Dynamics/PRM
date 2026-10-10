@@ -1,0 +1,971 @@
+---
+title: Robot Dynamics
+description: The Lagrangian route from masses and lever arms to M(q) q̈ + C(q, q̇) q̇ + g(q) = τ — Christoffel symbols as the geometry of unforced motion, Pfaffian constraints with Lagrange multipliers, rigid-body rotation and Euler's equation, and an integrator whose energy bookkeeping is a test.
+chapter: 17
+part: PART V
+partTitle: Dynamics, Trajectories, and Constraints
+difficulty: Intermediate
+readingTime: 55 min
+quote: A path is not a complete description of the motion of a robot system, however, as the timing of the motion is not specified.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 10
+---
+
+import { LagrangianLab } from '@/components/ch/ch17/lagrangian-lab';
+import { InertiaEllipsoid } from '@/components/ch/ch17/inertia-ellipsoid';
+import { TumblingBody } from '@/components/ch/ch17/tumbling-body';
+import { TorqueGaugeHook } from '@/components/ch/ch17/torque-gauge-hook';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Derive the equations of motion of Reach from its kinetic and potential energy, and put them in the standard form M(q) q̈ + C(q, q̇) q̇ + g(q) = τ',
+    'Compute the Christoffel symbols of an inertia matrix, say why C is not unique but C q̇ is, and prove that Ṁ − 2C is skew-symmetric so that energy is conserved exactly',
+    'Read the inertia matrix as a configuration-dependent metric on joint-velocity space, and reproduce the micro-example M = [[2, 1/3], [1/3, 1/3]] at Choset\'s worked pose',
+    'Impose a Pfaffian constraint A(q) q̇ = 0 with Lagrange multipliers, eliminate them with the projection P, and recover Choset\'s knife-edge equations',
+    'Integrate Euler\'s equation for a spinning rigid body in the body frame, and explain why ω changes with no torque applied',
+    'Implement the dynamics crate in Rust: a Dynamics trait, the hand-derived 2R model, a Jacobian-assembled 3R model, finite-difference Christoffel symbols, and an RK4 integrator whose energy drift is a unit test',
+  ]}
+  prerequisites={[
+    'Reach\'s forward kinematics and the three-robot simulator (Chapter 2)',
+    'Reach\'s Jacobian and its singularities (Chapter 4); SO(3) as a matrix group (Chapter 5)',
+    'The virtual-work identity u = Jᵀ f from the potential-function chapter (Chapter 7)',
+    'Vector calculus: partial derivatives of a quadratic form, the chain rule, the gradient of a scalar',
+  ]}
+>
+Parts I through IV planned *paths*: curves in $\Qfree$ with no clock attached. A real motor does
+not execute a curve. It applies a torque, and the configuration that results depends on masses,
+lever arms, and how fast everything else is already moving. This chapter builds the model that turns
+geometry into motion for the rest of Part V.
+
+The idea the chapter unpacks fits in one sentence. **The entire dynamics of an arm is encoded in one
+configuration-dependent symmetric matrix $M(q)$.** Kinetic energy is $\tfrac12 \dot q\T M(q)\dot q$;
+the Coriolis and centrifugal forces are nothing but derivatives of $M$ — the Christoffel symbols;
+gravity is the gradient of a scalar. The reader who watched Reach's Jacobian ellipse collapse in
+[Chapter 4](/chapters/ch04-configuration-space-i) now watches a second ellipse — the inertia
+ellipse — breathe as the elbow folds, and learns why "force equals mass times acceleration" is false,
+term by term, in joint coordinates.
+
+Everything here is Choset's Chapter 10, with one addition the 2005 text did not need because it
+assumed a Mathematica pipeline and never integrated anything: the skew-symmetry of $\dot M - 2C$ is
+turned into a *test oracle*, and the integrator that powers every widget on this page is required to
+conserve energy to a stated tolerance. If the code and the prose ever disagree, the energy bar settles
+it.
+</Overview>
+
+## The problem: a path says nothing about time
+
+Take a path for Reach — a smooth curve on the torus, the kind every planner in Part III hands
+back — and replay it. Then replay it twice as fast.
+
+<Figure caption="The same planned path (purple) replayed on Reach at two speeds, with a torque gauge for each joint. At 1× both gauges stay inside their limits of 20 and 12 N·m. At 2× the accelerations quadruple, the velocity-product terms quadruple, and both motors peg red. The planner that produced this curve never asked what the motors can do.">
+  <TorqueGaugeHook />
+</Figure>
+
+Nothing about the curve changed. What changed is $\dot q$ and $\ddot q$, and the torque a joint must
+supply depends on both — quadratically on $\dot q$, which is why doubling the speed does not double the
+torque but quadruples the part of it that comes from motion. A path is a set of configurations; a
+trajectory is that set *with a clock*, and only the clocked version can be feasible or infeasible.
+Chapter 18 chooses the clock. This chapter builds the thing the clock is measured against: the map from
+$(q, \dot q, \ddot q)$ to the torques $\tau$ that produce them.
+
+## Building intuition
+
+### The arm is a different machine in every configuration
+
+Before any formalism, watch Reach fall. The Lagrangian Lab hangs the arm on a vertical Workbench,
+releases it from a configuration you choose, and keeps the books.
+
+<Deferred minHeight={520}>
+  <LagrangianLab />
+</Deferred>
+
+Three things are worth noticing, and each becomes a theorem in the next section.
+
+**Energy is conserved, exactly, by construction.** The total $E = K + V$ sits on its dashed reference
+line while kinetic and potential energy trade places violently. There is no friction in the default
+model and no torque, so this is what the physics must do — and the integrator reproduces it to about
+one part in $10^8$ over ten seconds. That number is not an accident; it is a unit test, and the end of
+the chapter prints it.
+
+**Switch Coriolis off and the physics lies.** The toggle hands the same integrator a model in which the
+velocity-product vector $C(q,\dot q)\dot q$ has been zeroed — "a small correction," the folklore says.
+Within two swings the energy bar leaves its line. The arm gains or loses energy from nowhere, by more
+than twenty percent of what it started with. Those terms are not a correction. They are the only thing
+that makes joint-space Newton's law consistent with workspace Newton's law.
+
+**Neither $M\ddot q$ nor $C\dot q$ is a force.** Watch the torque gauge. Under zero applied torque the
+three stacks satisfy $M\ddot q + C\dot q + g = 0$ at every instant, and as the arm swings through
+different configurations the share carried by $M\ddot q$ and by $C\dot q$ changes while their sum does
+not. Choset says this precisely: "neither $M(q)\ddot q$ nor $C(q,\dot q)\dot q$ individually should be
+thought of as a generalized force; only their sum is a force."
+
+### Inertia is a metric
+
+The second widget throws the arm away and keeps the matrix.
+
+<Deferred>
+  <InertiaEllipsoid />
+</Deferred>
+
+The orange curve is the set of joint velocities that carry exactly one joule of kinetic energy,
+$\{\dot q : \dot q\T M(q)\dot q = 1\}$. If inertia were a number the curve would be a circle. It is an
+ellipse, its semi-axes are $1/\sqrt{\lambda_i}$ for the eigenvalues of $M(q)$, and as $q_2$ sweeps from
+$0$ to $\pi$ the entry $M_{11}$ reads $3$, then $2$, then $1$: the stretched arm is three times harder
+to swing about the shoulder than the folded one. Move the shoulder instead and nothing happens — there
+is no $q_1$ anywhere in $M$, and the text will ask you to say why.
+
+<KeyIdea title="The one sentence version">
+Kinetic energy is a quadratic form in $\dot q$, and the matrix of that form is $M(q)$. Everything
+else — the velocity-product forces, the shape of unforced motion, what "orthogonal" means for a
+constrained mechanism — is a statement about how $M$ changes with $q$.
+</KeyIdea>
+
+<NotationTable
+  rows={[
+    { sym: 'q \\in \\R^n,\\; u \\in \\R^n', meaning: 'Generalized coordinates and generalized forces, paired so that uᵀq̇ is power. For Reach u = τ, the joint torques.', note: 'Chs. 18–19 keep u for controls.' },
+    { sym: 'L(q, \\dot q) = K(q, \\dot q) - V(q)', meaning: 'The Lagrangian: kinetic minus potential energy.' },
+    { sym: 'M(q),\\; C(q, \\dot q),\\; g(q),\\; b(q, \\dot q)', meaning: 'Inertia matrix, a Coriolis matrix, gravity vector, dissipation — the standard form (10.7).', note: 'Book-wide (TOC §2).' },
+    { sym: '\\Gamma^i_{jk}(q),\\; \\Gamma^i(q),\\; \\dot q\\T \\Gamma(q) \\dot q', meaning: 'Christoffel symbols of M; the i-th symmetric n×n slice; the velocity-product vector (10.10).' },
+    { sym: 'T(q) f = u', meaning: 'Actuation matrix and raw actuator forces; T = Jᵀ for forces applied at a body point (10.12).' },
+    { sym: 'A(q) \\dot q = 0,\\; \\lambda \\in \\R^k', meaning: 'k Pfaffian constraints (rows ω_j(q)) and their Lagrange multipliers.' },
+    { sym: 'P,\\; P_u', meaning: 'Projections onto motions that satisfy the constraints / forces that do work (10.18–10.19).' },
+    { sym: 'r_{cm},\\; I_{zz},\\; \\mathcal{I},\\; \\mathcal{I}_s', meaning: 'Center of mass; planar inertia about z; body-frame and spatial inertia tensors.' },
+    { sym: '\\omega,\\; \\hat\\omega,\\; R \\in \\SOthree', meaning: 'Body angular velocity, its skew matrix, the orientation.' },
+    { sym: 'E = K + V,\\; h', meaning: 'Total mechanical energy; the integrator step.' },
+  ]}
+/>
+
+## The mathematics
+
+### Definitions
+
+**Generalized coordinates and forces.** A configuration is $q \in \R^n$ locally — joint angles for
+Reach, $(x, y, \theta)$ for a planar body — and a generalized force $u$ is anything that pairs with
+$\dot q$ to give power: $u\T\dot q$ is the rate at which work is done on the system. Torques pair with
+joint rates; a force through the center of mass pairs with its velocity.
+
+**The Lagrangian** is $L(q, \dot q) = K(q, \dot q) - V(q)$ with kinetic energy quadratic in the
+velocities and potential energy a function of configuration alone. The Euler–Lagrange equations
+(Choset eq. 10.1)
+
+$$
+\frac{d}{dt}\frac{\partial L}{\partial \dot q} - \frac{\partial L}{\partial q} = u
+$$
+
+are the equations of motion. Their derivation from the principle of least action is in any mechanics
+text; this chapter takes them as the recipe.
+
+**The inertia matrix** $M(q) = \partial^2 K / \partial\dot q\,\partial\dot q$, so that
+$K = \tfrac12\dot q\T M(q)\dot q$ (eqs. 10.13–10.14). It is symmetric by construction and positive
+definite because kinetic energy is positive for every nonzero velocity.
+
+**Christoffel symbols.** For each $i$, the $n \times n$ matrix with entries
+
+$$
+\Gamma^i_{jk}(q) = \tfrac12\left(\frac{\partial M_{ij}}{\partial q_k} + \frac{\partial M_{ik}}{\partial q_j} - \frac{\partial M_{jk}}{\partial q_i}\right)
+$$
+
+(eq. 10.9). Terms with $j = k$ are *centrifugal*; terms with $j \ne k$ are *Coriolis*. There are $n^3$
+of them, symmetric in the lower pair.
+
+**A Pfaffian constraint** is $A(q)\dot q = 0$ for a $k \times n$ matrix of full row rank. It is
+*holonomic* if each row is $\partial c/\partial q$ for some $c(q) = 0$ — the constraint is really a
+constraint on configurations in disguise — and *nonholonomic* otherwise.
+[Chapter 20](/chapters/ch20-nonholonomic-i) decides which; this chapter only imposes them.
+
+**The inertia tensor** of a rigid body with density $\rho$ occupying $V$, in a frame at its center of
+mass, is $\mathcal{I} = \int_V \rho(r)\,(\|r\|^2\mathbb{1} - r r\T)\,dV$ (eq. 10.42). Its
+eigenvectors are the *principal axes*; its eigenvalues the principal moments.
+
+### Euler–Lagrange gives the standard form
+
+<KeyIdea title="Statement">
+For $L = \tfrac12\dot q\T M(q)\dot q - V(q)$, the Euler–Lagrange equations are
+<LinkedMath>
+$$
+\htmlClass{term-robot}{M(q)\ddot q} + \htmlClass{term-cobstacle}{C(q, \dot q)\dot q} + g(q) = u,
+\qquad
+C_{ij} = \sum_k \Gamma^i_{jk}\,\dot q_k,\qquad g = \frac{\partial V}{\partial q}.
+$$
+</LinkedMath>
+</KeyIdea>
+
+<Derivation title="From the Lagrangian to M q̈ + C q̇ + g = u" result="\text{eq. (10.7), with } C \text{ from the Christoffel symbols}">
+**Step 1 — the momentum.** $\partial L/\partial\dot q = M(q)\dot q$, because $K$ is a quadratic form
+and $V$ has no $\dot q$ in it.
+
+**Step 2 — its time derivative.** $\tfrac{d}{dt}(M\dot q) = M\ddot q + \dot M\dot q$, and since $M$
+depends on $t$ only through $q$,
+$\dot M_{ij} = \sum_k (\partial M_{ij}/\partial q_k)\,\dot q_k$.
+
+**Step 3 — the configuration derivative.**
+$\partial L/\partial q_i = \tfrac12\dot q\T(\partial M/\partial q_i)\dot q - \partial V/\partial q_i$.
+
+**Step 4 — subtract and symmetrize.** The $i$-th equation reads
+
+$$
+\sum_j M_{ij}\ddot q_j + \sum_{j,k}\frac{\partial M_{ij}}{\partial q_k}\dot q_j\dot q_k - \tfrac12\sum_{j,k}\frac{\partial M_{jk}}{\partial q_i}\dot q_j\dot q_k + \frac{\partial V}{\partial q_i} = u_i .
+$$
+
+The middle sum is a quadratic form in $\dot q$ whose coefficient matrix $\partial M_{ij}/\partial q_k$
+is *not* symmetric in $(j, k)$. A quadratic form only sees the symmetric part, so replace it by
+$\tfrac12(\partial M_{ij}/\partial q_k + \partial M_{ik}/\partial q_j)$. Together with the third sum
+that is exactly $\sum_{jk}\Gamma^i_{jk}\dot q_j\dot q_k$ — the symmetrization *is* where the
+three-term Christoffel formula comes from.
+
+**Step 5 — read off the pieces.** Define $c_i = \sum_{jk}\Gamma^i_{jk}\dot q_j\dot q_k$ (eq. 10.8),
+$g_i = \partial V/\partial q_i$, and any matrix $C$ with $C\dot q = c$; the choice
+$C_{ij} = \sum_k\Gamma^i_{jk}\dot q_k$ is the one the rest of the chapter uses.
+$\blacksquare$
+
+**The RP arm as a check (Choset Examples 10.1.2, 10.2.1).** With $M = \operatorname{diag}(I_1 + I_2 + m_1 r_1^2 + m_2 q_2^2,\; m_2)$,
+the only nonzero symbols are $\Gamma^1_{12} = \Gamma^1_{21} = m_2 q_2$ and $\Gamma^2_{11} = -m_2 q_2$,
+and the velocity-product vector is $(2 m_2 q_2\dot q_1\dot q_2,\; -m_2 q_2\dot q_1^2)$ — eqs.
+(10.5)–(10.6) exactly. The cast of this book is revolute, so the RP arm survives only here.
+
+**$C$ is not unique; $C\dot q$ is.** Add to $C$ any matrix $S$ with $S\dot q = 0$ — for $n = 2$,
+$S = s\,[\dot q_2, -\dot q_1]\T[\dot q_2, -\dot q_1]$ for any scalar $s$ — and the equations of motion
+are unchanged. What *is* changed is the property the next derivation proves, which is why the
+Christoffel choice is the one worth naming.
+</Derivation>
+
+### Ṁ − 2C is skew-symmetric, so energy is conserved exactly
+
+<KeyIdea title="Statement">
+With $C_{ij} = \sum_k\Gamma^i_{jk}\dot q_k$, the matrix $\dot M - 2C$ is skew-symmetric. Hence along
+any motion $\dot E = \dot q\T(u - b)$: with no applied torque and no dissipation, $E = K + V$ is
+constant.
+</KeyIdea>
+
+<Derivation title="Why the Christoffel choice conserves energy" result="\dot q\T(\dot M - 2C)\dot q = 0,\quad \dot E = \dot q\T(u - b)">
+**Step 1 — write both pieces with the same partials.** From Step 2 above,
+$\dot M_{ij} = \sum_k\frac{\partial M_{ij}}{\partial q_k}\dot q_k$. From the definition,
+$2C_{ij} = \sum_k\left(\frac{\partial M_{ij}}{\partial q_k} + \frac{\partial M_{ik}}{\partial q_j} - \frac{\partial M_{jk}}{\partial q_i}\right)\dot q_k$.
+
+**Step 2 — the first terms cancel.** Subtracting leaves
+$(\dot M - 2C)_{ij} = \sum_k\left(\frac{\partial M_{jk}}{\partial q_i} - \frac{\partial M_{ik}}{\partial q_j}\right)\dot q_k$.
+
+**Step 3 — what remains is antisymmetric.** Swap $i$ and $j$ and the bracket changes sign:
+$(\dot M - 2C)_{ji} = -(\dot M - 2C)_{ij}$. So $\dot q\T(\dot M - 2C)\dot q = 0$ for every $\dot q$,
+since a quadratic form of a skew matrix vanishes identically.
+
+**Step 4 — differentiate the energy.** $E = \tfrac12\dot q\T M\dot q + V$, so
+$\dot E = \dot q\T M\ddot q + \tfrac12\dot q\T\dot M\dot q + \dot q\T g$. Substitute
+$M\ddot q = u - C\dot q - g - b$:
+
+$$
+\dot E = \dot q\T(u - b) + \tfrac12\dot q\T(\dot M - 2C)\dot q = \dot q\T(u - b). \qquad\blacksquare
+$$
+
+**Why this is the test the `dynamics` crate runs.** The derivation used only (i) the correct $M$,
+(ii) the correct $\Gamma$ obtained from it, and (iii) $g = \partial V/\partial q$. An error in any of
+the three breaks the identity, and an integrator run from rest with $u = b = 0$ will show it as
+energy drift. That is one assertion covering the whole derivation. The library check
+`dynamics: released from rest … E stays within 1e-6 relative under RK4` is exactly this.
+
+**Why dropping $C$ breaks it.** With $C \equiv 0$ the Step 4 remainder is $\tfrac12\dot q\T\dot M\dot q$,
+which is not zero — it is the rate at which the configuration-dependence of $M$ pumps energy in or out.
+That is the Lagrangian Lab's lie, and the sign of the drift depends on whether $\dot M$ is positive or
+negative along the motion (Exercise 4).
+</Derivation>
+
+### The 2R arm, worked in full
+
+This is Choset's Problem 10.2 — Reach in a vertical plane — and the model every later chapter in
+Part V runs.
+
+<KeyIdea title="Statement">
+For links of length $L_i$, mass $m_i$, inertia $I_i$ about a center of mass at distance $r_i$ from
+joint $i$, with gravity $a_g$ along $-x_2$ and $h(q) = m_2 L_1 r_2\sin q_2$:
+<LinkedMath>
+$$
+\htmlClass{term-robot}{M(q)} =
+\begin{pmatrix}
+I_1 + I_2 + m_1 r_1^2 + m_2(L_1^2 + r_2^2 + 2L_1 r_2\cos q_2) & I_2 + m_2 r_2^2 + m_2 L_1 r_2\cos q_2 \\
+I_2 + m_2 r_2^2 + m_2 L_1 r_2\cos q_2 & I_2 + m_2 r_2^2
+\end{pmatrix},
+\qquad
+\htmlClass{term-cobstacle}{C\dot q} =
+\begin{pmatrix} -h\dot q_2^2 - 2h\dot q_1\dot q_2 \\ h\dot q_1^2 \end{pmatrix},
+$$
+</LinkedMath>
+$$
+g(q) = \begin{pmatrix} (m_1 r_1 + m_2 L_1)\,a_g\cos q_1 + m_2 r_2\, a_g\cos(q_1 + q_2) \\ m_2 r_2\, a_g\cos(q_1 + q_2)\end{pmatrix},
+$$
+and the only nonzero Christoffel symbols are $\Gamma^1_{12} = \Gamma^1_{21} = \Gamma^1_{22} = -h$ and
+$\Gamma^2_{11} = h$.
+</KeyIdea>
+
+<Derivation title="The Lagrange recipe applied to Reach" result="M, \Gamma, g \text{ of the statement}">
+**Step 1 — centers of mass by forward kinematics.** Chapter 2's $\varphi$ evaluated at $r_i$ instead
+of $L_i$: $c_1 = r_1(\cos q_1, \sin q_1)$ and
+$c_2 = (L_1\cos q_1 + r_2\cos(q_1 + q_2),\; L_1\sin q_1 + r_2\sin(q_1 + q_2))$.
+
+**Step 2 — center-of-mass Jacobians.** Differentiating, $J_{c_1} = r_1\begin{pmatrix}-\sin q_1 & 0\\ \cos q_1 & 0\end{pmatrix}$ and
+
+$$
+J_{c_2} = \begin{pmatrix} -L_1\sin q_1 - r_2\sin(q_1 + q_2) & -r_2\sin(q_1 + q_2) \\ L_1\cos q_1 + r_2\cos(q_1 + q_2) & r_2\cos(q_1 + q_2)\end{pmatrix}.
+$$
+
+These are Chapter 4's Jacobian construction applied to interior points of the links.
+
+**Step 3 — kinetic energy.** Each link contributes translation of its center of mass plus rotation
+about it: $K = \sum_i \tfrac12\left(m_i\|J_{c_i}\dot q\|^2 + I_i\omega_i^2\right)$ with
+$\omega_1 = \dot q_1$ and $\omega_2 = \dot q_1 + \dot q_2$, i.e. $J_{\omega_1} = (1, 0)$,
+$J_{\omega_2} = (1, 1)$. Hence
+
+$$
+M = \sum_i \left( m_i J_{c_i}\T J_{c_i} + I_i J_{\omega_i}\T J_{\omega_i}\right).
+$$
+
+Multiplying out: $\|J_{c_2}\dot q\|^2 = (L_1^2 + r_2^2 + 2L_1 r_2\cos q_2)\dot q_1^2 + 2(r_2^2 + L_1 r_2\cos q_2)\dot q_1\dot q_2 + r_2^2\dot q_2^2$,
+using $\cos q_1\cos(q_1{+}q_2) + \sin q_1\sin(q_1{+}q_2) = \cos q_2$. Collect by $\dot q_i\dot q_j$ and the
+three entries of $M$ in the statement appear.
+
+**Step 4 — differentiate for $\Gamma$.** Only $q_2$ appears in $M$, and only through $\cos q_2$:
+$\partial M_{11}/\partial q_2 = -2h$, $\partial M_{12}/\partial q_2 = -h$, every other partial is zero.
+Feeding these into the three-term formula: $\Gamma^1_{12} = \tfrac12(\partial M_{11}/\partial q_2) = -h$;
+$\Gamma^1_{22} = \tfrac12(2\,\partial M_{12}/\partial q_2 - \partial M_{22}/\partial q_1) = -h$;
+$\Gamma^2_{11} = \tfrac12(2\,\partial M_{21}/\partial q_1 - \partial M_{11}/\partial q_2) = h$;
+$\Gamma^2_{12} = \tfrac12(\partial M_{21}/\partial q_2 + \partial M_{22}/\partial q_1 - \partial M_{12}/\partial q_2) = 0$.
+Contracting, $c_1 = -2h\dot q_1\dot q_2 - h\dot q_2^2$ and $c_2 = h\dot q_1^2$ (Problem 10.3).
+
+**Step 5 — gravity.** $V = m_1 a_g r_1\sin q_1 + m_2 a_g\left(L_1\sin q_1 + r_2\sin(q_1 + q_2)\right)$,
+and $g = \partial V/\partial q$ is the statement. $\blacksquare$
+
+**The same recipe for 3R.** Nothing in Steps 1–5 used $n = 2$ except the trigonometric collapse in
+Step 3. For Reach's three-link variant there are three center-of-mass Jacobians, nine entries of $M$
+and 27 symbols — too many to differentiate by hand without error, so the library assembles $M$ from the
+Jacobians and takes the Christoffel symbols by central differences. The 2R case is the check: the
+finite-difference symbols agree with the closed form above to $10^{-7}$ at fifty random states.
+</Derivation>
+
+#### The numbers
+
+Fix the micro-example that every later chapter in Part V reuses: $L_1 = L_2 = 1$ m, uniform rods so
+$r_i = L_i/2$, $m_1 = 2$ kg, $m_2 = 1$ kg, hence $I_1 = m_1L_1^2/12 = 1/6$ and $I_2 = 1/12$ kg·m²,
+$a_g = 9.81$ m/s², at Choset's worked pose $q = (\pi/4, \pi/2)$ from Example 3.8.1 — the configuration
+the reader already knows from [Chapter 2](/chapters/ch02-the-lab). Then $\cos q_2 = 0$ and
+
+$$
+M(q) = \begin{pmatrix} 2 & 1/3 \\ 1/3 & 1/3 \end{pmatrix}
+\quad\text{exactly:}\quad
+M_{11} = \tfrac16 + \tfrac1{12} + 2\cdot\tfrac14 + 1\cdot(1 + \tfrac14) = 2,\;
+M_{22} = \tfrac1{12} + \tfrac14 = \tfrac13,\;
+M_{12} = M_{22} + 0 .
+$$
+
+$\det M = 5/9 > 0$ with eigenvalues $2.0642$ and $0.2691$. Gravity:
+$g_1 = (1 + 1)(9.81)\cos\tfrac\pi4 + 0.5\cdot 9.81\cos\tfrac{3\pi}4 = 1.5\cdot 9.81\cdot 0.70711 = 10.405$ N·m
+and $g_2 = 0.5\cdot 9.81\cdot(-0.70711) = -3.468$ N·m. With $\dot q = (1, 0)$ rad/s the kinetic energy
+is $K = \tfrac12 M_{11} = 1.000$ J, $h = m_2 L_1 r_2\sin q_2 = 0.5$, and
+$C\dot q = (0,\; h\dot q_1^2) = (0, 0.5)$ N·m: joint 2 must push outward at half a newton-meter just to
+keep the elbow angle fixed while the shoulder turns. Released from rest at this pose with $\tau = 0$,
+$E = V = 17.342$ J and must stay there.
+
+<CheckAnswer
+  id="ch17.m11"
+  prompt="Sweep q₂ through 0, π/2, π at the same masses. What is M₁₁ at q₂ = 0 and at q₂ = π?"
+  answer={3}
+  tolerance={0.01}
+>
+At $q_2 = 0$ the arm is straight and $M_{11} = 1/4 + 2\cdot 1/4 + 1\cdot(1 + 1/4 + 1) = 3$; at
+$q_2 = \pi$ it is folded back on itself and $M_{11} = 1/4 + 1/2 + 1/4 = 1$. The library check
+`M₁₁ sweeps 3 → 2 → 1` pins all three.
+</CheckAnswer>
+
+### Constrained dynamics and the projection P
+
+Rusty's axle, Hitch's wheels, a knife-edge on ice: each may move along its heading and spin but not
+slide sideways. That is a constraint on *velocities*, and it enters the equations of motion through a
+Lagrange multiplier.
+
+<KeyIdea title="Statement (Choset eqs. 10.16–10.20)">
+With $A(q)\dot q = 0$, the constrained equations are
+$M\ddot q + C\dot q + g = u + A\T\lambda$ and $A\ddot q + \dot A\dot q = 0$: $n + k$ equations for the
+$n + k$ unknowns $(\ddot q, \lambda)$. Eliminating $\lambda$ gives
+$P\ddot q = PM^{-1}(u - C\dot q - g)$ with
+$P = \mathbb{1} - M^{-1}A\T(AM^{-1}A\T)^{-1}A$ of rank $n - k$.
+</KeyIdea>
+
+<Derivation title="Eliminating the multipliers" result="P \ddot q = P M^{-1}(u - C\dot q - g)">
+**Step 1 — differentiate the constraint.** $A\dot q = 0$ holds for all time, so
+$\tfrac{d}{dt}(A\dot q) = A\ddot q + \dot A\dot q = 0$ (eq. 10.17).
+
+**Step 2 — solve the force balance for $\ddot q$.** From (10.16),
+$\ddot q = M^{-1}(u + A\T\lambda - C\dot q - g)$.
+
+**Step 3 — substitute into the differentiated constraint.**
+$\dot A\dot q + AM^{-1}(u + A\T\lambda - C\dot q - g) = 0$.
+
+**Step 4 — solve for $\lambda$.** The $k \times k$ matrix $AM^{-1}A\T$ is invertible because $A$ has
+full row rank and $M \succ 0$:
+$\lambda = (AM^{-1}A\T)^{-1}\left(-\dot A\dot q + AM^{-1}(C\dot q + g - u)\right)$.
+
+**Step 5 — substitute back and factor.** Using $-\dot A\dot q = A\ddot q$ and collecting,
+$(\mathbb{1} - A\T(AM^{-1}A\T)^{-1}AM^{-1})(M\ddot q + C\dot q + g - u) = 0$. Call the bracket
+$P_u$ (eq. 10.18); then $P = M^{-1}P_u M$ (eq. 10.19) and rearranging gives the statement
+(eq. 10.20). $\blacksquare$
+
+**Orthogonality with respect to $M$.** $P$ and $\mathbb{1} - P$ split a velocity into a part that
+satisfies the constraints and a part in the constrained directions, and
+$(P\dot q)\T M(\mathbb{1} - P)\dot q = 0$ for every $\dot q$. The inner product is $M$, not the
+identity: Choset is explicit that this is "the appropriate one when discussing dynamics," because
+$M$ carries the metric of coordinates that mix lengths and angles. Also $P = P_u\T$, which the
+library checks numerically alongside the rank.
+
+**The knife-edge (Example 10.3.1).** $q = (q_1, q_2, q_3)$ is contact point and heading,
+$M = \operatorname{diag}(m, m, I)$, $A = [\sin q_3, -\cos q_3, 0]$, $\dot A = \dot q_3[\cos q_3, \sin q_3, 0]$.
+Then $P = \begin{pmatrix}\cos^2 q_3 & \sin q_3\cos q_3 & 0\\ \sin q_3\cos q_3 & \sin^2 q_3 & 0 \\ 0 & 0 & 1\end{pmatrix}$,
+rank 2, and the closed forms (10.25)–(10.28) follow — including the constraint force
+$\lambda_1 = (u_2 - m\dot q_1\dot q_3)\cos q_3 - (u_1 + m\dot q_2\dot q_3)\sin q_3$. The library solves
+the $(n + k) \times (n + k)$ system directly and reproduces those four formulas to $10^{-9}$ at thirty
+random states. This is Rusty's no-side-slip constraint, and Chapter 20 will show it is nonholonomic.
+</Derivation>
+
+### Euler's equation in the body frame
+
+For a spinning rigid body no choice of three angles gives a smooth global coordinate system — the
+same fact Chapter 5 made about $\SOthree$ — so Choset does not pick one. He takes $R \in \SOthree$ as
+the orientation and the body-frame angular velocity $\omega$ as the velocity, and derives the dynamics
+directly.
+
+<KeyIdea title="Statement (Choset eqs. 10.43–10.44)">
+With $\mathcal{I}$ the constant body-frame inertia tensor,
+$$
+\dot R = R\hat\omega, \qquad \tau = \hat\omega\,\mathcal{I}\omega + \mathcal{I}\dot\omega .
+$$
+In particular $\dot\omega \ne 0$ when $\tau = 0$ unless $\omega$ is along a principal axis.
+</KeyIdea>
+
+<Derivation title="From the spatial frame to the body frame" result="\tau = \hat\omega \mathcal{I}\omega + \mathcal{I}\dot\omega">
+**Step 1 — kinetic energy in the spatial frame.** A point at $r_s$ moves at $\omega_s \times r_s$, so
+$K = \tfrac12\int_V\rho\,\|\omega_s \times r_s\|^2\,dV = \tfrac12\omega_s\T\mathcal{I}_s\omega_s$ with
+$\mathcal{I}_s = \int_V\rho(\|r_s\|^2\mathbb{1} - r_s r_s\T)\,dV$ (eqs. 10.34–10.36). Because it is
+written in a fixed frame, $\mathcal{I}_s$ changes as the body turns.
+
+**Step 2 — angular momentum and its rate.** $P = \mathcal{I}_s\omega_s$ and $\tau_s = \dot P$. The
+density does not change, so $\dot{\mathcal{I}}_s = \omega_s \times \mathcal{I}_s$ comes only from the
+rotation, giving $\tau_s = \omega_s \times \mathcal{I}_s\omega_s + \mathcal{I}_s\dot\omega_s$ — Euler's
+equation in the inertial frame (10.37), or $\tau_s = \hat\omega_s\mathcal{I}_s\omega_s + \mathcal{I}_s\dot\omega_s$
+in matrix form (10.38).
+
+**Step 3 — change frames.** $\omega_s = R\omega$, $\tau_s = R\tau$, $\mathcal{I}_s = R\mathcal{I}R\T$,
+$\hat\omega_s = \dot R R\T$, and $\dot R = R\hat\omega$ (10.39, 10.41).
+
+**Step 4 — substitute.** $R\tau = \dot R R\T R\mathcal{I}R\T R\omega + R\mathcal{I}R\T(\dot R\omega + R\dot\omega)$.
+
+**Step 5 — kill one term.** $\dot R\omega = R\hat\omega\omega = R(\omega \times \omega) = 0$.
+
+**Step 6 — premultiply by $R\T$.** $\tau = R\T\dot R\,\mathcal{I}\omega + \mathcal{I}\dot\omega = \hat\omega\mathcal{I}\omega + \mathcal{I}\dot\omega$. $\blacksquare$
+
+**The principal-axis form (10.45).** Align the body frame with the eigenvectors of $\mathcal{I}$ and
+$\tau_x = I_{xx}\dot\omega_x + (I_{zz} - I_{yy})\omega_y\omega_z$, with the two cyclic permutations.
+Set $\tau = 0$: $\dot\omega_x = (I_{yy} - I_{zz})\omega_y\omega_z/I_{xx}$ is zero only if two of the
+components vanish. Spin about the axis of *intermediate* inertia and a small perturbation in the other
+two components grows exponentially — the flip the next widget shows. The parallel-axis theorem
+(10.33 planar, 10.46 spatial) and the composite-body rule $\mathcal{I} = \sum_i R_i(\mathcal{I}_i + m_i(\|r_i\|^2\mathbb{1} - r_i r_i\T))R_i\T$
+are functions in the library, not sections here.
+</Derivation>
+
+<Deferred>
+  <TumblingBody />
+</Deferred>
+
+Angular momentum and kinetic energy are conserved — the readout holds both to five decimals over the
+whole run — while the angular velocity is not. That is not a numerical artifact; it is what the
+equation says. Choset: "ω̇ may not be zero even if τ is zero. Although the angular momentum and kinetic
+energy of a rotating body are constant when no external torques are applied, the angular velocity of
+the body may not be constant."
+
+### RK4 on the first-order state, and what its energy drift means
+
+Write $x = (q, \dot q)$ and $\dot x = (\dot q,\; M^{-1}(u - C\dot q - g - b))$. Classical RK4 has local
+error $O(h^5)$ and global error $O(h^4)$, and the energy error inherits that order. Three honesty
+items the prose must keep:
+
+1. **RK4 is not symplectic.** Its energy error is bounded by $c\,h^4$ over the horizons we use because
+   the global error is, not because of any structural guarantee. Run it for an hour and it will drift.
+2. **The bound is empirical.** The test asserts $|E(t) - E(0)|/E(0) < 10^{-6}$ for $h = 1$ ms over
+   10 s on the micro-example released from rest; the measured value is about $10^{-8}$.
+3. **Explicit Euler drifts linearly** and is kept only as the bad example: on the same run it loses
+   track of the energy by more than ten percent. Semi-implicit (symplectic) Euler keeps the error
+   bounded, but at first order the bound is also around ten percent on this violently swinging arm —
+   cheap, not accurate.
+
+## The algorithm
+
+Choset numbers none of these; the names follow his text.
+
+<Algorithm
+  name="lagrange_recipe(links, φ, a_g)"
+  inputs="link parameters (L_i, r_i, m_i, I_i), forward kinematics, gravitational acceleration"
+  outputs="M(q), Γ(q), g(q) as callables"
+  complexity="O(n²) Jacobian products for M; O(n³) Christoffel symbols"
+>
+1. for each link $i$: $c_i(q) \leftarrow$ position of its center of mass by $\varphi$ at $r_i$; $J_{c_i}(q) \leftarrow \partial c_i/\partial q$; $J_{\omega_i} \leftarrow (1, \dots, 1, 0, \dots, 0)$ with $i$ ones
+2. $M(q) \leftarrow \sum_i \left(m_i J_{c_i}\T J_{c_i} + I_i J_{\omega_i}\T J_{\omega_i}\right)$
+3. $V(q) \leftarrow \sum_i m_i a_g\, [c_i(q)]_y$; $\;g(q) \leftarrow \sum_i m_i a_g\,[J_{c_i}(q)]_{y,\cdot}$
+4. $\Gamma^i_{jk}(q) \leftarrow \tfrac12(\partial_k M_{ij} + \partial_j M_{ik} - \partial_i M_{jk})$, by closed form or central differences
+5. return $(M, \Gamma, g)$
+</Algorithm>
+
+<Algorithm
+  name="forward_dynamics(q, q̇, u)"
+  inputs="state and generalized force"
+  outputs="q̈"
+  complexity="one n×n solve, O(n³)"
+>
+1. $c \leftarrow \dot q\T\Gamma(q)\dot q$; $\;r \leftarrow u - c - g(q) - b(q, \dot q)$
+2. return $M(q)^{-1} r$ by Cholesky or pivoted elimination — Choset eq. (11.46)
+</Algorithm>
+
+<Algorithm
+  name="constrained_forward_dynamics(q, q̇, u, A, Ȧ)"
+  inputs="state, force, constraint matrix and its rate"
+  outputs="(q̈, λ)"
+  complexity="one (n+k)×(n+k) KKT solve"
+>
+1. assemble $\begin{pmatrix} M & -A\T \\ A & 0\end{pmatrix}\begin{pmatrix}\ddot q\\ \lambda\end{pmatrix} = \begin{pmatrix} u - C\dot q - g - b \\ -\dot A\dot q\end{pmatrix}$ — eqs. (10.16)–(10.17)
+2. solve; return $(\ddot q, \lambda)$. The constraint force on the system is $A\T\lambda$.
+</Algorithm>
+
+<Algorithm
+  name="rk4_step(f, x, h)"
+  inputs="ẋ = f(x), state, step"
+  outputs="x(t + h)"
+  complexity="4 dynamics evaluations"
+>
+1. $k_1 \leftarrow f(x)$; $k_2 \leftarrow f(x + \tfrac h2 k_1)$; $k_3 \leftarrow f(x + \tfrac h2 k_2)$; $k_4 \leftarrow f(x + h k_3)$
+2. return $x + \tfrac h6(k_1 + 2k_2 + 2k_3 + k_4)$
+</Algorithm>
+
+<Algorithm
+  name="euler_body_step(R, ω, τ, 𝓘, h)"
+  inputs="orientation as a unit quaternion, body angular velocity, body torque, body inertia tensor, step"
+  outputs="(R, ω) after h"
+  complexity="O(1)"
+>
+1. state $x \leftarrow (R, \omega)$ with $\dot R = \tfrac12 R \otimes (0, \omega)$ and $\dot\omega = \mathcal{I}^{-1}(\tau - \omega \times \mathcal{I}\omega)$ — eqs. (10.43)–(10.44)
+2. one `rk4_step` on $x$; renormalize $R$
+</Algorithm>
+
+## Implementation in Rust
+
+The `dynamics` crate is introduced here and imported by Chapters 18–21 and 23. Its surface is a trait
+with four physical callbacks and two derived operations.
+
+```rust title="crates/dynamics/src/lib.rs"
+use nalgebra::{SMatrix, SVector};
+
+/// A fully actuated second-order mechanical system in generalized coordinates.
+/// Everything downstream (time scaling, iLQR, kinodynamic RRT) talks to this trait.
+pub trait Dynamics<const N: usize> {
+    /// M(q): symmetric positive definite. We return the full matrix — the
+    /// Cholesky factorization is cheap for N ≤ 3 and keeps the code readable.
+    fn mass(&self, q: &SVector<f64, N>) -> SMatrix<f64, N, N>;
+
+    /// The velocity-product vector C(q, q̇) q̇ = q̇ᵀ Γ(q) q̇ — returned as a vector,
+    /// because the matrix C is not unique and only the product is a generalized
+    /// force (Choset §10.2).
+    fn velocity_product(&self, q: &SVector<f64, N>, qd: &SVector<f64, N>) -> SVector<f64, N>;
+
+    /// g(q) = ∂V/∂q.
+    fn gravity(&self, q: &SVector<f64, N>) -> SVector<f64, N>;
+
+    /// V(q), so E = K + V can be tracked. K = ½ q̇ᵀ M q̇ is provided below.
+    fn potential_energy(&self, q: &SVector<f64, N>) -> f64;
+
+    /// Dissipation b(q, q̇); default: none.
+    fn dissipation(&self, _q: &SVector<f64, N>, _qd: &SVector<f64, N>) -> SVector<f64, N> {
+        SVector::zeros()
+    }
+
+    /// q̈ = M⁻¹(u − C q̇ − g − b). Default impl; override only for a faster recursive form.
+    fn forward(&self, q: &SVector<f64, N>, qd: &SVector<f64, N>, u: &SVector<f64, N>)
+        -> SVector<f64, N>
+    {
+        let rhs = u - self.velocity_product(q, qd) - self.gravity(q) - self.dissipation(q, qd);
+        self.mass(q).cholesky().expect("M(q) must be positive definite").solve(&rhs)
+    }
+
+    /// u = M q̈ + C q̇ + g + b — the torque that produces a given acceleration.
+    fn inverse(&self, q: &SVector<f64, N>, qd: &SVector<f64, N>, qdd: &SVector<f64, N>)
+        -> SVector<f64, N>
+    {
+        self.mass(q) * qdd + self.velocity_product(q, qd) + self.gravity(q) + self.dissipation(q, qd)
+    }
+
+    fn kinetic_energy(&self, q: &SVector<f64, N>, qd: &SVector<f64, N>) -> f64 {
+        0.5 * qd.dot(&(self.mass(q) * qd))
+    }
+
+    fn energy(&self, q: &SVector<f64, N>, qd: &SVector<f64, N>) -> f64 {
+        self.kinetic_energy(q, qd) + self.potential_energy(q)
+    }
+}
+```
+
+The 2R model is Derivation 3 typed in. Every expression is a line of the derivation, which is the
+point: a reader who has done the algebra should recognize the file.
+
+```rust title="crates/dynamics/src/reach2r.rs" {30-38,41-47}
+use nalgebra::{Matrix2, Vector2};
+use crate::Dynamics;
+
+/// Choset Problem 10.2: planar 2R arm in a vertical plane. Units: kg, m, s.
+pub struct Reach2R {
+    pub l1: f64, pub r1: f64, pub m1: f64, pub i1: f64,
+    pub l2: f64, pub r2: f64, pub m2: f64, pub i2: f64,
+    pub a_g: f64, // 0.0 lays the Workbench flat
+}
+
+impl Reach2R {
+    /// Uniform rods: r_i = L_i/2, I_i = m_i L_i²/12.
+    pub fn uniform(l1: f64, m1: f64, l2: f64, m2: f64, a_g: f64) -> Self {
+        Self {
+            l1, r1: l1 / 2.0, m1, i1: m1 * l1 * l1 / 12.0,
+            l2, r2: l2 / 2.0, m2, i2: m2 * l2 * l2 / 12.0,
+            a_g,
+        }
+    }
+
+    /// h(q) = m₂ L₁ r₂ sin q₂ — every velocity-product term is built from it.
+    fn h(&self, q: &Vector2<f64>) -> f64 {
+        self.m2 * self.l1 * self.r2 * q[1].sin()
+    }
+
+    /// Closed form: the four nonzero symbols Γ¹₁₂ = Γ¹₂₁ = Γ¹₂₂ = −h, Γ²₁₁ = h.
+    pub fn christoffel(&self, q: &Vector2<f64>) -> [Matrix2<f64>; 2] {
+        let h = self.h(q);
+        [Matrix2::new(0.0, -h, -h, -h), Matrix2::new(h, 0.0, 0.0, 0.0)]
+    }
+}
+
+impl Dynamics<2> for Reach2R {
+    fn mass(&self, q: &Vector2<f64>) -> Matrix2<f64> {
+        let c2 = q[1].cos();
+        let m22 = self.i2 + self.m2 * self.r2 * self.r2;
+        let m12 = m22 + self.m2 * self.l1 * self.r2 * c2;
+        let m11 = self.i1 + self.i2 + self.m1 * self.r1 * self.r1
+            + self.m2 * (self.l1 * self.l1 + self.r2 * self.r2 + 2.0 * self.l1 * self.r2 * c2);
+        Matrix2::new(m11, m12, m12, m22)
+    }
+
+    fn velocity_product(&self, q: &Vector2<f64>, qd: &Vector2<f64>) -> Vector2<f64> {
+        let h = self.h(q);
+        Vector2::new(-h * qd[1] * qd[1] - 2.0 * h * qd[0] * qd[1], h * qd[0] * qd[0])
+    }
+
+    fn gravity(&self, q: &Vector2<f64>) -> Vector2<f64> {
+        let (c1, c12) = (q[0].cos(), (q[0] + q[1]).cos());
+        Vector2::new(
+            (self.m1 * self.r1 + self.m2 * self.l1) * self.a_g * c1 + self.m2 * self.r2 * self.a_g * c12,
+            self.m2 * self.r2 * self.a_g * c12,
+        )
+    }
+
+    fn potential_energy(&self, q: &Vector2<f64>) -> f64 {
+        self.m1 * self.a_g * self.r1 * q[0].sin()
+            + self.m2 * self.a_g * (self.l1 * q[0].sin() + self.r2 * (q[0] + q[1]).sin())
+    }
+}
+```
+
+For arms longer than two links the symbols are differenced rather than derived. The function is
+generic over anything that can produce $M(q)$, and the 2R closed form is what it is tested against.
+
+```rust title="crates/dynamics/src/lagrange.rs"
+use nalgebra::{SMatrix, SVector};
+
+/// Γ^i_jk = ½(∂M_ij/∂q_k + ∂M_ik/∂q_j − ∂M_jk/∂q_i) (Choset eq. 10.9), with the
+/// partials by central differences. O(n³) symbols from 2n evaluations of M.
+/// The 3R arm has no other path; the 2R arm's closed form checks this one.
+pub fn christoffel<const N: usize>(
+    mass: impl Fn(&SVector<f64, N>) -> SMatrix<f64, N, N>,
+    q: &SVector<f64, N>,
+    step: f64,
+) -> [SMatrix<f64, N, N>; N] {
+    let mut d_m = [SMatrix::<f64, N, N>::zeros(); N]; // d_m[k] = ∂M/∂q_k
+    for k in 0..N {
+        let (mut qp, mut qm) = (*q, *q);
+        qp[k] += step;
+        qm[k] -= step;
+        d_m[k] = (mass(&qp) - mass(&qm)) / (2.0 * step);
+    }
+    let mut gamma = [SMatrix::<f64, N, N>::zeros(); N];
+    for i in 0..N {
+        for j in 0..N {
+            for k in 0..N {
+                gamma[i][(j, k)] = 0.5 * (d_m[k][(i, j)] + d_m[j][(i, k)] - d_m[i][(j, k)]);
+            }
+        }
+    }
+    gamma
+}
+
+/// max |(Ṉ − 2C) + (Ṉ − 2C)ᵀ| — zero when C is the Christoffel choice. A
+/// diagnostic for a model, not a step of any algorithm.
+pub fn skew_symmetry_defect<const N: usize>(
+    mass: impl Fn(&SVector<f64, N>) -> SMatrix<f64, N, N> + Copy,
+    q: &SVector<f64, N>,
+    qd: &SVector<f64, N>,
+) -> f64 {
+    let gamma = christoffel(mass, q, 1e-6);
+    let mut c = SMatrix::<f64, N, N>::zeros();
+    let mut m_dot = SMatrix::<f64, N, N>::zeros();
+    for i in 0..N {
+        for j in 0..N {
+            for k in 0..N {
+                c[(i, j)] += gamma[i][(j, k)] * qd[k];
+            }
+        }
+    }
+    // Ṁ = Σ_k ∂M/∂q_k q̇_k, recomputed here so the two sides share no code path.
+    for k in 0..N {
+        let (mut qp, mut qm) = (*q, *q);
+        qp[k] += 1e-6;
+        qm[k] -= 1e-6;
+        m_dot += (mass(&qp) - mass(&qm)) / 2e-6 * qd[k];
+    }
+    let s = m_dot - 2.0 * c;
+    (s + s.transpose()).abs().max()
+}
+```
+
+The integrator is thirty lines, and the test next to it is the chapter's contract.
+
+```rust title="crates/dynamics/src/integrate.rs"
+use nalgebra::SVector;
+use crate::Dynamics;
+
+/// One classical RK4 step on x = (q, q̇) with u held over the step.
+pub fn rk4_step<const N: usize>(
+    dyn_: &impl Dynamics<N>,
+    q: &SVector<f64, N>, qd: &SVector<f64, N>, u: &SVector<f64, N>, h: f64,
+) -> (SVector<f64, N>, SVector<f64, N>) {
+    let f = |q: &SVector<f64, N>, qd: &SVector<f64, N>| (*qd, dyn_.forward(q, qd, u));
+    let (k1q, k1v) = f(q, qd);
+    let (k2q, k2v) = f(&(q + k1q * (h / 2.0)), &(qd + k1v * (h / 2.0)));
+    let (k3q, k3v) = f(&(q + k2q * (h / 2.0)), &(qd + k2v * (h / 2.0)));
+    let (k4q, k4v) = f(&(q + k3q * h), &(qd + k3v * h));
+    (
+        q + (k1q + k2q * 2.0 + k3q * 2.0 + k4q) * (h / 6.0),
+        qd + (k1v + k2v * 2.0 + k3v * 2.0 + k4v) * (h / 6.0),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reach2r::Reach2R;
+    use nalgebra::Vector2;
+    use std::f64::consts::PI;
+
+    /// Zero torque, zero friction ⇒ E constant. The tolerance is empirical
+    /// (RK4 is not symplectic), calibrated once and never loosened.
+    #[test]
+    fn energy_drift_rk4() {
+        let arm = Reach2R::uniform(1.0, 2.0, 1.0, 1.0, 9.81);
+        let (mut q, mut qd) = (Vector2::new(PI / 4.0, PI / 2.0), Vector2::zeros());
+        let e0 = arm.energy(&q, &qd);
+        let mut worst = 0.0_f64;
+        for _ in 0..10_000 {
+            (q, qd) = rk4_step(&arm, &q, &qd, &Vector2::zeros(), 1e-3);
+            worst = worst.max(((arm.energy(&q, &qd) - e0) / e0).abs());
+        }
+        assert!(worst < 1e-6, "RK4 energy drift {worst:e}");
+    }
+}
+```
+
+### The worked example, printed
+
+`cargo run --example two_r_numbers -p dynamics` builds `Reach2R::uniform(1.0, 2.0, 1.0, 1.0, 9.81)`,
+evaluates it at $q = (\pi/4, \pi/2)$ and prints
+
+```text
+M   = [[2.0000, 0.3333], [0.3333, 0.3333]]      det 0.5556   eig 2.0642 0.2691
+g   = [10.4051, -3.4684]
+Cq̇  = [0.0000, 0.5000]        for q̇ = (1, 0)
+K   = 1.0000 J    V = 17.3418 J    E = 18.3418 J
+M11 sweep over q2 ∈ {0, π/2, π}:  3.0000  2.0000  1.0000
+energy drift, τ = 0, h = 1 ms, 10 s:  rk4 9.4e-9   semi-implicit Euler 1.1e-1   explicit Euler 1.4e-1
+```
+
+`#[test] fn reproduces_micro_example()` asserts each line to $10^{-4}$. Three more tests pin the
+chapter's claims: `christoffel_closed_form_matches_finite_differences` (2R closed form against central
+differences with step $10^{-6}$, agreement to $10^{-7}$), `energy_drift_rk4` above (with the explicit
+Euler run asserted to be *worse* than $10^{-3}$, so the comparison in the widget is honest), and
+`rapier_agrees`, which assembles Reach in `rapier2d` as two rigid bodies joined by revolute joints and
+checks that one engine step at $\Delta t = 10^{-4}$ agrees with `forward` to $10^{-3}$ relative, and
+2 s trajectories to $10^{-2}$ — the engine's own integrator sets that tolerance, and the text says so.
+
+<Callout type="info">
+The widgets on this page run the TypeScript port in `lib/dynamics/`, a line-for-line translation of
+the Rust above. Its self-checks reproduce every number in the printout: `M = [[2, 1/3], [1/3, 1/3]]`,
+`g = (10.4051, −3.4684)`, `C q̇ = (0, 0.5)`, the $3 \to 2 \to 1$ sweep, the eigenvalues, the energy
+drift, the knife-edge closed forms, and the brick that flips.
+</Callout>
+
+## Putting it together
+
+The integration lab drops the same `Reach2R` into Chapter 2's Workbench with gravity on and a PD
+controller holding a planned waypoint:
+
+$$
+\tau = g(q^*) + K_p(q^* - q) - K_d\,\dot q .
+$$
+
+Hold the micro-example pose. The gravity compensation term alone is $g(q^*) = (10.405, -3.468)$ N·m —
+more than half the shoulder motor's 20 N·m budget just to stand still. Raise $K_p$ and the arm
+overshoots on release; the overshoot is governed by $M(q)$, which is why a gain that is crisp with the
+arm folded ($M_{11} = 1$) rings with it stretched ($M_{11} = 3$). The torque trace this lab produces,
+peak and all, is the limit Chapter 18's time scaler inherits.
+
+Here is where the chapter closes and the next one opens. Take any planned path $q(s)$, substitute
+$\dot q = q'\dot s$ and $\ddot q = q''\dot s^2 + q'\ddot s$ into the standard form, and the $n$
+equations collapse to
+
+$$
+a(s)\,\ddot s + b(s)\,\dot s^2 + c(s) = \tau, \qquad a = M q',\; b = M q'' + q'\T\Gamma q',\; c = g .
+$$
+
+A path plus these equations is a *one-dimensional* dynamics in the path parameter. The whole of
+[Chapter 18](/chapters/ch18-trajectory-planning) lives in the $(s, \dot s)$ plane that equation
+defines. [Chapter 19](/chapters/ch19-trajectory-optimization) linearizes `forward` along a trajectory
+for iLQR. [Chapter 20](/chapters/ch20-nonholonomic-i) reuses $A(q)\dot q = 0$ and asks whether the
+knife-edge constraint can be integrated. All three import this crate and none of them re-derives a
+line of it.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="The three-term formula, and what breaks without it">
+    Starting from $K = \tfrac12\dot q\T M(q)\dot q$, carry out Step 4 of the first derivation and show
+    that the symmetrization produces exactly $\Gamma^i_{jk} = \tfrac12(\partial_k M_{ij} + \partial_j M_{ik} - \partial_i M_{jk})$.
+    Then take $C' = C + S$ with $S\dot q = 0$ — for $n = 2$, $S = s\,w w\T$ with $w = (\dot q_2, -\dot q_1)$ —
+    and show the equations of motion are unchanged while $\dot M - 2C'$ is skew only if $s = 0$.
+    <Hints>
+      <>A quadratic form $\sum_{jk} B_{jk}\dot q_j\dot q_k$ only depends on the symmetric part $\tfrac12(B + B\T)$.</>
+      <>For the second part, $\dot M - 2C' = (\dot M - 2C) - 2S$, and $S = s\,ww\T$ is symmetric. A symmetric matrix is skew only if it is zero.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={1} title="Choset Problem 10.1: a point mass in polar coordinates">
+    With $q = (r, \theta)$ and $K = \tfrac12 m(\dot r^2 + r^2\dot\theta^2)$, write $M(q)$, compute the
+    Christoffel symbols, and verify $\Gamma^1_{22} = -mr$ and $\Gamma^2_{12} = \Gamma^2_{21} = mr$.
+    Then show that the unforced motions $u = 0$ are straight lines in the Cartesian plane — so the
+    symbols are not describing a force but the bending of straight lines in these coordinates.
+    <CheckAnswer id="ch17.e2" prompt="For m = 2 kg at r = 1.5 m, what is Γ²₁₂?" answer={3} tolerance={0.01} unit="kg·m">
+    $M = \operatorname{diag}(m, mr^2)$, so $\partial M_{22}/\partial r = 2mr$ and
+    $\Gamma^2_{12} = \tfrac12\,\partial M_{22}/\partial q_1 = mr = 3$. The centrifugal
+    $\Gamma^1_{22} = -\tfrac12\,\partial M_{22}/\partial r = -mr$ is the familiar $-mr\dot\theta^2$.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Predict the ellipse">
+    <Predict
+      id="ch17.e3"
+      question="In the Inertia Ellipsoid the semi-axes at q₂ = π/2 are 1.928 and 0.696. At q₂ = π, where M₁₁ = 1 and M₁₂ = 1/3 − 1/2 = −1/6, what happens to the two semi-axes?"
+      options={[
+        { label: 'Both grow — the folded arm is lighter in every direction', because: 'M₁₁ drops from 2 to 1, so the shoulder axis does get easier; but M₂₂ is unchanged and the coupling M₁₂ changes sign. The eigenvalues move toward each other (1.039 and 0.294), and 1/√λ gives 0.981 and 1.844: the short axis grows, the long axis shrinks.' },
+        { label: 'The short axis grows, the long axis shrinks, and the long axis rotates', correct: true, because: 'Eigenvalues 1.039 and 0.294 give semi-axes 0.981 and 1.844. With M₁₂ negative the eigenvector of the small eigenvalue tilts into the quadrant where q̇₁ and q̇₂ have the same sign — the cheap direction is now to swing both joints together.' },
+        { label: 'Nothing: the ellipse only depends on the masses', because: 'M depends on q₂ through cos q₂ in M₁₁ and M₁₂. The ellipse is a function of configuration — that is the whole point of the widget.' },
+      ]}
+    >
+    Now move the slider and read the printed semi-axes. The long axis rotates because the
+    off-diagonal entry $M_{12}$ changed sign: at $q_2 = \pi/2$ the two joints are inertially coupled
+    positively, at $q_2 = \pi$ negatively, and the eigenvector of the small eigenvalue — the direction
+    a joule of energy buys the most speed — swings across the $\dot q_1$ axis.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Which way does the lie go?">
+    In the Lagrangian Lab switch Coriolis off and release from $(\pi/4, \pi/2)$. Does $E$ increase or
+    decrease first, and why does the sign depend on the release configuration? Confirm with the
+    torque-gauge stacks.
+    <Hints>
+      <>With $C$ zeroed, Derivation 2 leaves $\dot E = \tfrac12\dot q\T\dot M\dot q$. The sign of $\dot E$ is the sign of $\dot M_{11}\dot q_1^2 + \dots$, dominated by $\partial M_{11}/\partial q_2\cdot\dot q_2 = -2h\dot q_2$.</>
+      <>So the lie adds energy while the elbow is closing ($\dot q_2 < 0$, $h > 0$) and removes it while the elbow opens. From $(\pi/4, \pi/2)$ gravity first swings the elbow one way; the release pose decides which.</>
+      <>The amber stack in the gauge is $C\dot q$ of the honest model, i.e. the torque the lying model is silently failing to account for. Its sign on joint 2 is the sign of $h\dot q_1^2$.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="Reach3R from three Jacobians">
+    Implement `Reach3R` by assembling $M(q) = \sum_i (m_i J_{c_i}\T J_{c_i} + I_i J_{\omega_i}\T J_{\omega_i})$
+    from three center-of-mass Jacobians, and $g$ from the $y$-rows of the same Jacobians. Add a
+    property test that $M(q)$ is positive definite on 1000 seeded configurations (`SmallRng`), that
+    `skew_symmetry_defect` is below $10^{-6}$ with finite-difference symbols, and that
+    `inverse(forward(q, q̇, τ))` returns $\tau$ to $10^{-9}$. The TypeScript `PlanarArm.reach3R()` does
+    the same with links of 0.6, 0.5, 0.4 m and 1.2, 1.0, 0.8 kg; its check `M(q) is positive definite
+    at 200 seeded configurations of each arm` is the one to match.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Rusty's chassis as a knife-edge (stretch)">
+    Implement Rusty's chassis as a planar rigid body with the no-side-slip Pfaffian constraint of
+    Example 10.3.1 using `constrained_forward_dynamics`. Verify $\lambda$ against eq. (10.28) and
+    show that the reduced two-equation form of Choset p. 361,
+    $\ddot q_1\cos q_3 + \ddot q_2\sin q_3 = (u_1\cos q_3 + u_2\sin q_3)/m$ and $\ddot q_3 = u_3/I$,
+    emerges from $P\ddot q = PM^{-1}u$. Then drive it: with $u_3 \ne 0$ and $u_1 = u_2 = 0$ the body
+    turns in place, and the constraint force $\lambda_1 = -m\dot q_1\dot q_3\cos q_3 - m\dot q_2\dot q_3\sin q_3$
+    is the centripetal force the floor supplies. Chapter 20 will show this constraint cannot be
+    integrated to a constraint on $q$.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 10 is the source of everything here: the Lagrangian recipe, the standard form and Christoffel symbols (§10.2), Pfaffian constraints and the projections P and P_u (§10.3), and Euler's equation in both frames (§10.4). Our 2R arm is Problems 10.2–10.3 worked in full."
+  />
+  <Reference
+    authors="Murray, R. M., Li, Z., and Sastry, S. S."
+    year={1994}
+    title="A Mathematical Introduction to Robotic Manipulation"
+    venue="CRC Press"
+    url="https://www.cds.caltech.edu/~murray/mlswiki/"
+    note="Chapter 4 derives the manipulator equations with the Christoffel symbols in the index convention used here, and proves the skew-symmetry of Ṁ − 2C that this chapter turns into a test oracle."
+  />
+  <Reference
+    authors="Lynch, K. M. and Park, F. C."
+    year={2017}
+    title="Modern Robotics: Mechanics, Planning, and Control"
+    venue="Cambridge University Press"
+    url="http://modernrobotics.org"
+    note="Chapter 8 covers the same dynamics with the Newton–Euler recursion as the computational alternative to the Lagrangian route taken here; written by one of Choset's co-authors."
+  />
+  <Reference
+    authors="Featherstone, R."
+    year={2008}
+    title="Rigid Body Dynamics Algorithms"
+    venue="Springer"
+    doi="10.1007/978-1-4899-7560-7"
+    note="The composite-rigid-body and articulated-body algorithms that build M(q) and solve forward dynamics in O(n) — what replaces our O(n³) Jacobian assembly once an arm has more than a handful of joints."
+  />
+  <Reference
+    authors="Carpentier, J., Saurel, G., Buondonno, G., Mirabel, J., Lamiraux, F., Stasse, O., and Mansard, N."
+    year={2019}
+    title="The Pinocchio C++ library: A fast and flexible implementation of rigid body dynamics algorithms and their analytical derivatives"
+    venue="IEEE/SICE International Symposium on System Integration (SII)"
+    doi="10.1109/SII.2019.8700380"
+    note="A production rigid-body library that assembles the same quantities this chapter hand-rolls, with analytic derivatives — the modern form of the 'build M from link Jacobians' pattern behind Reach3R."
+  />
+  <Reference
+    authors="Hairer, E., Lubich, C., and Wanner, G."
+    year={2006}
+    title="Geometric Numerical Integration: Structure-Preserving Algorithms for Ordinary Differential Equations"
+    venue="Springer Series in Computational Mathematics 31, 2nd edition"
+    doi="10.1007/3-540-30666-8"
+    note="Why RK4 is not symplectic and what symplectic integrators preserve instead — the theory behind the honesty item that the energy-drift bound is empirical."
+  />
+</References>

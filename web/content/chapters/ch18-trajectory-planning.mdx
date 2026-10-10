@@ -1,0 +1,1043 @@
+---
+title: Trajectory Planning
+description: A path is a curve; a trajectory is a curve with a clock. Path-velocity decomposition turns an n-joint arm into a one-dimensional system in the path parameter, the time-optimal clock is a bang-bang curve in the (s, ṡ) phase plane that hugs a velocity-limit curve, zero-inertia points make it slide, TOPP-RA replaces switch hunting with reachable intervals, and Choset's GRID SEARCH plans in (q, q̇) when the path is not fixed.
+chapter: 18
+part: PART V
+partTitle: Dynamics, Trajectories, and Constraints
+difficulty: Advanced
+readingTime: 70 min
+quote: This kind of trajectory is called a “bang-bang” trajectory, and at least one of the actuators is always saturated. The heart of the time-scaling problem is to find the switching points between maximum and minimum acceleration.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §11.2
+---
+
+import { TwoClocksHook } from '@/components/ch/ch18/two-clocks-hook';
+import { PhasePlaneRacer } from '@/components/ch/ch18/phase-plane-racer';
+import { LatticeHopper } from '@/components/ch/ch18/lattice-hopper';
+import { SaturationScope } from '@/components/ch/ch18/saturation-scope';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Substitute a path q(s) into the Chapter 17 equations and reduce an n-DOF arm to a(s) s̈ + b(s) ṡ² + c(s) = u — one degree of freedom in the path parameter',
+    'Read the (s, ṡ) phase plane: motion cones, the velocity-limit curve where the cone collapses, the inadmissible region above it, and why the time-optimal clock is bang-bang',
+    'Run the Time-Scaling Algorithm of Bobrow–Dubowsky–Gibson and Shin–McKay as Choset states it, including the zero-inertia modification and the footnote-3 bisection for tangent points',
+    'Reformulate the same problem as TOPP-RA: reachable intervals in x = ṡ² propagated backward by two-variable linear programs, then a greedy forward pass',
+    'Plan directly in (q, q̇) with Choset\'s GRID SEARCH, state Theorem 11.3.2 precisely, and see A* with a bang-bang heuristic return the same lattice time with far fewer expansions',
+    'Implement the trajectory crate in Rust: Path, PathDynamics, TorqueLimits, time_scale, toppra, lattice_search, and a Trajectory type that no controller can confuse with a Path',
+  ]}
+  prerequisites={[
+    'The standard form M(q) q̈ + C(q, q̇) q̇ + g(q) = u, Christoffel symbols, and the RK4 integrator (Chapter 17)',
+    'Best-first search with a priority knob: breadth-first, Dijkstra, A* (Chapter 6)',
+    'Paths on the torus and the chart lift across the seam (Chapter 5); the planners that produce paths (Chapters 11–13)',
+    'Ordinary differential equations in one variable; the chain rule for q(s(t))',
+  ]}
+>
+Every planner in Parts II and III handed Reach a curve and walked away. The curve had no clock. This
+chapter attaches one, and the first thing it discovers is that the best clock is almost never
+uniform. Run a path at constant speed and some motor pegs where the configuration is heavy and
+idles where it is light; run it on the clock this chapter computes and exactly one motor is at its
+limit at every instant, in turn.
+
+The idea that makes this tractable fits in one sentence. **Once the path is fixed, an $n$-joint
+arm with $n$ torque limits is a one-dimensional system in the path parameter $s$**, and its
+time-optimal execution is a curve in the $(s, \dot s)$ phase plane that hugs a velocity-limit
+curve and switches between maximum and minimum acceleration a finite number of times. A reader who
+can read that phase plane can read every time-scaling result since 1985, including the 2018
+reformulation that replaced switch-point hunting with interval propagation.
+
+The second half of the chapter asks what happens when the path is *not* fixed, and meets the honest
+ancestor of every state-lattice planner: Choset's grid search over $(q, \dot q)$, run here on
+Chapter 6's A\*. It is time-optimal for its own discretization, complete in a precise
+$\epsilon$-sense, and exponential in the number of joints — which is exactly why
+[Chapter 19](/chapters/ch19-trajectory-optimization) lets the path move by optimization instead.
+</Overview>
+
+## The problem: one path, two clocks
+
+Take the spline below — three waypoints on Reach's torus, the arm hanging below its shoulder on a
+vertical Workbench — and execute it twice in the same $0.62$ s. The left arm runs a *uniform*
+clock: accelerate briefly, cruise at constant $\dot s$, brake briefly. The right arm runs the clock
+this chapter computes.
+
+<Figure caption="The same path (purple) on the same arm with the same motors, both finishing in 0.618 s. The uniform clock spends its acceleration where the clock says and pegs a motor; the time-scaled clock spends it where the configuration can afford it, and at every instant exactly one gauge is full and neither exceeds its rail.">
+  <TwoClocksHook />
+</Figure>
+
+Nothing about the curve differs between the two lanes. What differs is $s(t)$: the map from time to
+position along the path. Choset's §11.1 makes the distinction a definition. A **path** is a
+twice-differentiable curve $q : [0, 1] \to \Q$. A **time scaling** is a twice-differentiable,
+monotone map $s : [0, t_f] \to [0, 1]$ with $\dot s > 0$ on $(0, t_f)$. A **trajectory** is their
+composition $q(s(t))$. Uniform time scalings $s(t) = kt$ are a thin subset of the ones allowed, and
+the question of this chapter is: of all admissible clocks, which is fastest?
+
+## Building intuition
+
+### The phase plane is a speed-limit sign that changes every meter
+
+The whole problem lives in one picture. Put $s$ on the horizontal axis and $\dot s$ on the
+vertical. A time scaling is a curve from $(0, \dot s_0)$ to $(1, \dot s_f)$ that never dips below
+$\dot s = 0$. At every state $(s, \dot s)$ the torque limits allow a range of path accelerations
+$L \le \ddot s \le U$ — a *cone* of directions the curve may take. Above a certain speed the cone
+closes: there is no torque vector that keeps the arm on the path. That locus is the
+**velocity-limit curve**, and the region above it is **inadmissible**, hatched amber in the widget
+exactly as a configuration-space obstacle would be — it is an obstacle in $(s, \dot s)$.
+
+<Deferred minHeight={560}>
+  <PhasePlaneRacer />
+</Deferred>
+
+Three things to notice, each of which becomes a theorem in the next section.
+
+**The limit is coupled, not per-joint.** Drag a waypoint so the elbow folds sharply mid-path and the
+amber region dips to a waist. No single joint is near its own speed limit there; what has happened
+is that the centrifugal torque one joint needs, $h\dot q_1^2$, is a torque the other joint's motor
+must supply, and above some $\dot s$ it cannot while the first joint is also braking at full torque.
+The dashed grey ghost is a constant-speed clock; wherever it turns amber, that clock is infeasible,
+and no controller that only looks at the current joint speeds will know why.
+
+**The optimal curve is made of two kinds of arc.** Solid blue curves are integrated forward at the
+maximum acceleration $U$; the dashed blue curve $F$ is integrated backward from the goal at the
+minimum acceleration $L$. The orange profile is a concatenation of pieces of them, switching at the
+ticked points. The fastest trajectory is the one that is *highest* in the plane while staying out
+of the amber: $t_f = \int_0^1 ds/\dot s$, so area under the curve is time saved.
+
+**Zero-inertia points are where the picture changes shape.** The vertical dashed amber lines mark
+$s$ values where some $a_i(s) = (M q')_i$ changes sign: that actuator momentarily cannot change
+$\ddot s$ at all, and instead bounds $\dot s$ directly. The limit curve is continuous through such
+a point but its slope is not, and the optimal profile may have to *slide* along it rather than
+bounce off. Raise both torque limits by a factor of $1.5$ on the default spline and a slide appears
+near $s = 0.57$.
+
+### One motor at a time
+
+The design question most readers bring to this chapter is: "time-optimal means every motor at full
+power, right?" The Saturation Scope answers it with the torque histories of the solution above.
+
+<Deferred minHeight={520}>
+  <SaturationScope />
+</Deferred>
+
+At every instant one strip rides its rail and the other does whatever the coupling demands; the
+switch is the instant the saturated joint changes. Scale the limits to $1.5\times$ and the amber
+stretch is a **singular arc**: the profile slides along the velocity-limit curve with an
+acceleration strictly between $L$ and $U$, and *neither* motor is saturated. Choset's §11.2.1
+derives exactly when that happens and what acceleration to use.
+
+<KeyIdea title="The one-sentence version">
+Fix the path and the $n$ torque limits become $2n$ bounds on a single scalar acceleration
+$\ddot s$. The time-optimal clock maximizes $\dot s$ pointwise subject to those bounds, which makes
+it bang-bang in $\ddot s$ — and finding it is a boundary-value problem in a two-dimensional plane
+that can be drawn, read, and solved by integration.
+</KeyIdea>
+
+<NotationTable
+  rows={[
+    { sym: 's \\in [0, 1],\\; s(t),\\; \\dot s,\\; \\ddot s', meaning: 'Path parameter; the time scaling s : [0, t_f] → [0, 1] and its rates.', note: 'Choset §11.1' },
+    { sym: 'q(s),\\; q\' = dq/ds,\\; q\'\'', meaning: 'The path and its derivatives in s. q\'\' must be continuous — b(s) contains it.' },
+    { sym: 'a(s),\\; b(s),\\; c(s)', meaning: 'Inertial, velocity-product and gravity vectors of the path-constrained dynamics a s̈ + b ṡ² + c = u (eq. 11.6).' },
+    { sym: 'u_i^{\\min} \\le u_i \\le u_i^{\\max}', meaning: 'Actuator limits, possibly state dependent (eq. 11.1). Symmetric constant bounds |u_i| ≤ u_i^max are the default here.' },
+    { sym: '\\alpha_i, \\beta_i;\\; L_i, U_i;\\; L(s,\\dot s), U(s,\\dot s)', meaning: 'Per-actuator acceleration bounds (eq. 11.8), their assignment by the sign of a_i, and the max/min over i (eq. 11.9).' },
+    { sym: 'v(s),\\; \\dot s^{\\max}(s),\\; \\dot s^{\\max}_{zip}(s)', meaning: 'Velocity-limit curve where L = U (eq. 11.10); its generalization through zero-inertia points; the direct bound from a zero-inertia row (eq. 11.11).' },
+    { sym: 'F,\\; A_i,\\; \\mathcal{S} = \\{s_1, s_2, \\dots\\}', meaning: 'The backward minimum-acceleration curve; the forward curves of the construction; the switch list.' },
+    { sym: '(s_{lim}, \\dot s_{lim}),\\; (s_{tan}, \\dot s_{tan}),\\; \\ddot s^{\\pm}_{tangent}', meaning: 'Where A_i penetrates the limit curve; the tangent point found from it; the left and right tangent accelerations at a singular point.' },
+    { sym: 'x = \\dot s^2', meaning: 'Squared path speed — the variable in which every actuator limit is linear (TOPP-RA).', note: 'Pham & Pham 2018' },
+    { sym: 'h,\\; \\mathcal{A},\\; \\mathcal{A}(q, \\dot q),\\; \\hat{\\mathcal{A}}', meaning: 'Lattice timestep; the discretized control set {−a_max, 0, a_max}ⁿ; the feasible-acceleration parallelepiped of a manipulator and its one-step conservative subset.', note: 'Choset §11.3.3' },
+    { sym: '\\delta_v(c_0, c_1),\\; \\epsilon,\\; T_{opt}', meaning: 'Speed-dependent safety margin c₀ + c₁‖q̇‖; the approximation parameter of Theorem 11.3.2; the optimal time.' },
+  ]}
+/>
+
+## The mathematics
+
+### Definitions
+
+**Path, time scaling, trajectory** are as in the hook: $q : [0,1] \to \Q$ twice differentiable;
+$s : [0, t_f] \to [0,1]$ twice differentiable and monotone with $\dot s > 0$ on the open interval;
+the trajectory is $q(s(t))$. Twice differentiability of $s$ is what makes $\ddot q$ exist and be
+bounded, which is what makes torque finite.
+
+**The motion cone** at $(s, \dot s)$ is the set of tangent directions of curves through that state
+whose path acceleration satisfies $L(s, \dot s) \le \ddot s \le U(s, \dot s)$. The state is
+**inadmissible** when $L > U$: the cone is empty and the robot is doomed to leave the path
+immediately. At an admissible state the robot may still be doomed *eventually*, if every curve
+inside the cones from there reaches the inadmissible region (Choset's figure 11.2).
+
+**The velocity-limit curve** $v(s)$ is the locus where $L = U$ — the cone collapses to one vector.
+It is computed by equating $L_i = U_j$ for every pair of actuators, solving each for $\dot s$, and
+keeping the minimum.
+
+**A bang-bang time scaling** has $\ddot s \in \{L, U\}$ at every instant except possibly on
+singular arcs. At least one actuator is saturated at all times.
+
+**Zero-inertia, critical, singular.** A point where $a_i(s) = 0$ for some $i$ is a *zero-inertia
+point*: actuator $i$ cannot affect $\ddot s$ and instead bounds $\dot s$ directly. A point of the
+limit curve $\dot s^{\max}$ set by such a bound is *critical* ($L < U$ there, unlike on $v$). A
+critical point from which integrating $U$ forward or $L$ backward penetrates the limit curve
+immediately is *singular*.
+
+**A $\delta_v(c_0, c_1)$-safe trajectory** keeps clearance at least $c_0 + c_1\|\dot q\|$ from every
+obstacle at every instant — the faster, the wider the berth.
+
+### Path-constrained dynamics
+
+<KeyIdea title="Statement (Choset eqs. 11.2–11.6)">
+Along $q(s)$, the standard form $M\ddot q + \dot q\T\Gamma\dot q + g = u$ becomes
+<LinkedMath>
+$$
+\htmlClass{term-robot}{a(s)}\,\ddot s + \htmlClass{term-cobstacle}{b(s)}\,\dot s^2 + c(s) = u,
+\qquad a = M(q)\,q',\quad b = M(q)\,q'' + q'\T\,\Gamma(q)\,q',\quad c = g(q).
+$$
+</LinkedMath>
+</KeyIdea>
+
+<Derivation title="Substituting the path into the Chapter 17 equations" result="a(s)\ddot s + b(s)\dot s^2 + c(s) = u">
+**Step 1 — the chain rule.** With $q = q(s(t))$,
+$\dot q = q'\dot s$ and $\ddot q = q''\dot s^2 + q'\ddot s$ (eqs. 11.2–11.3). The first is linear
+in $\dot s$; the second has a term in $\dot s^2$ and a term in $\ddot s$, and nothing else.
+
+**Step 2 — substitute.** Into $M(q)\ddot q + \dot q\T\Gamma(q)\dot q + g(q) = u$:
+$$
+M\,(q''\dot s^2 + q'\ddot s) + (q'\dot s)\T\,\Gamma\,(q'\dot s) + g = u .
+$$
+
+**Step 3 — group by powers of the clock.** The velocity-product term is bilinear in $\dot q$, so
+the two factors of $\dot s$ come out as $\dot s^2$:
+$$
+\underbrace{M q'}_{a(s)}\,\ddot s + \underbrace{\big(M q'' + q'\T\Gamma q'\big)}_{b(s)}\,\dot s^2 + \underbrace{g}_{c(s)} = u .
+$$
+Every coefficient depends on $s$ alone. The $n$ equations now constrain one scalar unknown
+$\ddot s$ at each state $(s, \dot s)$ — that is the whole content of path-velocity decomposition.
+
+**The velocity-product piece of $b$ is exactly Chapter 17's `velocityProduct(q, q′)`**, the vector
+$C(q, \dot q)\dot q$ evaluated at $\dot q = q'$. No new physics is computed here; the library
+function `PathDynamics::abc` calls the Chapter 17 model and does the two matrix–vector products.
+
+**Why $b_i$ can vanish when $a_i$ does not, and vice versa (Choset Problem 11.5).** $a_i = (Mq')_i$
+is zero when the path's tangent is orthogonal, in the $M$-metric's $i$-th row, to joint $i$ — the
+RP arm's prismatic joint at the midpoint of a straight Cartesian line, where the radial velocity is
+momentarily zero. $b_i$ collects $M q''$ and the centrifugal/Coriolis terms, which can vanish on a
+straight segment ($q'' = 0$) with no Coriolis coupling even where $a_i \ne 0$. The micro-example
+below has $b_1 = 0$ and $a_1 = \pi$ at every $s$; Choset's RP arm has $a_2(\tfrac12) = 0$ and
+$b_2 \equiv 0$.
+</Derivation>
+
+**The micro-example.** Reach from the Chapter 17 micro-example ($L_i = 1$, $r_i = \tfrac12$,
+$m_1 = 2$, $m_2 = 1$, $I_1 = \tfrac16$, $I_2 = \tfrac1{12}$) on a *horizontal* Workbench
+($a_g = 0$), joint 2 held at $\pi/2$ by its own motor while joint 1 sweeps a quarter turn:
+$q(s) = (\pi s/2,\ \pi/2)$, so $q' = (\pi/2, 0)$, $q'' = 0$, and $M$ is constant along the path with
+$M = \big[\begin{smallmatrix} 2 & 1/3 \\ 1/3 & 1/3 \end{smallmatrix}\big]$ from Chapter 17. Then
+
+$$
+a(s) = M q' = \big(\pi,\ \tfrac{\pi}{6}\big) = (3.1416,\ 0.5236),\qquad
+b(s) = \big(\Gamma^1_{11},\ \Gamma^2_{11}\big)\,\tfrac{\pi^2}{4} = (0,\ 0.5 \cdot 2.4674) = (0,\ 1.2337),\qquad
+c(s) = 0 .
+$$
+
+Joint 2's $b_2 = h\,(q_1')^2$ is the centrifugal torque the elbow motor must supply to keep the elbow
+at $\pi/2$ while the shoulder swings — the coupling that will set the speed limit.
+
+### Acceleration bounds and the velocity-limit curve
+
+<KeyIdea title="Statement (Choset eqs. 11.8–11.10)">
+With $\alpha_i = (u_i^{\max} - b_i\dot s^2 - c_i)/a_i$ and $\beta_i$ the same with $u_i^{\min}$:
+$U_i = \alpha_i, L_i = \beta_i$ if $a_i > 0$ and swapped if $a_i < 0$;
+$L = \max_i L_i$, $U = \min_i U_i$; the feasible set is $L \le \ddot s \le U$, and it is empty above
+$v(s) = \min_{i \ne j} \dot s_{ij}(s)$ where $\dot s_{ij}$ solves $L_i = U_j$.
+</KeyIdea>
+
+<Derivation title="From torque limits to a cone, and from the cone to the curve" result="L(s,\dot s) \le \ddot s \le U(s,\dot s);\quad v(s) = \min_{i,j}\dot s_{ij}(s)">
+**Step 1 — isolate $\ddot s$ in each row.** Row $i$ of $u^{\min} \le a\ddot s + b\dot s^2 + c \le u^{\max}$
+reads $u_i^{\min} - b_i\dot s^2 - c_i \le a_i\ddot s \le u_i^{\max} - b_i\dot s^2 - c_i$.
+
+**Step 2 — divide, and flip if negative.** Dividing by $a_i > 0$ gives $\beta_i \le \ddot s \le \alpha_i$.
+Dividing by $a_i < 0$ reverses the inequality: $\alpha_i \le \ddot s \le \beta_i$. That swap is the
+whole content of eq. 11.8, and it is why the sign of $a_i$ matters: a joint whose coordinate
+decreases along the path has its "maximum torque" bound on the *low* side of $\ddot s$.
+
+**Step 3 — intersect the intervals.** $\ddot s$ must satisfy all $n$ rows, so it lies in
+$[\max_i L_i, \min_i U_i] = [L, U]$. Each $L_i$ and $U_i$ is an affine function of $x = \dot s^2$ at
+fixed $s$: $L_i = p_i + m_i x$ with $m_i = -b_i/a_i$. The max of affine functions is convex and
+piecewise affine; the min is concave. Neither is smooth, so neither is $v$.
+
+**Step 4 — the boundary of admissibility.** The cone is empty when $L > U$, i.e. when some
+$L_i > U_j$. At fixed $s$, as $\dot s$ grows from zero, the first value at which some pair crosses,
+$L_i(\dot s) = U_j(\dot s)$, is where admissibility is lost. Because each side is affine in $x$,
+the crossing is in closed form, $x_{ij} = (p^U_j - p^L_i)/(m^L_i - m^U_j)$, and $v(s) = \min$ over
+pairs of $\sqrt{x_{ij}}$ taken over positive roots. The minimum rule is exact rather than heuristic:
+if any $L_i = U_j$ then $L \ge L_i = U_j \ge U$, so the state is already on or past the boundary.
+
+**What the closed form assumes (Choset footnote 2).** That $\dot s = 0$ is admissible for every $s$
+— the robot can hold any configuration statically — and that admissibility is lost at most once as
+$\dot s$ grows. Friction, weak actuators, or velocity-dependent limits can violate this and create
+inadmissible *islands* in the plane. The algorithm below ignores islands; the library reports the
+first assumption's failure as an error rather than guessing.
+
+**A check that is not a frozen number.** `velocityLimit` is compared against a brute-force scan of
+$L \le U$ with bisection on $150$ seeded random $(a, b, c)$ rows in two and three dimensions; the
+worst disagreement is $4 \times 10^{-14}$.
+</Derivation>
+
+Back to the micro-example, limits $|\tau_1| \le 20$, $|\tau_2| \le 12$ N·m. Joint 1:
+$U_1 = 20/\pi = 6.366$, $L_1 = -6.366$, independent of $\dot s$ because $b_1 = c_1 = 0$. Joint 2:
+$U_2 = (12 - 1.2337\dot s^2)/0.5236 = 22.918 - 2.3562\dot s^2$ and $L_2 = -22.918 - 2.3562\dot s^2$.
+The only pair that can collapse is $L_1 = U_2$:
+$-6.366 = 22.918 - 2.3562\dot s^2$, so $\dot s^2 = 12.429$ and
+
+$$
+v(s) = 3.5254 \quad\text{for every } s
+$$
+
+— a joint-1 speed of $5.54$ rad/s. Faster than this, the elbow motor cannot supply the centrifugal
+torque $h\dot q_1^2$ while the shoulder brakes at full torque. Lower $\tau_2^{\max}$ to $10$ N·m and
+$v$ drops to $3.2875$; the library pins both.
+
+### Time optimality is bang-bang
+
+<KeyIdea title="Statement">
+$t_f = \int_0^1 ds/\dot s$, so the time-optimal scaling maximizes $\dot s$ pointwise subject to the
+cones; its phase-plane curve follows a cone boundary ($\ddot s = U$ or $\ddot s = L$) except possibly
+at zero-inertia points, and at least one actuator is saturated at all times.
+</KeyIdea>
+
+<Derivation title="Why the optimum rides the cone boundary" result="\ddot s \in \{L, U\}\ \text{except on singular arcs}">
+**Step 1 — higher is faster.** For two admissible curves $\dot s_a(s) \ge \dot s_b(s)$ on $[0, 1]$,
+$\int ds/\dot s_a \le \int ds/\dot s_b$. Time is monotone in the curve's height, so the optimum is
+the pointwise-highest admissible curve.
+
+**Step 2 — a tangent strictly inside the cone is wasteful.** If at some state the curve's slope
+$d\dot s/ds = \ddot s/\dot s$ lies strictly between $L/\dot s$ and $U/\dot s$, one can raise the
+curve locally — accelerate harder before, brake harder after — without leaving admissibility, and
+the new curve is higher. So on an optimal curve the tangent is on the boundary almost everywhere.
+
+**Step 3 — the reachable set is bounded by two integral curves.** From any state, the set of all
+curves with tangents inside the cones is bounded above by the $U$-integral curve and below by the
+$L$-integral curve (Choset's figure 11.2). The optimum is therefore a concatenation of pieces of
+$U$- and $L$-curves.
+
+**Step 4 — where the switches are.** The pieces meet where a $U$-curve crosses an $L$-curve, or
+where the limit curve forces a change: a $U$-curve that would penetrate the amber must have been
+abandoned earlier for an $L$-curve that grazes the limit tangentially. Finding those points is the
+algorithm.
+
+**The Pontryagin reading.** [Chapter 19](/chapters/ch19-trajectory-optimization) derives the same
+result from the minimum principle: for a minimum-time problem the Hamiltonian is affine in the
+control, $\partial H/\partial u$ contains no $u$, and $H$ is minimized at a bound of the control set.
+Choset's §11.3.1 makes the connection explicit for the double integrator, where the switch is at
+$t_s = \sqrt{d/u_{\max}}$ — the same number the lattice reproduces below.
+</Derivation>
+
+The micro-example never touches its limit curve. With constant $U_1 = 6.366$ and $L_1 = -6.366$ the
+$A_0$ curve is $x = \dot s^2 = 2 \cdot 6.366\,s$ and $F$ is $x = 2 \cdot 6.366\,(1 - s)$; they cross at
+$s = \tfrac12$ with $\dot s = \sqrt{6.366} = 2.5231 < 3.5254$. One switch, at
+
+$$
+t_s = \sqrt{2 \cdot 0.5 / 6.366} = 0.3963\ \text{s},\qquad t_f = 2 t_s = 0.7927\ \text{s}.
+$$
+
+Joint 2 is honest at the peak: during acceleration
+$\tau_2 = a_2 U_1 + b_2\dot s^2 = 0.5236 \cdot 6.366 + 1.2337 \cdot 6.366 = 11.19 < 12$ N·m. That is
+Choset's Example 11.2.1 situation — the limit curve never reached, one switch — on this book's arm.
+Turn gravity on ($a_g = 9.81$) and at $s = \tfrac12$ the gravity vector is $c = (10.405, -3.468)$,
+giving $U_1 = 3.054$, $L_1 = -9.678$ and $v(\tfrac12) = 4.080$; at $s = 0$ the shoulder's gravity
+torque is $c_1 = 19.62$ N·m against a $20$ N·m limit, so $U_1(0) = 0.1210$ — the arm can barely lift,
+and the whole motion takes $2.3276$ s with its single switch pushed out to $s = 0.7342$.
+
+### Zero-inertia points and singular arcs
+
+<KeyIdea title="Statement (Choset §11.2.1)">
+Where $a_i(s) = 0$, row $i$ becomes the direct velocity bound
+$u_i^{\min} \le b_i\dot s^2 + c_i \le u_i^{\max}$, giving $\dot s^{\max}_{zip}(s)$; the true limit
+is $\dot s^{\max} = \min(v, \dot s^{\max}_{zip})$. At a singular point the feasible accelerations are
+$\ddot s_{\max} = \min(\ddot s^{+}_{tangent}, U)$ and $\ddot s_{\min} = \max(\ddot s^{-}_{tangent}, L)$
+with $\ddot s_{tangent} = \dot s^{\max}\,d\dot s^{\max}/ds$.
+</KeyIdea>
+
+<Derivation title="Sliding along the limit curve" result="\ddot s_{\max} = \min(\ddot s^{+}_{tangent}, U),\quad \ddot s_{\min} = \max(\ddot s^{-}_{tangent}, L)">
+**Step 1 — the row loses its $\ddot s$.** With $a_i = 0$, row $i$ of eq. 11.7 reads
+$u_i^{\min} \le b_i\dot s^2 + c_i \le u_i^{\max}$. Nothing the actuator does changes $\ddot s$; the
+constraint is on $\dot s$ alone. Solving for $\dot s$ gives $\dot s^{\max}_{zip}$ (eq. 11.11). If
+$b_i = 0$ too, the row constrains nothing — provided the robot can hold the configuration, which is
+Choset's Problem 11.6 and the standing assumption.
+
+**Step 2 — a critical point is not a collapsed cone.** On $v(s)$ the cone is a single vector,
+$L = U$. At a point of $\dot s^{\max}$ set by a zero-inertia bound, $L < U$: the cone is open, but it
+may point out of the admissible region.
+
+**Step 3 — clip to the tangent.** Following $U$ forward from a singular point penetrates the limit
+curve; the fastest admissible acceleration is the one that keeps the state *on* the curve, which is
+the curve's tangent in the $(s, \dot s)$ plane: $d\dot s/dt = \ddot s = \dot s\,d\dot s^{\max}/ds$.
+Hence $\ddot s_{\max} = \min(\ddot s^{+}_{tangent}, U)$, with the right-hand derivative where the
+curve has a corner, and symmetrically $\ddot s_{\min} = \max(\ddot s^{-}_{tangent}, L)$ for the
+backward integration.
+
+**Step 4 — singular arcs.** Critical points lie where $M(q)$ loses rank along the path's tangent, a
+lower-dimensional set; a path crossing it transversally has isolated critical points, a path moving
+along it has a *critical arc*. Integrating $\ddot s_{\max}$ and $\ddot s_{\min}$ instead of $U$ and
+$L$ lets the algorithm slide along such an arc with an acceleration strictly between $L$ and $U$,
+rather than chattering between them — and on a slide neither actuator is saturated.
+
+**In $x = \dot s^2$ the rule is a one-liner.** The library integrates in $x$, where a stage from
+$s_k$ to $s_{k+1}$ with constant $\ddot s$ moves $x$ by $2\ddot s\,\Delta$. When the free step would
+land above $x_{\max}(s_{k+1})$, the stage acceleration that lands exactly on the curve is
+$u^* = (x_{\max} - x_k)/(2\Delta)$; if $u^*$ is inside the cone the stage slides, otherwise it
+penetrates. At a critical point that is Choset's rule; at an ordinary point of $v$ the collapsed
+cone makes the test pass only when the integral curve is tangent to the limit — which is the
+tangent-point condition of step 4 of the algorithm, found for free.
+</Derivation>
+
+**Choset's RP arm, honestly.** Example 11.2.1 runs the RP arm of Chapter 17's Example 10.1.2
+($m_1 = 5$, $I_1 = 0.1$, $r_1 = 0.2$, $m_2 = 3$, $I_2 = 0.05$, $a_g = 9.8$) along the straight
+Cartesian line $x(s) = (2s - 1, 1)$ with limits $\pm 20$ N·m and $\pm 40$ N. The path has
+$a_2(\tfrac12) = 0$ with $b_2 \equiv 0$ — a zero-inertia point that imposes no velocity bound, the
+case of Problem 11.5. Choset reports a minimum time of approximately $0.888$ s with one switch.
+With the printed parameters, however, the gravity torque on joint 1 at either end of the path is
+$a_g(m_1 r_1 + m_2\sqrt 2)\cos(\pi/4) = 36.33$ N·m against a $20$ N·m limit, so $U(0, 0) = -2.572$
+and $L(1, 0) = +2.572$: the arm can neither start forward from rest nor come to rest at the end,
+and both algorithms in this chapter report that the rest-to-rest problem has no solution — Choset's
+Problems 11.3 and 11.4 in the flesh. The $0.888$ s figure is not reproducible from the printed
+parameters. The library's cross-check therefore asserts the diagnosis, and reports the gravity-free
+execution: one switch at $s = \tfrac12$ and $t_f = 1.1445$ s, with TOPP-RA agreeing to the grid.
+
+### GRID SEARCH is optimal for its discretization
+
+<KeyIdea title="Statement (Choset Algorithm 21, Theorem 11.3.2)">
+For $\ddot q_i = a_i$ with $a_i \in \{-a_{\max}, 0, a_{\max}\}$ held for time $h$, every reachable
+state lies on a lattice with spacing $a_{\max}h$ in $\dot q$ and $\tfrac12 a_{\max}h^2$ in $q$;
+breadth-first expansion by level returns the fewest-steps safe trajectory. For a point robot in
+$n \in \{2, 3\}$ dimensions among polyhedral obstacles, if a $\delta_v(c_0, c_1)$-safe trajectory of
+duration $T_{opt}$ exists, then with $h \le v_{\max}/a_{\max}$ and
+$h \le c_0\epsilon/(2a_{\max}c_1(1 - \epsilon) + 5v_{\max})$ the search returns a
+$(1 - \epsilon)\delta_v$-safe trajectory of duration at most $T_{opt}$ from an $O(\epsilon)$-perturbed
+start to an $O(\epsilon)$ goal neighborhood, in time $O((1/\epsilon)^{3n})$.
+</KeyIdea>
+
+<Derivation title="Why the tree is a grid, and what the theorem buys" result="O((1/\epsilon)^{3n}),\ \text{time} \le T_{opt},\ (1-\epsilon)\delta_v\text{-safe}">
+**Step 1 — closure under the control set.** Integrating $\ddot q_i = c\,a_{\max}$, $c \in \{-1, 0, 1\}$,
+for time $h$ from $(q_i, \dot q_i)$ gives $\dot q_i + c\,a_{\max}h$ and
+$q_i + \dot q_i h + \tfrac12 c\,a_{\max}h^2$. Write $\dot q_i = m\,a_{\max}h$ and
+$q_i = p\cdot\tfrac12 a_{\max}h^2$ with integers $m, p$; then the new indices are $m + c$ and
+$p + 2m + c$ — integers again. Every node of Choset's figure 11.8 lies on the grid of figure 11.9,
+and the tree is really a graph on that grid.
+
+**Step 2 — level is time.** Each edge takes exactly $h$, so breadth-first expansion is uniform-cost
+search with unit edges, and the first level at which a node enters the goal region is the minimum
+number of steps: time-optimal for the chosen discretization of time and controls. A* with an
+admissible heuristic pops the same level with fewer expansions. The per-axis continuous bang-bang
+time $\max_i T_i$ is admissible because it ignores the other axes, the obstacles, the velocity
+limit and the discretization — every one of which can only make the lattice slower.
+
+**Step 3 — safety absorbs the discretization.** Any continuous $\delta_v$-safe trajectory can be
+tracked by lattice moves within an error that shrinks with $h$; the margin $c_0 + c_1\|\dot q\|$ is
+spent on that error, leaving $(1 - \epsilon)\delta_v$. The two bounds on $h$ are what make the
+bookkeeping close — the first keeps $v_{\max}$ an integer multiple of $a_{\max}h$, the second ties
+the tracking error to the margin.
+
+**Step 4 — the grid is finite, so the time is bounded.** The configuration-space diameter, the
+velocity bound and $h$ fix the number of lattice points, which is $O((1/\epsilon)^{3n})$ once $h$
+is expressed through $\epsilon$. Polynomial in $\epsilon$, exponential in $n$: nobody has run this
+beyond a few degrees of freedom, and Choset says so.
+
+**What the theorem does not say.** The $(1 - \epsilon)\delta_v$-safe trajectory the algorithm finds
+may look nothing like the true time-optimal $\delta_v$-safe one; the only promise is about its
+duration. And the proof — Donald and Xavier's — is beyond this chapter as it is beyond Choset's.
+
+**The manipulator generalization (Choset pp. 396–399).** For $M(q)\ddot q + C\dot q + g = u$ with box
+torque limits, the feasible accelerations at a state form a parallelepiped $\mathcal{A}(q, \dot q)$
+that changes during the step and collapses where $M^{-1}$ loses rank. A bound on the largest
+eigenvalue of $M$ keeps it from collapsing; a bound on $\dot M$ gives a conservative subset
+$\hat{\mathcal{A}} \subset \mathcal{A}$ feasible over the whole step; the controls are the
+$\ddot q$ grid points inside $\hat{\mathcal{A}}$. The completeness result survives with
+$(1 + \epsilon)T_{opt}$ in place of $T_{opt}$; the running time stays exponential in $n$.
+</Derivation>
+
+<Deferred minHeight={560}>
+  <LatticeHopper />
+</Deferred>
+
+The hand trace Choset's figure 11.9 invites: $a_{\max} = 1$, $h = \tfrac12$, from rest at $0$ to rest
+at $1$. The lattice has $\Delta\dot q = 0.5$ and $\Delta q = 0.125$; the goal is $p = 8$. The search
+returns the four-level sequence $(+1, +1, -1, -1)$ — velocities $0.5, 1.0, 0.5, 0$ and positions
+$0.125, 0.5, 0.875, 1.0$ — in $t_f = 2$ s, which is the continuous $2\sqrt{d/a_{\max}}$ exactly, and
+the $81$ control sequences of length four collapse to $49$ distinct lattice states. For the widget's
+default $d = 2$ the continuous bound is $2\sqrt 2 = 2.828$ s; the lattice returns $3$ s at
+$h \in \{1, \tfrac12, \tfrac14\}$ and $2.875$ s at $h = \tfrac18$ (23 levels). Finer is never slower,
+and never faster than the bound.
+
+### TOPP-RA: reachability on squared speed
+
+<KeyIdea title="Statement (Pham & Pham 2018)">
+With $x = \dot s^2$ and $u = \ddot s$, $dx/ds = 2u$, and each actuator limit
+$u_i^{\min} \le a_i u + b_i x + c_i \le u_i^{\max}$ is *linear* in $(x, u)$ at fixed $s$. On a grid
+$s_0 < \dots < s_N$ with $x_{k+1} = x_k + 2u_k\Delta_k$, the set of $x_k$ from which some feasible
+$u_k$ lands $x_{k+1}$ in a target interval is itself an interval, computable by two two-variable
+linear programs. A backward pass yields the controllable intervals $K_k$; a greedy forward pass
+picking the largest feasible $x_{k+1} \in K_{k+1}$ is time-optimal for the discretization.
+</KeyIdea>
+
+<Derivation title="Interval propagation instead of switch hunting" result="K_k = \{x \ge 0 : \exists u\ \text{feasible at } k,\ x + 2u\Delta_k \in K_{k+1}\};\quad x_{k+1} = \max"
+>
+**Step 1 — the substitution.** $\tfrac{d}{ds}\dot s^2 = 2\dot s\,\tfrac{d\dot s}{ds} = 2\ddot s$.
+In $x$ the kinematics are linear and a constant-$\ddot s$ stage is a straight line; the micro-example's
+switch at $s = \tfrac12$ lands on the grid exactly, and $\dot s = 0$ is no longer a singularity of
+the integration.
+
+**Step 2 — convexity of the stage constraint set.** At fixed $s_k$ the $2n$ inequalities in
+$(x_k, u_k)$ are half-planes, and $x_{k+1} = x_k + 2u_k\Delta$ is affine. The feasible set is a
+convex polygon; its projection onto the $x_k$ axis is an interval.
+
+**Step 3 — propagate backward.** $K_N = [x_f, x_f]$. Given $K_{k+1} = [\ell, h]$, add the two
+half-planes $\ell \le x_k + 2u_k\Delta \le h$ and take the minimum and maximum of $x_k$ over the
+polygon — two two-variable LPs, solved exactly by vertex enumeration since there are at most
+$2n + 6$ half-planes. The result is $K_k$, the set of states at $s_k$ from which the goal is still
+reachable: the complement of Choset's "doomed" states, computed without ever drawing a curve.
+
+**Step 4 — greedy forward is optimal.** A larger $x_k$ never shrinks the reachable set downstream
+(controllability is monotone in $x$ under these constraints), so choosing the largest admissible
+$x_{k+1} \in K_{k+1}$ at each stage dominates every other choice pointwise, and pointwise-highest
+is fastest by the first derivation.
+
+**What it sidesteps.** No tangent points, no root finding, no footnote-3 bisection, no special
+case for zero-inertia rows — a row with $a_i = 0$ is just a half-plane with no $u$ in it. The price
+is a grid: the answer is optimal for the discretization, and the stage constraints are enforced at
+$s_k$ only. On the chapter's seeded gravity-loaded splines at $N = 800$ the two constructions agree
+on $t_f$ to $0.38\%$ at worst, and they agree on which problems have no solution at all.
+</Derivation>
+
+## The algorithm
+
+Choset's five steps, with the §11.2.1 modification and the footnote-3 bisection that this chapter's
+implementation uses in step 4. The construction is drawn live in w18.1: $F$ dashed, each $A_i$
+solid, the hit points in amber.
+
+<Algorithm
+  name="time_scale(a, b, c, u_min, u_max, ṡ₀, ṡ_f)"
+  inputs="path-constrained dynamics on a grid s_k = k/N, actuator limits, boundary speeds"
+  outputs="switch list 𝒮, the profile (s_k, ṡ_k), t_f — or StallsAtZero / NoSolution / LimitIsland"
+  complexity="O(N) stages per curve; O(N log(1/tol)) per switch for the bisection"
+>
+1. $\mathcal{S} \leftarrow \{\}$, $i \leftarrow 0$, $(s_i, \dot s_i) \leftarrow (0, \dot s_0)$. Tabulate $\dot s^{\max}(s_k) = \min(v, \dot s^{\max}_{zip}, \dot s^{\max}_{rate})$ and fail with NoSolution if any $\dot s^{\max}(s_k) \le 0$ (the robot cannot hold that configuration).
+2. **Backward curve $F$.** Integrate $\ddot s = L$ backward from $(1, \dot s_f)$ until the limit curve is penetrated (record the hit), $s = 0$, or $\dot s = 0$ at $s < 1$ — in which case return StallsAtZero (Problem 11.3). A stage that would penetrate but can land on the curve with $\ddot s_{\min} = \max(\ddot s^{-}_{tangent}, L)$ slides instead.
+3. **Forward curve $A_i$.** Integrate $\ddot s = U$ forward from $(s_i, \dot s_i)$, sliding with $\ddot s_{\max} = \min(\ddot s^{+}_{tangent}, U)$ where allowed, until it crosses $F$ — append the crossing $s$ to $\mathcal{S}$ and **return** — or penetrates the limit curve at $(s_{lim}, \dot s_{lim})$. If it reaches $s = 1$ below $\dot s_f$ or reaches $\dot s = 0$, return NoSolution (Problem 11.4).
+4. **Tangent point (footnote 3).** On the line $s = s_{lim}$ bisect on $\dot s' \in [0, \dot s_{lim}]$ for the highest $L$-curve from $(s_{lim}, \dot s')$ that does not penetrate the limit curve; its point of closest approach is $(s_{tan}, \dot s_{tan})$ — a tangent point, or a critical point. Integrate $\ddot s = L$ backward from $(s_{lim}, \dot s')$ until it rises above $A_i$; the crossing $s_{i+1}$ is a max→min switch — append it. If it reaches $\dot s = 0$ or passes below the start, return NoSolution: the start state is doomed (figure 11.2).
+5. $(s_{i+2}, \dot s_{i+2}) \leftarrow (s_{tan}, \dot s_{tan})$ is a min→max switch — append it, set $i \leftarrow i + 2$, go to 3. A min→max switch immediately followed by a max→min at the same node is a slide, not a switch, and is removed from $\mathcal{S}$.
+</Algorithm>
+
+Two implementation choices matter. The curves are integrated in $x = \dot s^2$ by RK4 on the uniform
+grid, with the stage states clamped to the admissible region at the half-grid nodes — next to a
+zero-inertia point a stage that lands a hair above the limit would otherwise read a bound
+$n_i/a_i$ with $a_i \approx 0$ and drive $x$ negative. And the bisection in step 4 replaces the
+slope test $dv/ds = U/v$ of Choset's main text: it never selects a tangent point whose own
+deceleration curve is doomed, which the slope test can, and it costs about $48$ extra $L$-curve
+integrations per switch.
+
+<Algorithm
+  name="toppra(a, b, c, u_min, u_max, grid)"
+  inputs="path-constrained dynamics tabulated at s_0 < … < s_N, limits, ṡ₀, ṡ_f"
+  outputs="controllable sets K_k, the greedy profile x_k, t_f — or the first k at which K_k is empty"
+  complexity="O(N) two-variable LPs backward, O(N) forward"
+>
+1. $K_N \leftarrow [\dot s_f^2, \dot s_f^2]$.
+2. for $k = N-1$ down to $0$: half-planes $u_i^{\min} \le a_i u + b_i x + c_i \le u_i^{\max}$ at $s_k$, plus $x \ge 0$ and $K_{k+1}^{lo} \le x + 2u\Delta_k \le K_{k+1}^{hi}$; $K_k \leftarrow [\min x, \max x]$ over the polygon's vertices. If empty, report no solution from $s_k$.
+3. if $\dot s_0^2 \notin K_0$: no solution (the start is doomed).
+4. for $k = 0$ to $N-1$: $u_k \leftarrow$ the largest $u$ feasible at $(s_k, x_k)$ with $x_k + 2u\Delta_k \in K_{k+1}$; $x_{k+1} \leftarrow x_k + 2u_k\Delta_k$.
+5. $t_f \leftarrow \sum_k 2\Delta_k/(\sqrt{x_k} + \sqrt{x_{k+1}})$.
+</Algorithm>
+
+<Algorithm
+  name="GRID SEARCH((q*_start, q̇*_start), G, 𝒜, h)  —  Choset Algorithm 21"
+  inputs="lattice start state, goal region, control set {−a_max, 0, a_max}ⁿ, timestep"
+  outputs="a piecewise-constant-acceleration trajectory to G, or FAILURE"
+  complexity="O((1/ε)^{3n}) — Theorem 11.3.2"
+>
+1. place the start at the root of $T$ (level 0); $level \leftarrow 0$, $solved \leftarrow$ false
+2. while not $solved$: if level $level$ is empty return FAILURE
+3. for each node in level $level$, for each control in $\mathcal{A}$: integrate the control for time $h$, getting $newnode$
+4. if $newnode$ is new, and the arc neither passes within $c_0 + c_1\|\dot q\|$ of an obstacle nor exceeds $v_{\max}$: add it as a child
+5. if the arc enters $G$: $solved \leftarrow$ true, store $newnode$
+6. $level \leftarrow level + 1$
+7. return the stored trajectory that reaches $G$ first
+</Algorithm>
+
+<Algorithm
+  name="lattice_search(start, goal, a_max, v_max, h, safe)  —  ours"
+  inputs="the same, as integer lattice coordinates (p, m) with q = p·½a_max h², q̇ = m·a_max h"
+  outputs="the same trajectory, with a count of expansions"
+  complexity="same worst case; in practice 10–700× fewer expansions than breadth-first on the chapter's instances"
+>
+1. graph: node $(p, m)$; neighbors $(p + 2m + c,\ m + c)$ for $c \in \{-1, 0, 1\}^n$, kept if the quadratic arc is safe and $|(m + c)\,a_{\max}h| \le v_{\max}$; every node inside $G$ shares one key
+2. heuristic $h(p, m) \leftarrow \max_i T_i$, the per-axis continuous bang-bang time to the goal — admissible and consistent
+3. Chapter 6's `BestFirst` with $f = g + h$; breadth-first is the same engine with $f =$ link length
+4. return the back-pointer path; controls are $\Delta m$ between consecutive states
+</Algorithm>
+
+## Implementation in Rust
+
+The `trajectory` crate is introduced here and imported by Chapters 19, 21 and 23. Its surface is
+a `Path` trait, the path-constrained dynamics, the limits, two time scalers, the lattice, and one
+type — `Trajectory` — whose whole job is to be a different type from `Path`.
+
+```rust title="crates/trajectory/src/path.rs"
+use nalgebra::SVector;
+
+/// A twice-differentiable curve q : [0, 1] → Q. `ddq` must be *continuous*: the
+/// velocity-product term b(s) contains M q'', and a C¹ spline would make it jump
+/// at every knot — the phase plane would grow a fence of fake zero-inertia points.
+pub trait Path<const N: usize> {
+    fn q(&self, s: f64) -> SVector<f64, N>;
+    fn dq(&self, s: f64) -> SVector<f64, N>;
+    fn ddq(&self, s: f64) -> SVector<f64, N>;
+}
+
+/// A straight line in the chart; ddq ≡ 0. The micro-example's path.
+pub struct Segment<const N: usize> { pub a: SVector<f64, N>, pub b: SVector<f64, N> }
+
+impl<const N: usize> Path<N> for Segment<N> {
+    fn q(&self, s: f64) -> SVector<f64, N> { self.a + s * (self.b - self.a) }
+    fn dq(&self, _s: f64) -> SVector<f64, N> { self.b - self.a }
+    fn ddq(&self, _s: f64) -> SVector<f64, N> { SVector::zeros() }
+}
+
+/// Natural cubic spline through m ≥ 2 waypoints at uniform knots s_k = k/(m − 1).
+/// Natural ends (q'' = 0) are the right choice for a rest-to-rest motion: b(s)
+/// then vanishes at both ends and the plane's edges are governed by a and c alone.
+pub struct CubicSpline<const N: usize> {
+    knots: Vec<f64>,
+    pts: Vec<SVector<f64, N>>,
+    /// Second derivatives at the knots, from one tridiagonal solve per coordinate.
+    m2: Vec<SVector<f64, N>>,
+}
+
+impl<const N: usize> CubicSpline<N> {
+    /// Waypoints on Tⁿ are unwrapped first: consecutive angles differ by the
+    /// shortest arc, so a path through the seam is fitted in the chart lift
+    /// rather than interpolated across a 2π jump (Chapter 5).
+    pub fn on_torus(waypoints: &[SVector<f64, N>]) -> Self {
+        let mut pts = vec![waypoints[0]];
+        for w in &waypoints[1..] {
+            let prev = *pts.last().unwrap();
+            pts.push(prev + (w - prev).map(|d| (d + PI).rem_euclid(2.0 * PI) - PI));
+        }
+        Self::fit(pts)
+    }
+
+    fn fit(pts: Vec<SVector<f64, N>>) -> Self {
+        let m = pts.len();
+        let knots: Vec<f64> = (0..m).map(|k| k as f64 / (m - 1) as f64).collect();
+        // Interior rows: h M_{k-1} + 4h M_k + h M_{k+1} = 6 (d_k − d_{k-1}); M_0 = M_{m-1} = 0.
+        let m2 = natural_second_derivatives(&knots, &pts);
+        Self { knots, pts, m2 }
+    }
+}
+```
+
+```rust title="crates/trajectory/src/constrained.rs + limits.rs"
+use dynamics::Dynamics;
+
+/// a(s) s̈ + b(s) ṡ² + c(s) = u — Chapter 17's model restricted to a path (C eq. 11.6).
+pub struct PathDynamics<'a, D: Dynamics<N>, P: Path<N>, const N: usize> {
+    pub dynamics: &'a D,
+    pub path: &'a P,
+}
+
+impl<D: Dynamics<N>, P: Path<N>, const N: usize> PathDynamics<'_, D, P, N> {
+    /// b uses the velocity-product *vector* at q̇ = q'(s): q'ᵀ Γ q' = C(q, q') q' exactly.
+    pub fn abc(&self, s: f64) -> (SVector<f64, N>, SVector<f64, N>, SVector<f64, N>) {
+        let (q, dq, ddq) = (self.path.q(s), self.path.dq(s), self.path.ddq(s));
+        let m = self.dynamics.mass(&q);
+        (m * dq, m * ddq + self.dynamics.velocity_product(&q, &dq), self.dynamics.gravity(&q))
+    }
+
+    /// The torque that executes the path at phase state (s, ṡ) with path acceleration s̈.
+    pub fn torque(&self, s: f64, sdot: f64, sddot: f64) -> SVector<f64, N> {
+        let (a, b, c) = self.abc(s);
+        a * sddot + b * sdot * sdot + c
+    }
+}
+
+pub struct TorqueLimits<const N: usize> { pub min: SVector<f64, N>, pub max: SVector<f64, N> }
+
+/// Below this |a_i| a row is zero-inertia: it bounds ṡ, not s̈.
+pub const ZERO_INERTIA_EPS: f64 = 1e-9;
+
+/// (L, U) at a phase-plane state — eqs. 11.8–11.9. Dividing by a negative a_i
+/// flips the inequality; that swap is the whole content of 11.8.
+pub fn accel_bounds<const N: usize>(abc: &Abc<N>, lim: &TorqueLimits<N>, sdot: f64) -> (f64, f64) {
+    let x = sdot * sdot;
+    let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+    for i in 0..N {
+        let ai = abc.0[i];
+        if ai.abs() < ZERO_INERTIA_EPS { continue; }
+        let alpha = (lim.max[i] - abc.1[i] * x - abc.2[i]) / ai;
+        let beta  = (lim.min[i] - abc.1[i] * x - abc.2[i]) / ai;
+        let (li, ui) = if ai > 0.0 { (beta, alpha) } else { (alpha, beta) };
+        lo = lo.max(li);
+        hi = hi.min(ui);
+    }
+    (lo, hi)
+}
+
+/// v(s) from the pairwise crossings L_i = U_j (eq. 11.10). Each bound is affine
+/// in x = ṡ², p + m x, so the crossing is x = (p_U − p_L)/(m_L − m_U); keep the
+/// smallest positive root over all pairs. +∞ when no pair can collapse the cone.
+pub fn velocity_limit<const N: usize>(abc: &Abc<N>, lim: &TorqueLimits<N>) -> f64 {
+    let rows: Vec<Row> = (0..N).filter(|&i| abc.0[i].abs() >= ZERO_INERTIA_EPS).map(|i| Row::new(abc, lim, i)).collect();
+    let mut best = f64::INFINITY;
+    for li in &rows { for uj in &rows {
+        let den = li.m_l - uj.m_u;
+        if den.abs() < 1e-14 { continue; }
+        let x = (uj.p_u - li.p_l) / den;
+        if x > 0.0 && x < best { best = x; }
+    } }
+    best.sqrt()
+}
+
+/// ṡ_max(s) = min(v, ṡ_zip, ṡ_rate): the true limit curve of §11.2.1, with
+/// joint-rate limits |q̇_i| ≤ v_i folded in as rows ṡ ≤ v_i / |q'_i| (Exercise 5).
+pub fn sdot_max<const N: usize>(abc: &Abc<N>, dq: &SVector<f64, N>, lim: &TorqueLimits<N>, rate: Option<&[f64; N]>) -> LimitPoint {
+    let v = velocity_limit(abc, lim);
+    let zip = zero_inertia_limit(abc, lim);        // u_min ≤ b_i ṡ² + c_i ≤ u_max on rows with a_i = 0
+    let rate = joint_rate_limit(dq, rate);
+    LimitPoint::min_of(v, zip, rate)               // remembers which bound is active: cone, zip or rate
+}
+```
+
+```rust title="crates/trajectory/src/time_scale.rs"
+pub enum TimeScaleError {
+    /// F reached ṡ = 0 before s = 0: full braking cannot bring the arm to rest (Problem 11.3).
+    StallsAtZero { s: f64 },
+    /// A_i reached ṡ = 0 or s = 1, or the start is doomed (Problem 11.4, figure 11.2).
+    NoSolution { s: f64, detail: String },
+    /// More switches than the admissible region can honestly have (footnote 2).
+    LimitIsland { s: f64 },
+}
+
+pub struct TimeScaling {
+    pub switches: Vec<f64>,          // Choset's list 𝒮
+    pub sdot: Vec<f64>,              // the profile on s_k = k/N
+    pub stage: Vec<f64>,             // s̈ on each stage: x(s) is piecewise linear, so a replay applies exactly this
+    pub mode: Vec<PhaseMode>,        // Max | Min | Slide — Slide is a singular arc
+    pub t: Vec<f64>,                 // t[N] = t_f
+}
+
+/// One grid stage in x = ṡ². When the free step leaves the admissible region,
+/// try the stage acceleration that lands exactly on the limit curve; it is
+/// feasible iff it lies in the cone — Choset's s̈_max = min(s̈⁺_tangent, U) at a
+/// critical point, and the tangency test for free on an ordinary point of v(s).
+fn step_clipped(t: &Tables, k: usize, x: f64, mode: Mode, dir: i32) -> StepOut {
+    let raw = rk4_in_x(t, k, x, mode, dir);              // stage states clamped to x ≤ x_max at the half grid
+    let kn = (k as i32 + dir) as usize;
+    if !above(raw, t.xmax[kn]) { return StepOut::free(raw); }
+    let u_star = dir as f64 * (t.xmax[kn] - x) / (2.0 * t.ds);
+    let (l0, u0) = accel_bounds(&t.abc[k], &t.lim, x.sqrt());
+    let (l1, u1) = accel_bounds(&t.abc[kn], &t.lim, t.xmax[kn].sqrt());
+    if u_star >= l0.min(l1) && u_star <= u0.max(u1) { StepOut::slide(t.xmax[kn]) } else { StepOut::penetrated(raw) }
+}
+
+pub fn time_scale<const N: usize>(pd: &PathDynamics<'_, impl Dynamics<N>, impl Path<N>, N>, lim: &TorqueLimits<N>,
+                                  sdot0: f64, sdot_f: f64, grid: usize) -> Result<TimeScaling, TimeScaleError> {
+    let t = Tables::tabulate(pd, lim, grid);
+    // Step 2: F backward from (1, ṡ_f).
+    let f = integrate_backward(&t, grid, sdot_f * sdot_f, Mode::Min)?;    // StallsAtZero if x ≤ 0 before s = 0
+    let (mut ki, mut xi, mut switches, mut profile) = (0, sdot0 * sdot0, vec![], Profile::new(grid));
+    loop {
+        // Step 3: A_i forward with U; crossing F is tested on the free curve before penetration.
+        match integrate_forward(&t, ki, xi, Mode::Max, &f)? {
+            Forward::CrossedF { node, frac, a } => { profile.write(ki, node, &a, Mode::Max); profile.write_tail(&f);
+                                                   switches.push_crossing(node, frac, grid); break; }
+            Forward::Penetrated { k_lim, a, .. } => {
+                // Step 4, footnote 3: bisect on ṡ′ at s_lim for the highest admissible L-curve.
+                let (x_prime, lc) = bisect_highest_admissible_l_curve(&t, k_lim, a[k_lim], &f);
+                let k_tan = lc.closest_approach_to_limit();                        // tangent or critical point
+                let meet = meet_backward(&t, &a, ki, k_lim, x_prime)?;            // where L rises above A_i
+                profile.write(ki, meet.node, &a, Mode::Max);
+                profile.write(meet.node + 1, k_tan, &lc, Mode::Min);
+                switches.push_max_to_min(meet); switches.push_min_to_max(k_tan);  // Step 5
+                (ki, xi) = (k_tan, lc[k_tan]);
+            }
+        }
+    }
+    Ok(profile.finish(switches))     // t_f = Σ 2Δ/(ṡ_k + ṡ_{k+1}); slides reported as Mode::Slide
+}
+```
+
+```rust title="crates/trajectory/src/toppra.rs"
+/// TOPP-RA (Pham & Pham 2018): controllable intervals in x = ṡ² backward, greedy forward.
+pub fn toppra<const N: usize>(pd: &PathDynamics<'_, impl Dynamics<N>, impl Path<N>, N>, lim: &TorqueLimits<N>,
+                              sdot0: f64, sdot_f: f64, grid: usize) -> Result<TimeScaling, TimeScaleError> {
+    let ds = 1.0 / grid as f64;
+    let abc: Vec<Abc<N>> = (0..=grid).map(|k| pd.abc(k as f64 * ds)).collect();
+    let mut k_set = vec![(sdot_f * sdot_f, sdot_f * sdot_f); grid + 1];
+    for k in (0..grid).rev() {
+        // Half-planes in (x, u): the 2N actuator rows at s_k, x ≥ 0, and ℓ ≤ x + 2uΔ ≤ h for K_{k+1}.
+        let mut hp = actuator_half_planes(&abc[k], lim);     // a row with a_i = 0 is a half-plane with no u in it
+        hp.push(HalfPlane { p: 1.0, r: 2.0 * ds, q: k_set[k + 1].1 });
+        hp.push(HalfPlane { p: -1.0, r: -2.0 * ds, q: -k_set[k + 1].0 });
+        k_set[k] = extreme_x(&hp).ok_or(TimeScaleError::NoSolution { s: k as f64 * ds, detail: "controllable set empty".into() })?;
+    }
+    if sdot0 * sdot0 < k_set[0].0 || sdot0 * sdot0 > k_set[0].1 { return Err(TimeScaleError::NoSolution { s: 0.0, detail: "ṡ₀ not controllable".into() }); }
+    let mut x = vec![sdot0 * sdot0; grid + 1];
+    for k in 0..grid {
+        let (lo, hi) = feasible_u(&abc[k], lim, x[k]);                        // the cone at (s_k, x_k)
+        let u = hi.min((k_set[k + 1].1 - x[k]) / (2.0 * ds)).max(lo.max((k_set[k + 1].0 - x[k]) / (2.0 * ds)));
+        x[k + 1] = (x[k] + 2.0 * u * ds).max(0.0);                            // greedy: largest x_{k+1} ∈ K_{k+1}
+    }
+    Ok(TimeScaling::from_x(x, ds))
+}
+```
+
+```rust title="crates/trajectory/src/lattice.rs"
+use search::{astar, Graph};
+
+/// Integer lattice coordinates: q_i = p_i · ½ a_max h², q̇_i = m_i · a_max h.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct LatticeState<const N: usize> { pub p: [i64; N], pub m: [i64; N] }
+
+pub struct LatticeGraph<'a, const N: usize> {
+    pub a_max: f64, pub h: f64, pub v_max: f64,
+    pub c0: f64, pub c1: f64,
+    /// Clearance at a configuration; the lattice samples it along every arc.
+    pub clearance: &'a dyn Fn(&SVector<f64, N>) -> f64,
+    pub goal: LatticeState<N>,
+}
+
+impl<const N: usize> Graph<LatticeState<N>> for LatticeGraph<'_, N> {
+    /// Neighbors are (p + 2m + c, m + c) for c ∈ {−1, 0, 1}ᴺ, kept when the
+    /// quadratic arc is δ_v(c₀, c₁)-safe and the end velocity is within v_max.
+    fn neighbors(&self, s: &LatticeState<N>) -> Vec<(LatticeState<N>, f64)> {
+        controls::<N>().filter_map(|c| {
+            let next = LatticeState { p: array_fn(|i| s.p[i] + 2 * s.m[i] + c[i]), m: array_fn(|i| s.m[i] + c[i]) };
+            self.arc_safe(s, &c).then_some((next, self.h))
+        }).collect()
+    }
+}
+
+/// Minimum time of a 1-D double integrator from (q₀, v₀) to (q₁, v₁): one switch,
+/// via the peak velocity v_p with (v_p² − v₀²)/2a + (v_p² − v₁²)/2a = Δq. This is
+/// also Chapter 19's min-time double integrator read off the minimum principle.
+pub fn bang_bang_time_1d(q0: f64, v0: f64, q1: f64, v1: f64, a: f64) -> f64 { /* two candidate families */ }
+
+/// Algorithm 21 with A* (h = max_i per-axis bang-bang time, admissible) or Choset's literal breadth-first.
+pub fn lattice_search<const N: usize>(start: LatticeState<N>, goal: LatticeState<N>, g: &LatticeGraph<'_, N>) -> Option<Vec<[i64; N]>> {
+    let h = |n: &LatticeState<N>| (0..N).map(|i| bang_bang_time_1d(q_of(n.p[i], g), v_of(n.m[i], g), q_of(goal.p[i], g), v_of(goal.m[i], g), g.a_max))
+                                        .fold(0.0, f64::max);
+    let path = astar(g, start, goal, h)?;
+    Some(path.windows(2).map(|w| array_fn(|i| w[1].m[i] - w[0].m[i])).collect())   // controls are Δm
+}
+
+/// A time-parameterized curve — Choset §1.3's distinction made a type. Trackers
+/// accept a `Trajectory`, never a `Path`: handing a geometric curve to a
+/// controller is a compile error, not a runtime surprise.
+pub struct Trajectory<M: Manifold> { pub samples: Vec<(f64, M)> }
+```
+
+### The worked example, printed
+
+`cargo run --example reach_sweep -p trajectory` builds the micro-example and prints
+
+```text
+a(0.5) = [3.1416, 0.5236]    b(0.5) = [0.0000, 1.2337]    c(0.5) = [0.0000, 0.0000]
+v(s)   = 3.5254  (constant; the pair L₁ = U₂)
+switches = [0.5000]    t_s = 0.3963 s    t_f = 0.7927 s    peak ṡ = 2.5231
+τ₂ at the switch = 11.19 N·m  (< 12: honest)
+TOPP-RA, 200-point grid: t_f = 0.7927 s
+gravity on:  c(0.5) = [10.4051, -3.4684]   U₁(0.5) = 3.0542   L₁(0.5) = -9.6782   v(0.5) = 4.0799
+             U₁(0) = 0.1210   t_f = 2.3276 s   switches = [0.7342]
+τ₂ = 10 N·m: v = 3.2875   switches = [0.5071]   t_f = 0.7928 s
+RP arm (Choset Ex. 11.2.1, printed parameters): |c₁(0)| = 36.33 > 20  →  U(0,0) = -2.572, L(1,0) = +2.572
+             time_scale: StallsAtZero   toppra: controllable set empty at s = 0.999
+             a_g = 0:  one switch at 0.5000, t_f = 1.1445 s  (toppra 1.1445)
+lattice 1-DOF, a = 1, h = 0.5, 0 → 1:  controls [+1, +1, -1, -1]  t_f = 2.000 = 2√(d/a)
+             81 sequences → 49 states at level 4;  expansions A* 5 vs breadth-first 43
+lattice 2-DOF around a disc, h = 0.5:  6 levels;  expansions A* 17 / Alg. 21 4769 / heap BFS 12866
+             c₁ = 0.5: 8 levels;  h = 0.25: 12 → 14 levels (3.0 → 3.5 s), A* 494 expansions
+```
+
+`#[test] fn reproduces_micro_example()` asserts each line to $10^{-3}$ (the integrator's grid sets the
+tolerance) and $|t_f^{\text{TOPP-RA}} - t_f| < 5 \times 10^{-3}$ on a 200-point grid.
+`#[test] fn lattice_finds_bang_bang()` is the hand trace above. `#[test] fn replay_tracks_path()`
+closes the loop with Chapter 17: it time-scales the widgets' default spline ($t_f = 0.6176$ s,
+switches at $0.398$, $0.571$, $0.668$), computes $u(t) = a\ddot s + b\dot s^2 + c$ from the
+profile, integrates `Reach2R` with Chapter 17's RK4 at $h = 0.25$ ms, and asserts that the
+integrated $q(t)$ stays within $10^{-3}$ rad of $q(s(t))$ — the measured worst error is
+$4.5 \times 10^{-4}$ rad — with every sampled torque inside its limit to within the one-percent slop
+of the stage-constant $\ddot s$. The arm hangs below the shoulder in that test on purpose: an
+open-loop replay through the inverted configuration diverges exponentially whatever the planner
+did, which is [Chapter 19](/chapters/ch19-trajectory-optimization)'s cue for feedback.
+
+<Callout type="info">
+The widgets on this page run the TypeScript port in `lib/trajectory/`, a line-for-line translation of
+the Rust above. Its thirteen self-checks reproduce every number in the printout and add the
+invariants the mathematics guarantees: the closed-form $v(s)$ against a brute-force scan, an actuator
+saturated at every node of every solved profile, the profile never above $\dot s^{\max}$ and touching
+it only at switches or slides, $x(s)$ continuous across every switch (the bug that check was written
+to catch jumped the profile by $1.2$ in $x$), TOPP-RA within $0.38\%$ of the switching construction
+on seeded gravity-loaded splines and agreeing with it on which problems are unsolvable, and $t_f$
+non-increasing as the motors get stronger.
+</Callout>
+
+## Putting it together
+
+The integration lab is the pipeline [Chapter 23](/chapters/ch23-capstone) ships: a Chapter 12 RRT
+path for Reach, shortcut by Chapter 13 into a polyline, smoothed into a `CubicSpline` on $T^2$,
+time-scaled here, and replayed by the Chapter 17 integrator with the computed torques. On the
+Workbench with gravity the gauge grazes its rail at every instant and never crosses it — that is
+what bang-bang looks like from the motor's side.
+
+Two honesty items the lab makes visible. First, the shortcutting step matters more than it looks:
+a polyline has corners, a spline through a polyline's vertices has large $q''$ near sharp ones, and
+large $q''$ is large $b(s)$, which lowers the velocity-limit curve exactly where the path turns. The
+time scaler is only as fast as the path is smooth. Second, decoupled planning is honest about time
+only *locally*: it finds the fastest clock for the path it was handed, and a slightly different path
+through the same homotopy class may be much faster. Choset's §11.2.2 sketches Shiller and Dubowsky's
+answer — enumerate grid paths, bound their times from below with a speed cap, time-scale the
+best, prune the rest, and polish locally with the time scaler as the objective. Modern practice
+replaces that search with the optimizers of the next chapter, which move the path and the clock
+together. The lattice of §11.3.3 is the other direct route, and its exponential grid is the reason
+Chapter 21's state lattices and hybrid A\* prune it with motion primitives and a heuristic rather
+than enumerate it.
+
+What survives into [Chapter 19](/chapters/ch19-trajectory-optimization) unchanged: the time-scaled
+trajectory is the warm start CHOMP and iLQR polish; the bang-bang structure reappears from
+Pontryagin's minimum principle; and the `Trajectory` type is what every controller there accepts.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={1} title="When is there no limit curve at all?">
+    Show that a single actuator with constant symmetric bounds $|u| \le u_{\max}$ and $a(s) \ne 0$
+    has $L < U$ at every state, so no velocity-limit curve exists and the time-optimal clock is
+    pure bang-bang with one switch. Then replace the bound by the DC-motor law
+    $u^{\max}(s, \dot s) = u_0 - k\dot s$ (torque falling with speed) and show that a limit curve
+    appears. Where is it?
+    <Hints>
+      <>With one row, $L = \beta$ and $U = \alpha$ (for $a > 0$) and $\alpha - \beta = 2u_{\max}/a > 0$ for every $\dot s$.</>
+      <>With the motor law, $\alpha = (u_0 - k\dot s - b\dot s^2 - c)/a$ while $\beta = (-u_0 - b\dot s^2 - c)/a$; the cone collapses when $\alpha = \beta$, i.e. $k\dot s = 2u_0$. The limit is $\dot s = 2u_0/k$, independent of the path — a speed above which the motor cannot produce positive torque at all.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Gravity on the micro-example">
+    For the micro-example path with gravity on, derive $c(s)$ in closed form from Chapter 17's
+    $g(q)$ and show that $U_1(0) = (20 - 19.62)/\pi$. What torque limit on joint 1 would make
+    $s = 0$ inadmissible at rest, and what does that mean physically?
+    <CheckAnswer id="ch18.e2" prompt="U₁ at s = 0 with gravity on, in units of 1/s²" answer={0.121} tolerance={0.003}>
+    $c_1(s) = (m_1 r_1 + m_2 L_1)\,a_g\cos q_1 + m_2 r_2\,a_g\cos(q_1 + q_2)$ with $q_1 = \pi s/2$,
+    $q_2 = \pi/2$: at $s = 0$ the second cosine vanishes and $c_1(0) = 2 \cdot 9.81 = 19.62$ N·m.
+    Then $U_1(0) = (20 - 19.62)/\pi = 0.1210$. Any $\tau_1^{\max}$ below $19.62$ N·m makes
+    $\alpha_1 < 0 < \beta_1$ impossible to reconcile with $\dot s = 0$: $L > 0$ at rest, the shoulder
+    cannot hold the horizontal arm, and Choset's standing assumption fails — the algorithm reports
+    `NoSolution` rather than a trajectory.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Predict the switch">
+    <Predict
+      id="ch18.e3"
+      question="In the Phase-Plane Racer switch on the micro-example preset (gravity off) and lower τ₂ from 12 to 10 N·m. Where does the single switch go, and does the trajectory now touch v(s)?"
+      options={[
+        { label: 'Before s = ½, and it touches v(s)', because: 'Lowering τ₂ lowers v from 3.5254 to 3.2875, but the peak speed 2.52 is still well below it, so the limit curve is not reached. And the switch cannot move earlier: F is unchanged (L = L₁ = −6.366 regardless of τ₂) while A₀ is lower.' },
+        { label: 'After s = ½, and it does not touch v(s)', correct: true, because: 'U₂ = 19.1 − 2.356 ṡ² drops below U₁ = 6.366 once ṡ > 2.325, so A₀ accelerates less near its peak and is lower than before. F is unchanged. A lower A₀ meets F later: the switch moves to s = 0.5071, the peak drops to 2.504 < v = 3.2875, and t_f barely changes, 0.7928 s.' },
+        { label: 'It stays at s = ½ by symmetry', because: 'The symmetry that put it at ½ was L₁ = −U₁ with joint 1 binding on both sides. With τ₂ = 10 joint 2 binds the acceleration side near the peak but not the braking side, so the two halves are no longer mirror images.' },
+      ]}
+    >
+    Now lower $\tau_2$ to $8$ N·m: the switch moves to $0.554$ and $t_f$ to $0.7962$ s — the elbow motor is
+    throttling the shoulder's acceleration without either of them being "the slow joint".
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Levels and detours on the lattice">
+    In the Lattice Hopper (1-DOF, $a_{\max} = 1$, $d = 2$) predict the level count and the lattice
+    $t_f$ at $h = \tfrac14$ before running it, then at $h = \tfrac18$. Then switch to the 2-DOF room,
+    set $c_1 = 0.5$ and explain the longer, slower trajectory in terms of Choset's figure 11.11.
+    <CheckAnswer id="ch18.e4" prompt="Lattice t_f at h = ¼ for d = 2, a_max = 1, in seconds" answer={3} tolerance={0.01} unit="s">
+    The continuous bound is $2\sqrt{2} = 2.828$ s. Levels are multiples of $h$, and the rest-to-rest
+    sequence must have as many $+1$ as $-1$ controls with the position landing on the goal cell, so
+    $12$ levels at $h = \tfrac14$ ($3.0$ s) and $23$ at $h = \tfrac18$ ($2.875$ s). With $c_1 > 0$ the
+    required clearance grows with speed; near the disc the fast straight trajectories are pruned and
+    the search returns $14$ levels at $h = \tfrac14$ — a detour that is slower *and* longer, because
+    the safe speed past the obstacle is the binding constraint, exactly as in figure 11.11.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="Joint-rate limits as rows of the limit curve">
+    Add joint-velocity limits $|\dot q_i| \le v_{\max,i}$ to `limits.rs` as additional rows of the
+    velocity-limit computation. Since $\dot q_i = q'_i\dot s$, each is the bound
+    $\dot s \le v_{\max,i}/|q'_i(s)|$, a critical-type point ($L < U$ there). Show in a test that
+    $\dot s^{\max}(s)$ becomes $\min(v(s), \dot s_{zip}, \min_i v_{\max,i}/|q_i'(s)|)$, and that the
+    time scaler slides along the rate limit where it is active rather than bouncing. The TypeScript
+    port's `jointRateLimit` and the `'rate'` kind of `LimitPoint` are the reference.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="TOPP-RA versus the switching construction (stretch)">
+    Run `toppra` and `time_scale` on $50$ seeded natural cubic splines for Chapter 17's `Reach3R`
+    with gravity, limits drawn from a fixed range, $N = 800$. Report, honestly, the fraction on which
+    both report no solution, the fraction on which exactly one does, and the distribution of
+    $|t_f^{\text{TOPP-RA}} - t_f|/t_f$ on the rest. Explain every disagreement larger than the grid
+    resolution: a zero-inertia point the slope test mishandles, a stage constraint TOPP-RA enforces
+    only at $s_k$, or an inadmissible island (footnote 2) that neither algorithm is built for. The
+    2-DOF version of this experiment is the chapter's check: six solvable splines of eight, no
+    disagreement on solvability, worst relative difference $3.8 \times 10^{-3}$.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 11 is the source: the path-constrained dynamics and the phase plane (§11.2), the Time-Scaling Algorithm and its footnote-3 bisection, zero-inertia points (§11.2.1), Example 11.2.1 (whose printed parameters this chapter re-examines), the Shiller–Dubowsky sketch (§11.2.2), and GRID SEARCH with Theorem 11.3.2 (§11.3.3). Choset's bibliography is where Shin & McKay [385], Pfeiffer & Johanni [348], Slotine & Yang [388] and Donald & Xavier [135] are cited."
+  />
+  <Reference
+    authors="Bobrow, J. E., Dubowsky, S., and Gibson, J. S."
+    year={1985}
+    title="Time-Optimal Control of Robotic Manipulators Along Specified Paths"
+    venue="International Journal of Robotics Research 4(3)"
+    doi="10.1177/027836498500400301"
+    note="One of the two 1985 papers that solved the decoupled problem; the phase-plane construction with its switching curves is theirs (Shin & McKay's companion paper in IEEE Transactions on Automatic Control 30(6) reached the same result independently)."
+  />
+  <Reference
+    authors="Pham, H. and Pham, Q.-C."
+    year={2018}
+    title="A New Approach to Time-Optimal Path Parameterization Based on Reachability Analysis"
+    venue="IEEE Transactions on Robotics 34(3)"
+    doi="10.1109/TRO.2018.2819195"
+    note="TOPP-RA: controllable sets in squared speed propagated by small linear programs, then a greedy forward pass. The reformulation that replaces switch-point hunting, implemented here with exact two-variable LPs and checked against the switching construction."
+  />
+  <Reference
+    authors="Pivtoraiko, M., Knepper, R. A., and Kelly, A."
+    year={2009}
+    title="Differentially Constrained Mobile Robot Motion Planning in State Lattices"
+    venue="Journal of Field Robotics 26(3)"
+    doi="10.1002/rob.20285"
+    note="The state lattice as the descendant of GRID SEARCH: motion primitives on a regular lattice of states, searched with a heuristic. Chapter 21 develops the lineage."
+  />
+  <Reference
+    authors="Dolgov, D., Thrun, S., Montemerlo, M., and Diebel, J."
+    year={2010}
+    title="Path Planning for Autonomous Vehicles in Unknown Semi-Structured Environments"
+    venue="International Journal of Robotics Research 29(5)"
+    doi="10.1177/0278364909359210"
+    note="Hybrid A*: the practical end of the GRID SEARCH → state lattice line, with continuous states attached to discrete cells. Cited here for the lineage; Chapter 21 implements it."
+  />
+  <Reference
+    authors="LaValle, S. M. and Kuffner, J. J."
+    year={2001}
+    title="Randomized Kinodynamic Planning"
+    venue="International Journal of Robotics Research 20(5)"
+    doi="10.1177/02783640122067453"
+    note="Choset's 'third approach' to direct trajectory planning: trade the lattice's optimality for probabilistic completeness in (q, q̇). Chapter 21's kinodynamic trees use the same state."
+  />
+  <Reference
+    authors="Lynch, K. M. and Park, F. C."
+    year={2017}
+    title="Modern Robotics: Mechanics, Planning, and Control"
+    venue="Cambridge University Press"
+    url="http://modernrobotics.org"
+    note="Section 9.4 presents the same time-scaling algorithm, by one of Choset's co-authors, with the (s, ṡ) phase plane drawn the way w18.1 draws it."
+  />
+</References>

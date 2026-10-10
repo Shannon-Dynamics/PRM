@@ -1,0 +1,991 @@
+---
+title: Probabilistic Roadmaps
+description: Stop describing the free space and ask it questions — probabilistic roadmaps with samplers, kd-trees on the torus, the straight-line local planner and its two check schedules, narrow passages, and probabilistic completeness stated with constants you can compute.
+chapter: 11
+part: PART III
+partTitle: Sampling-Based Planning
+difficulty: Intermediate
+readingTime: 75 min
+quote: PRM fully exploits the fact that it is cheap to check if a single robot configuration is in Q_free or not.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 7
+---
+
+import { SlotHook } from '@/components/ch/ch11/slot-hook';
+import { RoadmapRain } from '@/components/ch/ch11/roadmap-rain';
+import { NarrowPassage } from '@/components/ch/ch11/narrow-passage';
+import { KdTreeFigure } from '@/components/ch/ch11/kd-tree-figure';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Build a roadmap of a configuration space nobody wrote down, from one predicate — "is q free?" — and two resolutions of random sampling, and state exactly what the resulting planner promises',
+    'Define probabilistic completeness as a limit statement, and prove the three Choset §7.4 results that make it quantitative: ball tiling along a known path, (ε, α, β)-expansiveness, and abstract path tiling',
+    'Compute the constants: for a path of length 1.2 and clearance 0.1 in a unit square, 892 uniform samples bound the failure probability below 1 percent — and the expansiveness bound asks for 15 552',
+    'Choose a metric on T² and SE(2), build a kd-tree whose pruning bound respects periodic axes, and run a straight-line local planner with the incremental or the subdivision check schedule',
+    'Say where the Gaussian, bridge, OBPRM and medial-axis samplers put their mass, why none of them wins everywhere, and what a finite collision-check step can miss',
+    'Write the sampling crate — Sampler, NearestNeighbors, Steer, Prm generic over Chapter 5\'s Manifold — that Chapters 12, 13, 14, 21 and 22 import without change',
+  ]}
+  prerequisites={[
+    'The collision checker and the three worlds (Chapter 2) — the only question this chapter asks of the world',
+    'C-obstacles as sets that exist but are never computed here; Reach\'s torus (Chapter 4)',
+    'Manifolds with dist, interpolate and sample on S¹, T² and SE(2) (Chapter 5)',
+    'Dijkstra and A* for the query phase (Chapter 6); roadmap properties — accessibility, connectivity, departability (Chapter 8)',
+  ]}
+>
+Every planner in Part II built its roadmap by *constructing* $\Qfree$: visibility graphs from
+obstacle vertices, Voronoi diagrams from equidistance, cells from critical points. Each needs an
+explicit description of the free space, and each dies as the dimension climbs. Choset's figure 7.1
+is a ten-degree-of-freedom arm threading clutter — a problem none of them can touch.
+
+This chapter makes the turn that defined the field after 1996. Stop describing $\Qfree$ and *ask it
+questions*. A collision checker answers "is $q$ free?" in microseconds. A roadmap built from coarse
+random samples (the nodes) and fine sampling along local paths (the edges) captures the connectivity
+of a space nobody wrote down. The price is a weaker promise: the planner is complete only
+*probabilistically*. The surprise is that the weakness is quantifiable — PRM's failure probability
+decays *exponentially* in the sample count, with constants computable from the length and clearance
+of a path you will never see.
+
+The sister book's [Chapter 20](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch20-motion-planning)
+previews PRM in a dozen lines. This is the canonical treatment it links to, and it owns the sampling
+machinery — samplers, the nearest-neighbor structure, the `Steer` trait — that the rest of Part III
+builds on.
+</Overview>
+
+## The problem: a slot nobody can describe
+
+Put two bars on the Workbench, leaving a half-metre gap between them, and ask Reach to bring its
+forearm from the home pose to a pose inside the gap.
+
+<Deferred minHeight={520}>
+  <SlotHook />
+</Deferred>
+
+Think about what Part II would do with this. [Chapter 8](/chapters/ch08-roadmaps-i)'s visibility
+graph wants obstacle *vertices* in configuration space, and the C-obstacle of the bars on the torus
+has no vertices — it is a curved amber region we can only sample, as the right-hand panel does.
+[Chapter 10](/chapters/ch10-cell-decompositions)'s exact decomposition of the torus would run to
+thousands of cells for one slot, and every new object on the bench would rebuild all of them. Neither
+can start until someone has written $\Qfree$ down.
+
+The planner in the figure never did. It drew six hundred configurations at random, kept the ones the
+[Chapter 2](/chapters/ch02-the-lab) checker called free, joined each to its six nearest neighbors
+with a straight line in joint space when the checker approved every point along it, and asked
+[Chapter 6](/chapters/ch06-graph-search)'s Dijkstra for a path. The only thing it knows about the
+world is the answer to one yes/no question, asked a few tens of thousands of times.
+
+That is the whole idea. The rest of the chapter is about making it precise — what the planner
+promises, why the promise is weaker than Part II's, and exactly how much weaker.
+
+## Building intuition: coarse rain, fine rain
+
+A probabilistic roadmap samples at two resolutions. **Coarse rain**: configurations fall at random,
+and the ones that land in $\Qfree$ become nodes. **Fine rain**: for each node and each of its $k$
+nearest neighbors, a *local planner* proposes a short path — here, a straight line — and walks it in
+small steps, asking the checker at each one. If every step is free, the edge is added. Everything
+the chapter does is a choice about where one of the two rains falls.
+
+<Deferred minHeight={760}>
+  <RoadmapRain />
+</Deferred>
+
+Watch the component counter, not the dots. At first every node is its own component; then components
+swallow one another in bursts; then the count sits at two or three for a long time while the rain
+fills in regions that were already connected. The frame where $\qstart$ and $\qgoal$ first share a
+component is marked. Now re-roll the seed. The dots are all different. The curve is the same shape,
+and the marker lands in the same neighborhood of $n$. **A PRM is a random graph, but whether it
+connects is not luck.** The randomness lives in the constants — how many samples it takes — and the
+constants are the subject of the Foundation section.
+
+Two more things to notice. The planner is *metered* in two currencies: calls to the local planner
+$\Dist$ (how many edges were tried) and collision checks (how many points were asked about). The
+first is the coarse rain's cost, the second the fine rain's, and every comparison in Part III is in
+the second unit, because that is the unit Choset's quotation above is about. And the torus tab runs
+*the same code* on Reach's $T^2$ as the Apartment tab runs on Rusty's $\mathbb{R}^2$ — the planner
+asks the manifold for distances and interpolants and never does arithmetic on coordinates, which is
+what [Chapter 5](/chapters/ch05-configuration-space-ii) was for.
+
+<KeyIdea title="The one sentence version">
+A probabilistic roadmap is a graph whose nodes are random free configurations and whose edges are
+local paths a checker approved, built from the single predicate "is $q$ free?"; it is complete only
+in the limit, and the rate at which the failure probability vanishes is exponential in the number of
+samples with constants set by the clearance and length of a path that exists.
+</KeyIdea>
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: '\\Dist(q, q\')', meaning: 'the local planner: a collision-free local path from q to q′, or NIL', note: 'Choset §7.1.1' },
+    { sym: '\\mathrm{dist}(q, q\'),\\; \\mathrm{emb}(q)', meaning: 'a distance function on 𝒬; the embedding of q by p robot points into ℝ^{p·dim 𝒲}' },
+    { sym: 'N_q', meaning: 'the k closest neighbors of q among the nodes V under dist' },
+    { sym: '\\mathrm{clr}(\\gamma),\\; L', meaning: 'clearance and length of a known path γ' },
+    { sym: '\\mu(A),\\; B_\\rho(x),\\; \\sigma', meaning: 'Lebesgue measure; the open ball of radius ρ at x; σ = μ(B₁) / (2^d μ(𝒬_free))', note: 'Theorem 7.4.1' },
+    { sym: '\\mathrm{reach}(S),\\; \\mathrm{lookout}_\\beta(S)', meaning: 'the set of points Δ connects to some point of S; the part of S that sees at least a β fraction of the rest of its component', note: 'Defs. 7.4.2–7.4.4' },
+    { sym: 'x \\mathrel{R} y,\\; R^\\ell', meaning: 'the abstract local-planner relation; its ℓ-fold iterate', note: 'Theorem 7.4.3' },
+    { sym: 'D(P, \\mathcal{R}),\\; \\delta(P, \\rho)', meaning: 'discrepancy and dispersion of a point set P', note: 'Defs. 7.1.1–7.1.2' },
+    { sym: 'n,\\; k,\\; (\\epsilon, \\alpha, \\beta)', meaning: 'sample count; neighbors per node; expansiveness constants', note: 'book-wide' },
+  ]}
+/>
+
+### Two phases and one predicate
+
+<KeyIdea title="Definition — probabilistic roadmap, learning and query phases (Choset §7.1.1)">
+A **probabilistic roadmap** is an undirected graph $G = (V, E)$ with $V \subset \Qfree$ a set of
+sampled configurations and $(q, q') \in E$ iff $q' \in N_q$ and $\Dist(q, q') \ne$ NIL. The
+**learning phase** builds $G$ (Choset Algorithm 6); the **query phase** connects $\qstart$ and
+$\qgoal$ to $G$ by the same $\Dist$ and searches (Algorithm 7). The phases may interleave: a roadmap
+that fails a query can be grown and asked again.
+</KeyIdea>
+
+Three decisions hide inside that definition, and §7.1.2 of Choset is a list of them: what `dist`
+means, so that "nearest" is defined; what $\Dist$ is, so that an edge can be proposed; and how $\Dist$
+decides, so that an edge can be accepted. The chapter takes them in order after saying what the
+planner promises.
+
+### What "probabilistically complete" means
+
+Part II's planners were *complete*: a path exists if and only if they find one, in finite time.
+Chapter 6's grid search was *resolution complete*: complete relative to a discretization, so that a
+path thinner than a cell can be missed. This chapter's planners make a third kind of promise.
+
+<KeyIdea title="Definition — probabilistic completeness (Choset §7.4)">
+A sampling-based planner is **probabilistically complete** if, for every solvable query $(a, b)$,
+$$
+\lim_{n \to \infty} \Pr\big[\text{the planner reports FAILURE on } (a, b) \text{ after } n \text{ samples}\big] = 0 .
+$$
+Resolution completeness is the deterministic analogue — the failure probability is zero or one, and
+reaches zero once the sampling resolution is fine enough.
+</KeyIdea>
+
+Read the quantifiers carefully, because every honest sentence about PRM depends on them. The
+statement is about a *limit*. At any finite $n$ the planner can report "no path" when one exists,
+and nothing in the definition says how often. The content of §7.4 is that, under hypotheses on the
+space, the limit is approached *exponentially fast* — and the content of this chapter's honesty
+items is that the exponent's constants can be hopeless.
+
+### Metrics, embeddings, and a kd-tree that knows about seams
+
+"Nearest" needs a metric, and the metric is the first place a planner can quietly go wrong. On
+$\mathbb{R}^2$ the Euclidean distance is the obvious choice. On Reach's torus the right choice is
+[Chapter 5](/chapters/ch05-configuration-space-ii)'s $d_{T^2}$, the $\ell^2$ norm of per-joint
+circular distances, so that $\theta = 3.1$ and $\theta = -3.1$ are $0.08$ apart, not $6.2$. On
+Hitch's $\SEtwo$ the chapter uses the weighted metric
+$w_t \lVert X' - X'' \rVert + w_r \lvert \theta' - \theta'' \rvert_{S^1}$ with an exchange rate
+between metres and radians that is *a parameter, not a fact* — Choset's §7.1.2 is explicit that no
+natural metric exists on $\SEtwo$, and the book keeps it visible.
+
+Choset's alternative is the **embedding**: pick $p$ points on the robot, map a configuration to the
+$p \cdot \dim \W$ vector of their workspace positions, and use Euclidean distance there. It is a
+metric on the robot's actual geometry, it is what Kavraki's original planner used, and it costs a
+forward kinematics evaluation per distance. The book's `Manifold::dist` is the default; `emb` is an
+exercise.
+
+Given a metric, $N_q$ asks for the $k$ nearest of up to a thousand nodes, a thousand times. Choset
+recommends the kd-tree of de Berg, van Kreveld and Overmars: $O(d\,n \log n)$ to build,
+$O(n^{1 - 1/d} + m)$ per range query returning $m$ points. A textbook kd-tree splits on coordinates
+and prunes a subtree when the query's distance to the subtree's box exceeds the current best. On a
+torus that bound is wrong: a box touching the seam at $\theta = \pi$ is *adjacent* to a query at
+$\theta = -3.1$, and a flat bound would prune the very subtree the answer lives in.
+
+<Deferred minHeight={520}>
+  <KdTreeFigure />
+</Deferred>
+
+The fix is one line. The distance from a query coordinate $c$ to a box edge $s$ along a periodic axis
+of period $T$ is $\min(\lvert c - s \rvert,\; T - \lvert c - s \rvert)$, and the bound on the box is
+the $\ell^2$ sum of per-axis gaps, each scaled by the metric's weight on that axis. The bound never
+exceeds the true distance, so pruning never discards a real neighbor — the check
+`kd-tree (periodic axes) equals brute force on ℝ² and T²` compares two thousand torus points and two
+hundred queries, seam-crossing neighbors included, against a linear scan.
+
+### The local planner and its two schedules
+
+$\Dist(q, q')$ is the fine rain. The straight-line planner follows the manifold's own geodesic —
+`interpolate`, which on $T^2$ goes the short way through the seam — and samples it at a resolution
+`step` far finer than the node sampling. Two orders of asking are in Choset's figure 7.6.
+
+- **Incremental**: $q_1, q_2, \dots$ in order from one end; stop at the first collision.
+- **Subdivision**: the midpoint first, then the quarter points, then the eighths — breadth-first
+  over intervals. A blocked edge is usually blocked somewhere in its middle, and the midpoint finds
+  that first; a free edge of length $\ell$ is declared free after $\lceil \ell / \text{step} \rceil$
+  checks either way.
+
+Hover any edge in Roadmap Rain to see the numbered checks of the active schedule. Subdivision tends
+to win [C refs. 162, 367] because an edge that is going to fail fails sooner. Both share a flaw the
+prose must keep: **a finite step can miss a collision thinner than the step.** An obstacle $0.2$
+m wide between two checks $0.25$ m apart is invisible to both schedules. Only a distance-based
+schedule — march by the checker's *distance* to the nearest obstacle, so that consecutive checks are
+guaranteed to overlap, as Chapter 2's `edgeFree` does — cannot miss, at the price of a distance
+query instead of a boolean one. The book's `StraightLine` is the fixed-step version because that is
+what Choset analyzes; the chapter says so every time it matters.
+
+After a path is found, **shortcutting** (figure 7.7) tries to connect $\qstart$ straight to $\qgoal$,
+then to the configuration before it, and so on, replacing jagged pieces by geodesics between their
+own points. It never lengthens a path and never changes its homotopy class.
+[Chapter 13](/chapters/ch13-optimal-sampling) will show that this is why it is postprocessing and
+not optimization.
+
+### The sampler zoo
+
+Uniform sampling is the baseline, and Theorem 7.4.1 is about it. Everything else in §7.1.3 is a
+bias toward where uniform sampling is poor: near obstacles, and inside narrow passages.
+
+- **Gaussian** [C ref. 59, Boor, Overmars and van der Stappen]: draw $q_1$ uniformly, $q_2$ a
+  Gaussian step of scale $\sigma$ from it, and keep the free one only if the other is in collision.
+- **Bridge test** [C ref. 193, Hsu, Jiang, Reif and Sun]: draw two configurations a random length
+  apart; if *both* are in collision and their midpoint is free, keep the midpoint.
+- **OBPRM** [C ref. 18, Amato et al.]: from a configuration in collision, march in a random
+  direction until free, then bisect back toward the surface.
+- **Medial-axis retraction** [C ref. 427, Wilmarth, Amato and Stiller]: push a free sample up the
+  clearance function until a second obstacle becomes equidistant — onto
+  [Chapter 8](/chapters/ch08-roadmaps-i)'s generalized Voronoi diagram.
+- **Quasirandom sequences**: Halton points replace the random generator with a deterministic
+  low-discrepancy sequence; the planner becomes resolution complete rather than probabilistically
+  complete, and two runs at the same $n$ give the same roadmap.
+
+Where do the biased samplers put their mass? The question has a clean answer.
+
+<Derivation title="Where the Gaussian and bridge samplers put their mass" result="\text{Gaussian: within } O(\sigma) \text{ of } \partial\QO;\quad \text{bridge: inside corridors narrower than the bridge}">
+**Step 1 — acceptance as an integral.** A two-point sampler accepts $q$ with probability equal to the
+integral of the collision indicator over the partner distribution centered at $q$. For the Gaussian
+sampler, the density of accepted samples at a free $q$ is
+$$
+p_{\text{acc}}(q) \;\propto\; \int_{\QO} \mathcal{N}(q' ; q, \sigma^2 I)\, dq' ,
+$$
+the probability that a $\sigma$-ball around $q$ *straddles* $\partial\QO$.
+
+**Step 2 — a half-space obstacle.** If $\QO$ is the half-space at distance $\mathrm{dist}(q)$ from
+$q$, the integral is $\Phi(-\mathrm{dist}(q)/\sigma)$ with $\Phi$ the standard normal CDF: one half
+at the boundary, $0.16$ at one $\sigma$, $0.02$ at two. The mass concentrates within $O(\sigma)$ of
+every boundary — the walls of a narrow passage, and also the outer wall of an empty room.
+
+**Step 3 — both piers in collision.** The bridge test accepts the midpoint of $q_1, q_2$ when both
+endpoints are in collision and the midpoint is free. In a corridor of width $w$ between two obstacles,
+a bridge of length $\ell > w$ laid across it has both piers in collision for a large fraction of
+directions; in open space, a bridge has both piers in collision in almost no direction, because the
+nearest obstacle is one-sided. The sampler is therefore nearly *silent* in the open and loud exactly
+in corridors narrower than its bridge — which is why it is run as a hybrid with uniform sampling, as
+its authors recommend and as this chapter's widgets do.
+
+**Step 4 — OBPRM lands within one step.** Bisection between a colliding and a free configuration
+halves the interval each round, so after $r$ rounds the accepted sample is within $2^{-r}$ of the
+initial step of $\partial\QO$, on the free side.
+
+The medial-axis sampler is the odd one out: it pushes mass *away* from boundaries, toward the set of
+maximal clearance, and in a corridor that set is the center line. Choset closes §7.1.3 with the honest
+summary — hybrids $\pi = (1 - w)\,\pi_A + w\,\pi_B$ and samplers used as *filters* on one another
+exist because no single strategy wins everywhere, and pathological instances exist for every one.
+$\blacksquare$
+</Derivation>
+
+<KeyIdea title="Definitions 7.1.1–7.1.2 — discrepancy and dispersion">
+For a point set $P \subset [0, 1]^d$ and a family $\mathcal{R}$ of ranges, the **discrepancy**
+$D(P, \mathcal{R}) = \sup_{R \in \mathcal{R}} \lvert\, \lvert P \cap R \rvert / \lvert P \rvert - \mu(R) \,\rvert$
+measures how far $P$ is from counting volume. The **dispersion**
+$\delta(P, \rho) = \sup_x \min_{p \in P} \rho(x, p)$ is the radius of the largest empty ball. Under
+$L_\infty$ the Sukharev grid achieves $\delta = 1 / (2 \lfloor N^{1/d} \rfloor)$, and no $N$-point set
+does better — so reaching dispersion $\delta^*$ needs $N \ge (1 / 2\delta^*)^d$ points. Dispersion
+costs exponentially in dimension, random or not.
+</KeyIdea>
+
+### Connection strategies
+
+The $k$-nearest rule is the default. Three refinements are in §7.1.3–7.1.4.
+
+- **Sparse roadmaps**: connect a new node only to the nearest node of each *other* component plus a
+  few redundant neighbors. The result is nearly a forest; it has the connectivity and few of the
+  edges.
+- **Connection sampling**: after the first pass, pick nodes with probability inversely related to
+  their degree, sample around them, and connect as usual. It never creates a component on its own
+  and tends to join the ones that remain.
+- **Lazy evaluation** [C ref. 53, Bohlin and Kavraki]: add every candidate edge *unchecked*, search,
+  and verify only the edges on the returned path, coarse-to-fine; delete a blocked edge and search
+  again. Collision checks are spent only where a path wanted to go.
+
+Each is a `Connect` variant in the implementation, and Exercise 5 asks for the lazy one's accounting.
+
+### Theorem 7.4.1 — the ball tiling
+
+The first analysis assumes nothing about the space except that a solution exists with some room
+around it.
+
+<KeyIdea title="Theorem 7.4.1 (Kavraki, Kolountzakis and Latombe; Choset §7.4.1)">
+Let $\Qfree \subset [0, 1]^d$ and let $\gamma$ be a path of length $L$ and clearance $\rho > 0$
+joining $a, b \in \Qfree$. After $n$ uniform samples, with $\Dist$ the straight-line planner and
+every pair of samples within $\rho$ of each other tried,
+$$
+\Pr[\text{FAILURE}] \;\le\; \Big\lceil \tfrac{2L}{\rho} \Big\rceil\, e^{-\sigma \rho^d n},
+\qquad \sigma = \frac{\mu(B_1)}{2^d\, \mu(\Qfree)} .
+$$
+</KeyIdea>
+
+<Derivation title="Theorem 7.4.1 — tiling a path with balls" result="\Pr[\text{FAILURE}] \le m\,(1 - \sigma\rho^d)^n \le m\, e^{-\sigma\rho^d n}">
+**Step 1 — tile the path.** Place $m = \lceil 2L / \rho \rceil$ points $x_1 = a, x_2, \dots, x_m = b$
+along $\gamma$ so that consecutive points are less than $\rho / 2$ apart. Around each put the ball
+$B_{\rho/2}(x_i)$. Since $\mathrm{clr}(\gamma) = \rho$, every such ball lies inside the larger free
+ball $B_\rho(x_i) \subset \Qfree$.
+
+**Step 2 — any two consecutive balls see each other.** Take $y_i \in B_{\rho/2}(x_i)$ and
+$y_{i+1} \in B_{\rho/2}(x_{i+1})$. Both lie in $B_\rho(x_i)$: the first trivially, the second because
+$\lvert y_{i+1} - x_i \rvert \le \lvert y_{i+1} - x_{i+1} \rvert + \lvert x_{i+1} - x_i \rvert < \rho/2 + \rho/2$.
+A ball is convex, so the segment $\overline{y_i\, y_{i+1}}$ lies in $B_\rho(x_i) \subset \Qfree$ and
+the straight-line $\Dist$ succeeds on it.
+
+**Step 3 — one sample per ball is a roadmap path.** If every ball $B_{\rho/2}(x_i)$ contains at
+least one sample, Step 2 chains them into a sequence of roadmap edges from a sample near $a$ to a
+sample near $b$; $a$ and $b$ themselves connect to their balls' samples by the same argument. The
+query succeeds.
+
+**Step 4 — union bound.** FAILURE therefore requires some ball to be empty:
+$$
+\Pr[\text{FAILURE}] \;\le\; \sum_{i=1}^{m} \Pr\big[B_{\rho/2}(x_i) \cap V = \emptyset\big] .
+$$
+
+**Step 5 — one empty ball.** A uniform sample over $\Qfree$ lands in $B_{\rho/2}(x_i)$ with
+probability $\mu(B_{\rho/2}) / \mu(\Qfree) = \mu(B_1)\,(\rho/2)^d / \mu(\Qfree) = \sigma \rho^d$. The
+$n$ samples are independent, so the ball is empty with probability $(1 - \sigma\rho^d)^n$.
+
+**Step 6 — the exponential.** $(1 - \beta)^n \le e^{-\beta n}$ for $\beta \in [0, 1]$, giving the
+theorem. $\blacksquare$
+
+*Where the $k$-nearest rule breaks the proof.* Step 2 assumes every pair of samples within $\rho$ is
+tried. The $k$-nearest rule tries only $k$ pairs per node, and nothing stops all $k$ from lying in
+the *same* ball while the neighbor in the next ball goes untried. Exercise 1 asks for the picture.
+The repair is either a radius rule — connect everything within $r$ — or a $k$ that grows with $n$;
+[Chapter 13](/chapters/ch13-optimal-sampling)'s PRM\* radius $r_n$ is exactly that repair, and the
+chapter proves it is also the smallest one that keeps the per-node work logarithmic. Kavraki,
+Kolountzakis and Latombe [C ref. 223] extend the theorem to paths of varying clearance by tiling with
+balls of varying radius.
+</Derivation>
+
+Now the numbers, because the shape of a bound is cheap and its constants are the point. Take
+$d = 2$, a free space occupying $\mu(\Qfree) = 0.9$ of the unit square, a path of length $L = 1.2$
+with clearance $\rho = 0.1$. Then $\sigma = \pi / (4 \cdot 0.9) = 0.8727$, $\sigma\rho^2 = 0.008727$,
+and $m = \lceil 24 \rceil = 24$ balls. The bound is $24\, e^{-0.008727\, n}$:
+
+| $n$ | bound |
+|---|---|
+| $500$ | $0.306$ |
+| $892$ | $0.0100$ — the smallest $n$ at or below one percent |
+| $1000$ | $0.0039$ |
+
+Exponential in shape; nine hundred samples for a two-dimensional problem a child could solve by
+eye. Theorem 7.4.1 is a *proof* that PRM works, not a *budget*, and the gap between the two is where
+the sampler zoo earns its keep. The check `Theorem 7.4.1 constants` pins all five numbers.
+
+### Theorem 7.4.2 — expansive spaces
+
+The second analysis drops the known path and characterizes the *space*. Three definitions, each
+about how much of $\Qfree$ a point can see.
+
+<KeyIdea title="Definitions 7.4.2–7.4.5 — ε-good, β-lookout, (ε, α, β)-expansive, linking sequence">
+Let $\mathrm{reach}(x) = \{\, y \in \Qfree : \Dist(x, y) \ne \text{NIL} \,\}$ be what $x$ sees, and
+$\mathrm{reach}(S) = \bigcup_{x \in S} \mathrm{reach}(x)$.
+
+- $\Qfree$ is **$\epsilon$-good** if every $x$ sees at least an $\epsilon$ fraction of its component:
+  $\mu(\mathrm{reach}(x)) \ge \epsilon\, \mu(\Qfree)$.
+- The **$\beta$-lookout** of a connected $S$ is the part of $S$ that sees at least a $\beta$ fraction
+  of what $S$ does not:
+  $\mathrm{lookout}_\beta(S) = \{\, x \in S : \mu(\mathrm{reach}(x) \setminus S) \ge \beta\, \mu(\Qfree \setminus S) \,\}$.
+- $\Qfree$ is **$(\epsilon, \alpha, \beta)$-expansive** if it is $\epsilon$-good and every connected
+  $S$ has $\mu(\mathrm{lookout}_\beta(S)) \ge \alpha\, \mu(S)$: a fixed fraction of any region is
+  lookout.
+- A **linking sequence** from $x$ is $x_1 = x$, $x_i \in \mathrm{lookout}_\beta(X_{i-1})$ with
+  $X_i = X_{i-1} \cup \mathrm{reach}(x_i)$: each new point was chosen from the part of the current
+  reach set that sees a lot of new space.
+</KeyIdea>
+
+Choset's figure 7.19 gives the intuition: two squares of side $W$ joined by a corridor of width $w$
+and length $W$. A point in mid-corridor sees a sliver of each room, a point in a room sees most of
+that room and almost nothing beyond the corridor, so $\epsilon \approx \alpha \approx \beta \approx
+w / W$. Exercise 2 asks for the computation; the widget below measures what the estimate predicts.
+
+<Deferred minHeight={700}>
+  <NarrowPassage />
+</Deferred>
+
+<KeyIdea title="Theorem 7.4.2 (Hsu, Latombe and Motwani; Choset §7.4.2)">
+If $\Qfree$ is $(\epsilon, \alpha, \beta)$-expansive and the planner draws $2n + 2$ uniform samples
+with
+$$
+n \;=\; \Big\lceil \frac{8 \ln (8 / \epsilon\alpha\delta)}{\epsilon\alpha} + \frac{3}{\beta} \Big\rceil ,
+$$
+then with probability at least $1 - \delta$, every connected component of $\Qfree$ is captured by one
+connected component of the roadmap.
+</KeyIdea>
+
+<Derivation title="Theorem 7.4.2 — linking sequences and overlapping reach sets" result="\Pr[\text{some component split}] \le \delta \text{ when } n \ge \lceil 8\ln(8/\epsilon\alpha\delta)/\epsilon\alpha + 3/\beta \rceil">
+**Step 1 — Lemma 7.4.6: a sample has a long linking sequence.** Let $s = 1 / \alpha\epsilon$. For a
+sample $x \in V$, the probability that $V$ contains no linking sequence of length $t$ starting at $x$
+is at most $s\, e^{-(n - t - 1)/s}$. Sketch: at each stage the lookout of the current reach set has
+measure at least $\alpha \mu(X_{i-1}) \ge \alpha\epsilon\, \mu(\Qfree)$ by expansiveness and
+$\epsilon$-goodness, so each of the remaining samples lands in it with probability at least $1/s$;
+the chance that $n - t - 1$ independent tries all miss is $(1 - 1/s)^{n - t - 1} \le e^{-(n-t-1)/s}$,
+and a union over the $t$ stages contributes the factor $s$ after some bookkeeping.
+
+**Step 2 — Lemma 7.4.7: a long linking sequence sees most of the component.** With
+$t \ge \beta^{-1} \ln 4$, the reach set $X_t$ of a linking sequence covers at least three quarters of
+the component: each step adds at least a $\beta$ fraction of what is still uncovered, so the
+uncovered measure shrinks by $(1 - \beta)$ per step and $(1 - \beta)^t \le e^{-\beta t} \le 1/4$.
+
+**Step 3 — two such sets overlap.** If $x$ and $y$ in the same component both have linking sequences
+with $\mu(X_t), \mu(Y_t) \ge \tfrac34 \mu$, then $\mu(X_t \cap Y_t) \ge \tfrac12 \mu$ of the
+component.
+
+**Step 4 — a third batch hits the overlap.** Draw a further $n$ samples. One lands in the overlap and
+is therefore connected to both $x$'s and $y$'s roadmap components with probability at least
+$1 - (1 - 1/2)^n \ge 1 - e^{-n/2}$ — Choset carries the sharper $1 - e^{-n\epsilon/2}$ through the
+$\epsilon$-goodness of the overlap's points.
+
+**Step 5 — union bound over pairs.** There are $\binom{n}{2}$ pairs of first-batch samples; each
+fails to be joined with probability at most the sum of the two Lemma 7.4.6 terms and the Step 4
+term. Requiring the total to be at most $\delta$ and
+
+**Step 6 — solving for $n$** gives the stated expression, with $3/\beta$ accounting for the
+linking-sequence length $t$ of Step 2 and the logarithm absorbing the $\binom n2$ and the constant
+$s$. $\blacksquare$
+</Derivation>
+
+Put in the corridor's numbers. At $\epsilon = \alpha = \beta = 0.1$ and $\delta = 0.05$ the theorem
+asks for $n = 7775$, that is $2n + 2 = 15{,}552$ samples. The narrow-passage widget connects a
+corridor with $w / W = 0.125$ on every seed with a hundred and fifty. **Right shape, hopeless
+constants** — the theorem's value is not the number but the *dependence*: $1 / \epsilon\alpha$ in
+front of a logarithm, so halving the corridor roughly quadruples the samples the bound demands, and
+the widget's uniform curve falls off in just that way as $w$ shrinks.
+
+### Theorem 7.4.3 — abstract path tiling
+
+The third analysis is the most general and, once seen, the simplest. It does not care what $\Dist$
+is or how samples are drawn.
+
+<KeyIdea title="Theorem 7.4.3 (Ladd and Kavraki; Choset §7.4.3)">
+Let $R \subset \Qfree \times \Qfree$ be any measurable relation used as the local planner
+($x \mathrel{R} y$ means $\Dist(x, y) \ne$ NIL) and $\mu$ any sampling measure. PRM with $(R, \mu)$
+is probabilistically complete iff Algorithm 15 — guess $x_{\ell+1} \sim \mu$, require
+$x_\ell \mathrel{R} x_{\ell+1}$, stop when $x_\ell \mathrel{R} y$ — succeeds with nonzero
+probability on every solvable query. When it does, there exist $\ell$ and $p > 0$ with
+$\Pr[\text{FAILURE after } n \text{ samples}] \le \ell\, e^{-pn}$.
+</KeyIdea>
+
+<Derivation title="Theorem 7.4.3 — both directions, and the exponential" result="\Pr[\text{FAILURE}] \le \ell\,(1 - p)^n \le \ell\, e^{-pn}">
+**Step 1 — forward.** A run of Algorithm 15 that succeeds in $\ell$ guesses produces
+$x_1 \mathrel{R} x_2 \mathrel{R} \cdots \mathrel{R} x_\ell \mathrel{R} y$. The $x_i$ are draws from
+$\mu$ and every consecutive pair is $R$-related, so the same draws, handed to PRM, produce a roadmap
+containing that path. PRM succeeds whenever Algorithm 15 does.
+
+**Step 2 — converse.** Suppose PRM succeeds with probability $P > 0$ using $n$ nodes, and take a
+minimal successful roadmap. Its success does not depend on the order in which the nodes were drawn,
+so one of the $n!$ orderings lists the solution path's nodes first and in path order — and that
+ordering is a successful run of Algorithm 15 with probability at least $P / n!$. Nonzero is nonzero.
+
+**Step 3 — rectangles.** The set $S \subset R^\ell$ of successful $\ell$-sequences has positive
+$\mu^\ell$-measure. Any measurable set of positive product measure contains a product
+$A_1 \times \cdots \times A_\ell$ of positive measure — so pick one, with every
+$A_i \mathrel{R} A_{i+1}$ pairwise.
+
+**Step 4 — the rate.** Let $p = \min_i \mu(A_i)$. Each of the $\ell$ rectangles receives one of the
+$n$ samples with probability $1 - (1 - \mu(A_i))^n \ge 1 - (1 - p)^n$.
+
+**Step 5 — union bound.** FAILURE requires some $A_i$ to be empty, which happens with probability at
+most $\ell (1 - p)^n \le \ell\, e^{-pn}$. $\blacksquare$
+
+*What was never used.* Symmetry of $R$ and reflexivity were not needed: an **asymmetric** local
+planner — [Chapter 21](/chapters/ch21-nonholonomic-ii)'s Dubins paths, which cannot be driven backward
+— gives a directed roadmap and the same theorem. Nor was it required that $\mu$ be uniform or that
+$\Q$ be a configuration space: time as an extra coordinate, which
+[Chapter 14](/chapters/ch14-many-bodies) previews for kinodynamic planning, is covered as written.
+</Derivation>
+
+## The algorithm
+
+<Algorithm
+  name="BASIC PRM — roadmap construction  (Choset Algorithm 6)"
+  inputs="n, the number of nodes; k, the number of neighbors; a sampler; a distance function dist; a local planner Δ"
+  outputs="a roadmap G = (V, E)"
+  complexity="n samples (plus rejections) + n k-nearest-neighbor queries + at most nk calls to Δ, each ⌈dist/step⌉ collision checks"
+>
+1. $V \leftarrow \emptyset$; $E \leftarrow \emptyset$
+2. **while** $\lvert V \rvert < n$ **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;**repeat** $q \leftarrow$ a random configuration **until** $q$ is collision-free
+4. &nbsp;&nbsp;&nbsp;&nbsp;$V \leftarrow V \cup \{q\}$
+5. **for all** $q \in V$ **do**
+6. &nbsp;&nbsp;&nbsp;&nbsp;$N_q \leftarrow$ the $k$ closest neighbors of $q$ in $V$ under `dist`
+7. &nbsp;&nbsp;&nbsp;&nbsp;**for all** $q' \in N_q$ **do**
+8. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**if** $(q, q') \notin E$ **and** $\Dist(q, q') \ne$ NIL **then** $E \leftarrow E \cup \{(q, q')\}$
+9. **return** $G = (V, E)$
+</Algorithm>
+
+Two orders are both in Choset and both in the implementation. `build(n)` is Algorithm 6 literally:
+all nodes first, then every node's $k$ nearest among *all* nodes — the order the worked example
+below is traced under. `grow(n)` is the incremental form of §7.1.1's "adding to the roadmap": each
+new node connects to its $k$ nearest among the nodes already present, which is what lets Roadmap
+Rain scrub the build by time, and what makes the planner single-query when $\qstart$ and $\qgoal$
+are the first two nodes (§7.2).
+
+<Algorithm
+  name="SOLVE QUERY  (Choset Algorithm 7)"
+  inputs="q_start, q_goal, k, the roadmap G"
+  outputs="a path from q_start to q_goal, or FAILURE"
+  complexity="at most 2k calls to Δ plus one Dijkstra or A* (Chapter 6) over G"
+>
+1. $N_{\qstart} \leftarrow$ the $k$ closest neighbors of $\qstart$ in $V$; likewise $N_{\qgoal}$
+2. $V' \leftarrow V \cup \{\qstart, \qgoal\}$; $E' \leftarrow E$
+3. **for** $q'$ in $N_{\qstart}$ in order of increasing `dist` **do** **if** $\Dist(\qstart, q') \ne$ NIL **then** add $(\qstart, q')$ to $E'$ and **break**
+4. **for** $q'$ in $N_{\qgoal}$ in order of increasing `dist` **do** **if** $\Dist(\qgoal, q') \ne$ NIL **then** add $(\qgoal, q')$ to $E'$ and **break**
+5. $P \leftarrow$ shortest path from $\qstart$ to $\qgoal$ in $G' = (V', E')$
+6. **if** $P$ is not empty **then return** $P$ **else return** FAILURE
+</Algorithm>
+
+The implementation prefers, among $\qgoal$'s candidates, those already in $\qstart$'s component —
+a cheap way to avoid attaching the two endpoints to two components that will never meet. And it
+can report FAILURE falsely: the roadmap may simply not have seen the passage yet. That is the
+honest reading of "probabilistically complete", and the planner's answer to it is to grow and ask
+again.
+
+### The six-sample roadmap, by hand
+
+The example the implementation is tested against is small enough to trace. A point robot lives in
+$\W = [0, 10]^2$ with one wall $\WO = [4.5, 5.5] \times [0, 7]$, so $\QO = \WO$ and the gap is above
+$y = 7$. Six free samples arrive in order:
+$s_1 = (1, 2)$, $s_2 = (3, 5)$, $s_3 = (2, 8)$, $s_4 = (7, 2)$, $s_5 = (8, 6)$, $s_6 = (6, 9)$.
+The metric is Euclidean, $\Dist$ is the straight line with subdivision at step $0.25$. The distances
+that matter:
+
+| pair | distance | | pair | distance |
+|---|---|---|---|---|
+| $s_1 s_2$ | $\sqrt{13} = 3.606$ | | $s_1 s_4$ | $6.000$ |
+| $s_2 s_3$ | $\sqrt{10} = 3.162$ | | $s_2 s_4$ | $5.000$ |
+| $s_3 s_6$ | $\sqrt{17} = 4.123$ | | $s_2 s_6$ | $5.000$ |
+| $s_4 s_5$ | $\sqrt{17} = 4.123$ | | $s_2 s_5$ | $5.099$ |
+| $s_5 s_6$ | $\sqrt{13} = 3.606$ | | | |
+
+**$k = 1$.** Each sample's single nearest neighbor: $s_1 \to s_2$, $s_2 \to s_3$, $s_3 \to s_2$,
+$s_4 \to s_5$, $s_5 \to s_6$, $s_6 \to s_5$. The candidate edges are $\{s_1 s_2, s_2 s_3, s_4 s_5,
+s_5 s_6\}$, every one of them lies on one side of the wall, and $\Dist$ accepts all four. The roadmap
+has **two components**, $\{s_1, s_2, s_3\}$ and $\{s_4, s_5, s_6\}$. It has not seen the gap.
+
+**$k = 2$.** The second neighbors add $s_1 s_4$, $s_2 s_4$ and $s_3 s_6$ (the others repeat). The
+segment $s_1 s_4$ runs along $y = 2$ straight through the wall: NIL. The segment $s_2 s_4$ crosses
+the wall's $x$-band at $y \in [3.125, 3.875]$, well below the gap: NIL. The segment $s_3 s_6$ crosses
+the band at $y \in [8.625, 8.875]$, above $y = 7$: free. Five edges,
+$\{s_1 s_2, s_2 s_3, s_3 s_6, s_5 s_6, s_4 s_5\}$, **one component**, and the roadmap path from
+$s_1$ to $s_4$ goes the long way round the top:
+$$
+s_1 \to s_2 \to s_3 \to s_6 \to s_5 \to s_4,
+\qquad 3.606 + 3.162 + 4.123 + 3.606 + 4.123 = 18.620 .
+$$
+
+Two rejections and one extra edge are the whole difference between a roadmap that has found the gap
+and one that has not — which is the $k$-nearest gap of Theorem 7.4.1 in miniature.
+
+## Implementation in Rust
+
+The `sampling` crate is introduced here and imported by Chapters 12, 13, 14, 21 and 22. Its design
+rule is the chapter's thesis: the planner may ask the world one question, and it may ask the
+configuration space three. Everything is generic over [Chapter 5](/chapters/ch05-configuration-space-ii)'s
+`Manifold`, which is *not* redefined.
+
+```rust title="crates/sampling/src/lib.rs"
+use manifold::Manifold;                 // Ch. 5: type Point; dim, dist, interpolate, sample
+use rand::rngs::SmallRng;
+
+/// What this chapter asks of the world — and nothing else. Blanket-implemented for any
+/// (robot, world) pair with a Ch. 2 `Collision` impl, so planners never see parry2d.
+pub trait FreeSpace<M: Manifold> {
+    fn is_free(&self, q: &M::Point) -> bool;
+    /// Collision-check counter: the book's cost unit, shown separately from Δ calls.
+    fn checks(&self) -> u64;
+}
+
+/// Node sampler. `None` = attempt rejected — the Gaussian, bridge and OBPRM samplers reject
+/// most attempts *by design*, so callers loop on attempts and count them.
+pub trait Sampler<M: Manifold> {
+    fn sample(&mut self, space: &M, free: &dyn FreeSpace<M>, rng: &mut SmallRng) -> Option<M::Point>;
+}
+pub struct Uniform;
+pub struct Gaussian { pub sigma: f64 }
+pub struct Bridge { pub length: f64 }
+pub struct Obprm { pub step: f64 }
+pub struct MedialAxis { pub step: f64 }
+pub struct Hybrid<M: Manifold> { pub parts: Vec<(Box<dyn Sampler<M>>, f64)> }
+/// Replays a fixed list — the device that makes the six-sample roadmap independent of any
+/// RNG's bit stream. Ch. 12's hand-traced RRT replays its targets through it too.
+pub struct Scripted<P> { list: Vec<P>, i: usize, require_free: bool }
+
+/// Coordinates for kd-tree splitting; `period(axis)` is Some(2π) on S¹ factors.
+/// The metric stays Manifold::dist — the chart only decides how to split and prune.
+pub trait Chart: Manifold {
+    const D: usize;
+    fn coords(&self, q: &Self::Point) -> nalgebra::SVector<f64, { Self::D }>;
+    fn period(&self, axis: usize) -> Option<f64>;
+}
+pub trait NearestNeighbors<M: Manifold> {
+    fn insert(&mut self, idx: usize, q: M::Point);
+    fn k_nearest(&self, q: &M::Point, k: usize) -> Vec<(usize, f64)>;   // sorted by dist
+    fn within(&self, q: &M::Point, r: f64) -> Vec<(usize, f64)>;        // Ch. 13's Q_near
+}
+
+pub enum EdgeCheck { Incremental { step: f64 }, Subdivision { step: f64 } }   // figure 7.6
+pub struct LocalPath<M: Manifold> { pub waypoints: Vec<M::Point>, pub length: f64 }
+
+/// Δ(q, q'): the local planner. `StraightLine` is deterministic and symmetric; Ch. 21's
+/// Dubins and Reeds–Shepp impls are asymmetric and the roadmap becomes directed (§7.1.1).
+pub trait Steer<M: Manifold> {
+    fn steer(&self, space: &M, free: &dyn FreeSpace<M>, from: &M::Point, to: &M::Point)
+        -> Option<LocalPath<M>>;
+    fn symmetric(&self) -> bool { true }
+}
+pub struct StraightLine { pub check: EdgeCheck }
+```
+
+The kd-tree is hand-rolled, not because a crate could not do flat $\mathbb{R}^d$ — `kiddo` is the
+candidate cross-check in the tests — but because $T^2$ and $\SEtwo$ need periodic axes, and the
+pruning bound is the one place the periodicity must be exact.
+
+```rust title="crates/sampling/src/nn.rs" {22-31}
+/// A kd-tree that splits on chart coordinates and measures with the manifold's metric.
+/// Insertion is incremental (depth-cycled split axis): every planner in Part III grows
+/// its point set one node at a time.
+pub struct KdTree<M: Chart> {
+    root: Option<Box<Node<M>>>,
+    weights: SVector<f64, { M::D }>,     // per-axis scale so the bound never exceeds dist
+    space: M,
+}
+struct Node<M: Chart> { idx: usize, c: SVector<f64, { M::D }>, axis: usize,
+                        left: Option<Box<Node<M>>>, right: Option<Box<Node<M>>> }
+
+impl<M: Chart> KdTree<M> {
+    pub fn insert(&mut self, idx: usize, q: M::Point) {
+        let c = self.space.coords(&q);
+        let mut depth = 0;
+        let mut slot = &mut self.root;
+        while let Some(node) = slot {
+            let a = node.axis;
+            slot = if c[a] < node.c[a] { &mut node.left } else { &mut node.right };
+            depth += 1;
+        }
+        *slot = Some(Box::new(Node { idx, c, axis: depth % M::D, left: None, right: None }));
+    }
+
+    /// √Σ (wᵢ·gapᵢ)²: the distance from a query to a box, with the circular gap on a
+    /// periodic axis — min(|c − s|, T − |c − s|) — so a subtree touching the seam is
+    /// never pruned away from a query on the other side of it.
+    fn lower_bound(&self, qc: &SVector<f64, { M::D }>, lo: &[f64], hi: &[f64]) -> f64 {
+        let mut s = 0.0;
+        for i in 0..M::D {
+            let c = qc[i];
+            let gap = if c < lo[i] || c > hi[i] {
+                match self.space.period(i) {
+                    Some(t) => {
+                        let (dl, dh) = ((c - lo[i]).abs(), (c - hi[i]).abs());
+                        dl.min(t - dl).min(dh).min(t - dh)
+                    }
+                    None => if c < lo[i] { lo[i] - c } else { c - hi[i] },
+                }
+            } else { 0.0 };
+            s += (gap * self.weights[i]).powi(2);
+        }
+        s.sqrt()
+    }
+    // k_nearest / within: depth-first, nearer child first, far child only if
+    // lower_bound(...) <= current k-th best (or r). See `kd_knn`, `kd_range`.
+}
+```
+
+The planner itself is short, because every hard decision was pushed into a trait.
+
+```rust title="crates/sampling/src/prm.rs"
+use petgraph::{graph::UnGraph, unionfind::UnionFind};
+
+pub enum Connect { KNearest { k: usize }, Radius { r: f64 }, Sparse { k: usize, redundant: usize }, Lazy { k: usize } }
+
+pub struct Roadmap<M: Manifold> {
+    pub graph: UnGraph<M::Point, f64>,   // edge weight = local path length
+    pub components: UnionFind<usize>,    // O(1) "how many components?" after every edge
+}
+
+pub struct Prm<M: Chart, S: Sampler<M>, N: NearestNeighbors<M>> {
+    pub space: M, pub sampler: S, pub nn: N, pub steer: Box<dyn Steer<M>>, pub connect: Connect,
+    pub roadmap: Roadmap<M>,
+    pub rng: SmallRng,                   // seeded by the caller; the widget shows the seed
+    pub delta_calls: u64,                // the coarse rain's cost
+}
+
+impl<M: Chart, S: Sampler<M>, N: NearestNeighbors<M>> Prm<M, S, N> {
+    /// Choset Algorithm 6. Resumable: a larger `n` extends the roadmap (§7.1.1 "Adding").
+    pub fn build(&mut self, free: &dyn FreeSpace<M>, n: usize) {
+        let first_new = self.roadmap.graph.node_count();
+        while self.roadmap.graph.node_count() < n {
+            if let Some(q) = self.sampler.sample(&self.space, free, &mut self.rng) {
+                let i = self.roadmap.graph.add_node(q.clone()).index();
+                self.nn.insert(i, q);
+            }
+        }
+        for i in 0..self.roadmap.graph.node_count() {
+            let q = &self.roadmap.graph[i.into()];
+            for (j, d) in self.candidates(i, q) {
+                // Why skip old–old pairs: they were tried when the old nodes were connected.
+                if i < first_new && j < first_new { continue; }
+                if self.roadmap.graph.find_edge(i.into(), j.into()).is_some() { continue; }
+                self.delta_calls += 1;
+                if let Some(lp) = self.steer.steer(&self.space, free, q, &self.roadmap.graph[j.into()]) {
+                    self.roadmap.graph.add_edge(i.into(), j.into(), lp.length);
+                    self.roadmap.components.union(i, j);
+                }
+            }
+        }
+    }
+
+    /// Choset Algorithm 7: attach both endpoints, then Ch. 6 Dijkstra on the roadmap.
+    pub fn query(&mut self, free: &dyn FreeSpace<M>, q_start: &M::Point, q_goal: &M::Point, k: usize)
+        -> Option<Vec<M::Point>>
+    {
+        let a = self.attach(free, q_start, k, None)?;
+        // Prefer goal candidates already in the start's component: cheap, and it avoids
+        // attaching the two endpoints to components that will never meet.
+        let comp = self.roadmap.components.find(a);
+        let b = self.attach(free, q_goal, k, Some(comp))?;
+        let path = search::dijkstra(&self.roadmap.graph, a.into(), b.into())?;
+        Some(std::iter::once(q_start.clone())
+            .chain(path.iter().map(|&i| self.roadmap.graph[i].clone()))
+            .chain(std::iter::once(q_goal.clone()))
+            .collect())
+    }
+}
+```
+
+The worked example is an executable, and its output is what the test asserts.
+
+```rust title="crates/sampling/examples/six_sample_prm.rs"
+use cspace::R2;
+use sampling::{analysis::{prm_failure_bound, samples_for_failure}, *};
+
+fn main() {
+    let world = BoxWorld::new([0.0, 10.0], [0.0, 10.0], &[[4.5, 5.5, 0.0, 7.0]]);   // the wall
+    let samples = vec![[1., 2.], [3., 5.], [2., 8.], [7., 2.], [8., 6.], [6., 9.]];
+    for k in [1usize, 2] {
+        let mut prm = Prm::new(R2::unit_box(10.0), Scripted::new(samples.clone(), true),
+                               KdTree::new(), Box::new(StraightLine { check: EdgeCheck::Subdivision { step: 0.25 } }),
+                               Connect::KNearest { k }, SmallRng::seed_from_u64(1));
+        prm.build(&world, 6);
+        println!("k = {k}: edges {:?}, {} component(s)", prm.roadmap.edge_labels(), prm.roadmap.component_count());
+        if let Some(len) = prm.roadmap.path_length(0, 3) { println!("  path s1 → s4: {len:.3}"); }
+    }
+    for n in [500, 1000] { println!("Pr[FAILURE] ≤ {:.4} at n = {n}", prm_failure_bound(2, 0.9, 1.2, 0.1, n)); }
+    println!("smallest n with bound ≤ 1%: {}", samples_for_failure(2, 0.9, 1.2, 0.1, 0.01));
+}
+```
+
+```text title="cargo run --example six_sample_prm -p sampling"
+k = 1: edges ["12", "23", "45", "56"], 2 component(s)
+k = 2: Δ(s1, s4) = NIL (crosses the wall at y = 2); Δ(s2, s4) = NIL (crosses at y ∈ [3.125, 3.875])
+k = 2: edges ["12", "23", "36", "45", "56"], 1 component(s)
+  path s1 → s4: 18.620
+Pr[FAILURE] ≤ 0.3060 at n = 500
+Pr[FAILURE] ≤ 0.0039 at n = 1000
+smallest n with bound ≤ 1%: 892
+```
+
+```rust title="crates/sampling/tests/prm.rs"
+#[test]
+fn reproduces_six_sample_roadmap() {
+    let (edges1, comps1) = six_sample(1);
+    assert_eq!(edges1, ["12", "23", "45", "56"]);
+    assert_eq!(comps1, 2);
+    let (edges2, comps2, len) = six_sample_with_path(2);
+    assert_eq!(edges2, ["12", "23", "36", "45", "56"]);
+    assert_eq!(comps2, 1);
+    assert!((len - 18.620).abs() < 1e-3);
+}
+
+/// 2 000 points on T², 200 queries, k = 8: the periodic kd-tree agrees with a linear scan,
+/// including the neighbors that live across the seam.
+#[test]
+fn kd_tree_matches_linear_on_torus() {
+    let mut rng = SmallRng::seed_from_u64(5);
+    let (mut kd, mut lin) = (KdTree::new(T2), Linear::new(T2));
+    for i in 0..2000 { let q = T2.sample(&mut rng); kd.insert(i, q); lin.insert(i, q); }
+    for _ in 0..200 {
+        let q = T2.sample(&mut rng);
+        assert_eq!(kd.k_nearest(&q, 8), lin.k_nearest(&q, 8));
+    }
+}
+```
+
+The TypeScript port that runs the widgets, `web/lib/sampling/{prm,sampler,kdtree,steer}.ts`, is
+pinned to the same roadmap: the check `six-sample roadmap, k = 2` asserts the edge set
+$\{12, 23, 36, 45, 56\}$, one component and the path length $18.620$ to $10^{-3}$, and the constants
+check asserts $\sigma = 0.8727$, $m = 24$, $0.306$, $0.0039$ and $892$.
+
+## Putting it together: one planner, two robots
+
+The integration lab is the point of the generic design. The *same* `Prm` — the same file, the same
+code path, no planner line changed — runs on Rusty as a disc in the Apartment, where the space is
+$\mathbb{R}^2$ with Euclidean distance, and on Reach on the Workbench, where the space is $T^2$ and
+the straight line between two configurations may pass through the seam. The only two things that
+differ are the `Manifold` and the `FreeSpace`, and both come from earlier chapters. Roadmap Rain's
+two tabs are that lab; the checks `PRM path is collision-free by an independent dense check` and
+`the same Prm on T² (Reach, Workbench)` re-verify every returned path at five millimetres,
+independently of the planner's own checks, on both robots.
+
+Three lessons to take from the lab before the chapter closes.
+
+**The cost unit is the collision check.** Build a six-hundred-node roadmap with $k = 6$ and watch
+the two counters: a few thousand calls to $\Dist$, and an order of magnitude more collision checks,
+because every edge is a row of them. When Chapter 12 claims that a tree planner is cheaper for one
+query, or Chapter 13 that lazy collision checking saves most of FMT\*'s budget, those claims are in
+this unit, and they are only meaningful because this chapter counted it separately.
+
+**The roadmap is the expensive thing; the query is cheap.** Once built, a query costs two
+attachments and a Dijkstra — milliseconds. That is the economics of a *multi-query* planner: pay
+once, ask often. It is the right economics for a robot that lives in one room and is asked for a
+thousand paths.
+
+**It is the wrong economics for a robot that is asked for one path, now.** Most robots have one
+query — from where they are to where they want to be — and then the world changes. Move one obstacle
+on the Workbench and the roadmap is stale: every edge through the moved object's new C-obstacle is
+wrong, and nothing in the roadmap knows which. A planner that builds only the part of $\Qfree$ the
+current query needs, and stops the instant start and goal connect, would spend its budget on the
+right problem. That planner is a *tree*, and it is [Chapter 12](/chapters/ch12-tree-planners).
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="The k-nearest gap in Theorem 7.4.1">
+    Step 2 of the ball-tiling proof assumes every pair of samples within $\rho$ of each other is
+    tried by $\Dist$. Exhibit a configuration of samples, in the plane, where every ball
+    $B_{\rho/2}(x_i)$ of the tiling contains a sample and yet the $k = 1$ roadmap is disconnected.
+    Then state the smallest change to the connection rule that restores the proof, and say what it
+    costs in calls to $\Dist$ per node as $n$ grows.
+    <Hints>
+      <>Put three samples in one ball, close together, and one sample in the next ball along the path. Whose nearest neighbor is the lonely one?</>
+      <>A radius rule — connect every pair within distance ρ — restores Step 2 verbatim. How many samples fall within ρ of a given one when n is large?</>
+      <>Linear in n. Chapter 13's r_n = γ (log n / n)^(1/d) is the radius that shrinks just fast enough to make that count logarithmic while keeping the balls of this proof hit forever.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Figure 7.19 by measure">
+    Two squares of side $W$ are joined by a corridor of width $w$ and length $W$. Compute
+    $\mu(\mathrm{reach}(x))$ for a point $x$ at mid-corridor to leading order in $w / W$, and for a
+    point in the middle of a room. Deduce the $\epsilon$ of Definition 7.4.2, then argue — by
+    taking $S$ to be one room plus half the corridor — that $\alpha$ and $\beta$ are also of order
+    $w / W$. Where does the straight-line local planner enter?
+    <CheckAnswer id="ch11.e2" prompt="For w / W = 0.1, what is ε to one significant figure (as a fraction of μ(Q_free) ≈ 2W²)?" answer={0.05} tolerance={0.03}>
+    From mid-corridor, straight lines reach a wedge of each room whose area is of order $w W$, so
+    $\mu(\mathrm{reach}(x)) \approx 2\,c\, w W$ for a constant $c$ near $\tfrac12$, against
+    $\mu(\Qfree) \approx 2 W^2$: $\epsilon \approx c\, w / W$. Choset writes the estimate as
+    $\epsilon \approx w / W$ with the constant dropped; the point is the dependence, which the
+    narrow-passage widget's uniform curve follows.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the narrow passage, then verify">
+    <Predict
+      id="ch11.e3"
+      question="In Narrow Passage at n = 150 the uniform sampler connects every one of 24 seeds at w = 0.50 m (w/W = 0.125). Before touching the slider: what fraction of seeds connect at w = 0.15 m (w/W = 0.0375)?"
+      options={[
+        { label: 'Still nearly all — the corridor is only three times narrower', because: 'The probability that one of 150 samples lands in the corridor scales with its area, which is three times smaller, and the roadmap needs several samples in it (or lucky alignment) to chain through. Theorem 7.4.2 says the required n scales like 1/(εα) ∝ (W/w)², a factor of nine.' },
+        { label: 'Roughly half', correct: true, because: 'Right. The measured rate at w = 0.15 m is about 40 percent of seeds. The exponent of Theorem 7.4.2 scales as 1/(εα) ∝ (W/w)²: nine times the samples for the same confidence, and at fixed n the success probability falls off accordingly.' },
+        { label: 'Essentially none', because: 'Too pessimistic. The corridor is straight, so two samples at its mouths that happen to see each other through it suffice; with 150 samples in 48 m² that still happens on a good fraction of seeds.' },
+      ]}
+    >
+    Now enable the Gaussian sampler. Its curve stays at the top at every width, because Derivation 4
+    puts its mass within $O(\sigma)$ of *every* boundary — the corridor's two walls included — so
+    the corridor is sampled on every seed. Read what it pays: the attempts counter runs several times
+    the node count, and the cloud shows samples hugging the rooms' outer walls where they do nothing
+    for the query. Then enable the bridge test: at $w = 0.25$ m it recovers most of uniform's loss,
+    and at $w = 0.15$ m it does not, because the bridge of length one metre now has both piers in
+    collision in only a thin set of directions.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Interleaved components on the torus">
+    In Roadmap Rain's torus tab, find a seed and a sample count $n$ at which two roadmap components
+    interleave on the unwrapped square — their nodes alternate along a strip — separated only by the
+    amber band of the block's C-obstacle. Which connection strategy would join them soonest: more
+    neighbors $k$, connection sampling around low-degree nodes, or the bridge test? Explain using
+    where each puts its next sample.
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="Lazy PRM">
+    Implement `Connect::Lazy` (Bohlin and Kavraki, Choset ref. 53): build the roadmap with no edge
+    checks at all, search, then check the nodes and then the edges along the candidate path
+    coarse-to-fine — the midpoints of every edge first, then the quarter points — deleting the first
+    blocked edge and searching again until a path survives. Record, per edge, the resolution at which
+    it was last checked so that a later path does not repeat work. Report collision checks against
+    `KNearest` on the Workbench over 50 seeds, at the same $n$ and $k$, and explain the ratio.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Halton points and dispersion">
+    Add a `Halton` sampler (bases 2 and 3 mapped onto the torus) and an estimator of dispersion
+    $\delta(P, \rho)$ by probing with a fine grid. Show that two builds at the same $n$ produce
+    identical roadmaps, that dispersion falls like $n^{-1/2}$ on $T^2$, and that the planner is now
+    resolution complete rather than probabilistically complete. Then build the adversarial layout
+    Choset promises exists: a free space where the Halton roadmap at some $n$ misses a passage that
+    uniform sampling finds on most seeds.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 7, §7.1 and §7.4, is this chapter's source: Algorithms 6, 7 and 15, the sampler zoo of §7.1.3, and the three completeness analyses with the definitions quoted here. The bridge test (ref. 193), the Gaussian sampler (ref. 59), OBPRM (ref. 18), MAPRM (ref. 427), Lazy PRM (refs. 53–54) and the kd-tree (ref. 124) are cited through its bibliography."
+  />
+  <Reference
+    authors="Kavraki, L. E., Švestka, P., Latombe, J.-C., and Overmars, M. H."
+    year={1996}
+    title="Probabilistic Roadmaps for Path Planning in High-Dimensional Configuration Spaces"
+    venue="IEEE Transactions on Robotics and Automation 12(4), 566–580"
+    doi="10.1109/70.508439"
+    note="The planner. Two phases, coarse and fine sampling, the k-nearest connection rule and the first experiments on many-degree-of-freedom arms."
+  />
+  <Reference
+    authors="Hsu, D., Latombe, J.-C., and Motwani, R."
+    year={1999}
+    title="Path Planning in Expansive Configuration Spaces"
+    venue="International Journal of Computational Geometry and Applications 9(4–5), 495–512"
+    doi="10.1142/S0218195999000285"
+    note="(ε, α, β)-expansiveness and Theorem 7.4.2; the paper's linking sequences are the proof device Derivation 2 follows."
+  />
+  <Reference
+    authors="Karaman, S. and Frazzoli, E."
+    year={2011}
+    title="Sampling-based Algorithms for Optimal Motion Planning"
+    venue="International Journal of Robotics Research 30(7), 846–894"
+    doi="10.1177/0278364911406761"
+    note="Where the k-nearest gap of Theorem 7.4.1 is closed: the r_n and k_n connection rules of PRM*, which Chapter 13 derives."
+  />
+  <Reference
+    authors="de Berg, M., Cheong, O., van Kreveld, M., and Overmars, M."
+    year={2008}
+    title="Computational Geometry: Algorithms and Applications"
+    venue="Springer, 3rd edition"
+    doi="10.1007/978-3-540-77974-2"
+    note="Chapter 5 is the kd-tree Choset recommends: O(n log n) to build, O(n^{1−1/d} + m) per range query. The periodic pruning bound is this book's addition."
+  />
+  <Reference
+    authors="LaValle, S. M."
+    year={2006}
+    title="Planning Algorithms"
+    venue="Cambridge University Press"
+    url="http://lavalle.pl/planning/"
+    note="Chapter 5 treats sampling-based planning with the fullest discussion of metrics on SE(2) and SE(3), dispersion and discrepancy, and Sukharev grids."
+  />
+  <Reference
+    authors="Şucan, I. A., Moll, M., and Kavraki, L. E."
+    year={2012}
+    title="The Open Motion Planning Library"
+    venue="IEEE Robotics and Automation Magazine 19(4), 72–82"
+    doi="10.1109/MRA.2012.2205651"
+    note="The reference implementations of PRM and of every sampler in this chapter, with the state-space abstraction this book's Manifold trait mirrors."
+  />
+</References>

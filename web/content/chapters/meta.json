@@ -1,0 +1,30 @@
+{
+  "title": "Chapters",
+  "root": true,
+  "pages": [
+    "index",
+    "---Part I · Foundations---",
+    "ch01-robots-that-plan",
+    "ch02-the-lab",
+    "ch03-bug-algorithms",
+    "ch04-configuration-space-i",
+    "ch05-configuration-space-ii",
+    "---Part II · Classical Planners---",
+    "ch06-graph-search",
+    "ch07-potential-functions",
+    "ch08-roadmaps-i",
+    "---Part III · Sampling-Based Planning---",
+    "ch11-prm",
+    "ch12-tree-planners",
+    "ch13-optimal-sampling",
+    "ch14-many-bodies",
+    "---Part IV · Planning with Uncertainty---",
+    "ch15-kalman-observer",
+    "ch16-bayesian-localization",
+    "---Part V · Dynamics and Constraints---",
+    "ch17-robot-dynamics",
+    "ch18-trajectory-planning",
+    "ch19-trajectory-optimization",
+    "ch20-nonholonomic-i"
+  ]
+}

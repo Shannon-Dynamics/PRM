@@ -1,0 +1,924 @@
+---
+title: Optimal Sampling-Based Planning
+description: Why RRT's path never improves and what fixing it costs — RRT*, PRM* and the radius r_n = γ(log n/n)^{1/d} with its 2011 and 2020 constants, Informed RRT*'s ellipse, FMT*'s lazy dynamic programming, BIT*'s batches, and the anytime contract for a robot that must move before the planner is done.
+chapter: 13
+part: PART III
+partTitle: Sampling-Based Planning
+difficulty: Advanced
+readingTime: 80 min
+quote: "In general, if paths with certain optimality criteria are desired, it is worth trying to build these paths during the roadmap construction phase of PRM. For example, a large dense roadmap will probably yield shorter paths than a smaller and sparser roadmap."
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §7.1.2
+---
+
+import { WobbleHook } from '@/components/ch/ch13/wobble-hook';
+import { RewireWatch } from '@/components/ch/ch13/rewire-watch';
+import { EllipseShrinker } from '@/components/ch/ch13/ellipse-shrinker';
+import { BatchBench } from '@/components/ch/ch13/batch-bench';
+import { ShrinkingTiling } from '@/components/ch/ch13/shrinking-tiling';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'State what asymptotic optimality means for a sampling-based planner and prove that RRT does not have it — its best path converges, almost surely, to the wrong value',
+    'Derive the two local operations, choose-parent and rewire, that repair it, and trace one RRT* iteration on a five-node tree by hand',
+    'Explain why the neighborhood radius must be exactly r_n = γ(log n/n)^{1/d}: shrink faster and the tiling balls go empty, slower and the per-iteration work stops being O(log n) — and compute both the 2011 and the 2020 constants',
+    'Derive the informed set as the ellipse with foci at start and goal and string length c_best, and its measure as the share of the space still worth sampling',
+    'Read FMT* as lazy dynamic programming on one batch and BIT* as A* over an implicit random geometric graph, and say what each has at a given deadline',
+    'Write sampling::optimal — CostTree, RrtStar, PrmStar, InformedSampler, Fmt, Bit, Anytime — and run the anytime contract: stop at a deadline, execute, keep refining',
+  ]}
+  prerequisites={[
+    'Everything in Chapter 11 is imported: Sampler, KdTree::within for the r_n-ball, Steer, FreeSpace, Theorem 7.4.1\'s tiling constant and the (ε, α, β) vocabulary',
+    'Chapter 12\'s Tree, Extend and RRT — the baseline whose Voronoi bias is unchanged by rewiring',
+    'A* on the inflated lattice as a cost floor; g + h as an edge key (Chapter 6)',
+    'Manifold::dist as a cost; the geodesic through the seam on T² (Chapter 5)',
+  ]}
+>
+Chapters [11](/chapters/ch11-prm) and [12](/chapters/ch12-tree-planners) bought feasibility with
+randomness and proved the price: the failure probability decays exponentially in the number of
+samples. They said nothing about the *quality* of the path, and anyone who has watched Tree Grower
+knows why — the first path is a jagged accident of sample order.
+
+This chapter asks the question Choset's 2005 text could not. Does more sampling make the path
+better? For RRT the answer, proved by Karaman and Frazzoli in 2011, is *no, almost surely*: the tree
+is anchored to its root through edges it never reconsiders. The repair is two local operations,
+choose-parent and rewire, inside a neighborhood of radius $r_n = \gamma (\log n / n)^{1/d}$, and the
+"aha" is *why that exact rate*. The ball must shrink so that the per-iteration cost stays
+$O(\log n)$, but no faster than the scale at which a random geometric graph stays connected —
+Chapter 11's tiling balls, now required to keep receiving samples forever.
+
+From RRT\* and PRM\* the chapter builds the modern batch family — Informed RRT\* samples only where
+improvement is possible, FMT\* and BIT\* search an implicit random geometric graph with a heuristic —
+and ends with what "anytime" means for a robot that must move before the planner is done. Nothing in
+this chapter is in Choset; its scaffolding, the ball tiling and the expansiveness constants, is. The
+sister book's [Chapter 20](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch20-motion-planning)
+states the central theorem in a paragraph and defers here.
+</Overview>
+
+## The problem: the path does not get better
+
+Let Reach execute the path Chapter 12's RRT found on the Workbench.
+
+<Deferred minHeight={520}>
+  <WobbleHook />
+</Deferred>
+
+Three needless reversals of the fingertip, a loop that goes the long way round the block. Give the
+planner ten thousand more iterations and the path does not change: the tree gets denser everywhere,
+and the path to the goal is the same jagged chain of edges it was when it first arrived. On the
+right, the *same* random samples, in the same order, with one flag flipped: the tree is allowed to
+reconsider which node each node hangs from. The cost drops within the first few hundred iterations
+after the first solution and keeps dropping, and the arm goes the short way.
+
+Feasibility and quality are separate contracts. Part III has so far delivered only the first.
+
+## Building intuition: a tree allowed to change its mind
+
+The ordinary RRT adds a node by attaching it to the nearest tree node, and that attachment is final.
+RRT\* adds the same node — the Voronoi bias of Chapter 12 is untouched — and then does two things in
+a ball around it. **Choose-parent:** among the tree nodes in the ball, attach to the one through which
+the new node's cost-to-come is smallest, not the nearest. **Rewire:** for every other node in the
+ball, if going through the new node would be cheaper than its current cost, make the new node its
+parent and propagate the saving down its subtree.
+
+<Deferred minHeight={900}>
+  <RewireWatch />
+</Deferred>
+
+Left and right consume the same seeded stream of random targets, so they have the same nodes; only
+the edges differ. Watch the two cost curves. The left one is flat — it changes only on the rare
+occasion that a *new* node happens to enter the goal region more cheaply than the old one, and it
+never approaches the dashed lattice floor. The right one descends, and every drop is a flash of
+rewired edges somewhere in the tree. The misconception this widget exists to kill is *"more samples
+make RRT's path better."* They do not. They make RRT\*'s path better, and the whole chapter is about
+what the asterisk costs.
+
+Two more things to try. Slide $\gamma / \gamma^*$ below one. The right curve stalls — not
+immediately, but it stops approaching the floor — because the ball now shrinks faster than samples
+arrive to fill it, and the theorem's hypothesis has failed. Slide it to three and the descent is
+faster per iteration and slower per second: every insertion now considers dozens of neighbors, and
+the histogram of $\lvert Q_{near} \rvert$ tells you how many. The constant $\gamma^*$ is where
+those two pressures balance, and it is a *computed* number, not a tuning knob.
+
+<KeyIdea title="The one sentence version">
+RRT's path is frozen by its parent pointers; RRT\* re-chooses the parent of every new node and of
+every node near it inside a ball of radius $\gamma(\log n / n)^{1/d}$, which is the smallest ball
+that keeps the random geometric graph connected along the optimal path and the largest that keeps
+the per-iteration work logarithmic — and with it the best path's cost converges to the optimum
+almost surely.
+</KeyIdea>
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: 'c(\\sigma),\\; c^*,\\; c_n^{\\mathrm{ALG}}', meaning: 'path cost (dist-length); the optimal cost; the best cost ALG holds after n samples' },
+    { sym: '\\mathrm{Cost}(v)', meaning: 'cost-to-come of tree node v along its parent chain' },
+    { sym: '\\zeta_d', meaning: 'volume of the unit ball in ℝᵈ (ζ₂ = π)' },
+    { sym: '\\gamma,\\; \\gamma^*,\\; k_n', meaning: 'the radius constant; its critical value; k_n = k* log n', note: 'book-wide with n, r_n' },
+    { sym: 'Q_{near}', meaning: '{ v : dist(v, q_new) ≤ r_n } — or the k_n nearest' },
+    { sym: '\\delta\\text{-robust}', meaning: 'a δ-clear path exists (feasibility) / c* is the limit of such paths\' costs (optimality)' },
+    { sym: 'X_{\\hat f},\\; c_{best},\\; c_{min}', meaning: 'the informed set; the incumbent cost; dist(q_start, q_goal)' },
+    { sym: '\\hat g,\\; \\hat h,\\; \\hat c', meaning: 'admissible estimates of cost-to-come, cost-to-go, edge cost' },
+    { sym: 'G_n = (V_n, E_n)', meaning: 'the random geometric graph on n samples with connection radius r_n' },
+  ]}
+/>
+
+### Definitions
+
+<KeyIdea title="Definitions — asymptotic optimality, almost-sure suboptimality">
+A planner is **asymptotically optimal** if, for every robustly feasible problem with a robustly
+optimal solution,
+$$
+\Pr\Big[\lim_{n \to \infty} c_n^{\mathrm{ALG}} = c^*\Big] = 1 .
+$$
+It is **almost surely suboptimal** if $\Pr[\lim_n c_n^{\mathrm{ALG}} = c^*] = 0$: the limit exists
+— $c_n$ is monotone — and is wrong with probability one. Robustness is the regularity the theorems
+need: a path that can be perturbed by $\delta$ without leaving $\Qfree$, and an optimum that is the
+limit of such paths' costs, so that a shrinking tube around it stays free.
+</KeyIdea>
+
+<KeyIdea title="Definitions — choose-parent, rewire, the informed set, anytime">
+**Choose-parent.** Attach $q_{new}$ to the $v \in Q_{near}$ minimizing $\mathrm{Cost}(v) + c(v,
+q_{new})$ subject to $\Dist(v, q_{new}) \ne$ NIL.
+
+**Rewire.** For each $v \in Q_{near}$ with $\mathrm{Cost}(q_{new}) + c(q_{new}, v) <
+\mathrm{Cost}(v)$ and $\Dist(q_{new}, v) \ne$ NIL, set $\mathrm{par}(v) := q_{new}$ and propagate
+the decrease to $v$'s subtree.
+
+**Informed set.** $X_{\hat f} = \{x : \hat g(x) + \hat h(x) \le c_{best}\}$. For `dist` cost in
+$\mathbb{R}^d$ it is the prolate hyperspheroid with foci $\qstart, \qgoal$, transverse diameter
+$c_{best}$ and conjugate diameter $\sqrt{c_{best}^2 - c_{min}^2}$.
+
+**Anytime planner.** Returns a feasible solution early and improves it monotonically until
+interrupted — "deadline in, best-so-far out".
+</KeyIdea>
+
+### RRT is almost surely suboptimal
+
+<KeyIdea title="Theorem (Karaman and Frazzoli 2011)">
+For $d \ge 2$, `dist` cost, and the paper's regularity assumptions — robust feasibility, a robustly
+optimal path, finite $\mu(\Qfree)$ — the RRT's best cost converges to a suboptimal value:
+$\Pr[\lim_n c_n^{\mathrm{RRT}} = c^*] = 0$.
+</KeyIdea>
+
+<Derivation title="Why the tree's first children decide its fate" result="\Pr[\lim_n c_n^{\mathrm{RRT}} = c^*] = 0">
+**Step 1 — every path passes through a child of the root.** Any tree path from $\qstart$ to the goal
+leaves the root along one of the root's edges. The best path's cost is at least the best over the
+root's children $u$ of $c(\qstart, u)$ plus the optimal cost from $u$ to the goal.
+
+**Step 2 — the first children leave in the wrong directions.** With positive probability, the root's
+first few children all leave at angles bounded away from the optimal path's initial direction — the
+first few random targets simply landed elsewhere. Call the cone of good initial directions $C$.
+
+**Step 3 — later good children are summably unlikely.** For the root to acquire a new child in $C$
+at iteration $n$, a random target must fall in the root's Voronoi cell intersected with $C$. That
+cell shrinks as the tree densifies around the root, so the probability of acquiring a good child at
+iteration $n$ decays with $n$ fast enough that its sum over $n$ is finite.
+
+**Step 4 — Borel–Cantelli.** A sequence of events whose probabilities sum to a finite value happens
+only finitely often, almost surely. So the root almost surely acquires only finitely many good
+children — and with positive probability, by Step 2, none at all.
+
+**Step 5 — a fixed loss.** A path that leaves the root outside $C$ costs at least $c^* + \epsilon$
+for an $\epsilon > 0$ depending on the cone, by the regularity of the optimum. With positive
+probability the limit of $c_n$ is therefore at least $c^* + \epsilon$; the paper sharpens this to
+probability one. $\blacksquare$
+
+*Why shortcutting does not rescue it.* Chapter 11's greedy shortcutting replaces pieces of the path
+by geodesics between its own points. It cannot change which side of an obstacle the path passes —
+its homotopy class — and RRT's commitment through a bad first child is often exactly that. Exercise 6
+asks for the two-class map where shortcutting can never win.
+</Derivation>
+
+### PRM\*, RRG and RRT\* are asymptotically optimal
+
+<KeyIdea title="Theorem (Karaman and Frazzoli 2011)">
+With the connection radius
+$$
+r_n = \gamma \Big(\frac{\log n}{n}\Big)^{1/d},
+\qquad
+\gamma > \gamma^*_{2011} = 2 \Big(1 + \frac1d\Big)^{1/d} \Big(\frac{\mu(\Qfree)}{\zeta_d}\Big)^{1/d},
+$$
+or the $k$-nearest rule $k_n = k^* \log n$ with $k^* > e(1 + 1/d)$, PRM\* and RRT\* satisfy
+$\Pr[\lim_n c_n = c^*] = 1$, and the expected per-iteration cost stays $O(\log n)$ because
+$\mathbb{E} \lvert Q_{near} \rvert = \Theta(\log n)$.
+</KeyIdea>
+
+<Derivation title="The shrinking tiling, and where the constant comes from" result="\sum_n \Pr[\text{some ball empty at } n] < \infty \iff c\gamma^d > 1 + 1/d">
+**Step 1 — fix a robustly optimal path.** Let $\sigma^*$ have clearance $\delta$, so a tube of
+radius $\delta$ around it is free.
+
+**Step 2 — tile it with shrinking balls.** As in Theorem 7.4.1, cover $\sigma^*$ with balls — but of
+radius proportional to $r_n$, say $r_n / 4$, with centers $r_n / 4$ apart, so that any two
+consecutive balls lie inside a common ball of radius $r_n / 2 \le \delta$ once $n$ is large. The
+number of balls is $M_n \approx 4L / r_n$, growing like $(n / \log n)^{1/d}$.
+
+**Step 3 — one empty ball.** A ball of radius $r_n/4$ has measure $\zeta_d (r_n/4)^d = c\,\gamma^d
+\log n / n$ for the constant $c = \zeta_d / (4^d \mu(\Qfree))$, measuring relative to $\Qfree$.
+Being missed by all $n$ samples has probability
+$$
+\Big(1 - \frac{c\,\gamma^d \log n}{n}\Big)^n \;\le\; e^{-c\gamma^d \log n} \;=\; n^{-c\gamma^d} .
+$$
+
+**Step 4 — the union bound, and the constant.** The probability that *some* ball is empty at stage
+$n$ is at most $M_n n^{-c\gamma^d} \approx 4L\, (n / \log n)^{1/d}\, n^{-c\gamma^d}$. Summing over
+$n$ converges iff the exponent satisfies $c\gamma^d - 1/d > 1$, that is $c\gamma^d > 1 + 1/d$.
+Solving for $\gamma$ gives a threshold of the form $(1 + 1/d)^{1/d} (\mu(\Qfree)/\zeta_d)^{1/d}$
+times a geometric factor from the ball radii — the $2$ in $\gamma^*_{2011}$. *This step is where
+$(1 + 1/d)$ enters*, and Exercise 1 asks for it with the constants carried.
+
+**Step 5 — Borel–Cantelli.** Summable, so almost surely every ball is hit for all large $n$.
+
+**Step 6 — the graph shadows the path.** Samples in consecutive balls are within $r_n$ of each
+other and connected by a free segment (Step 2), so $G_n$ contains a path shadowing $\sigma^*$
+whose cost tends to $c^*$ as the balls shrink. PRM\*'s Dijkstra finds something at least that good.
+
+**Step 7 — RRT\* follows.** Choose-parent and rewire make the tree's cost-to-come at each sample
+match the shortest path in $G_n$ along the shadow, in the limit — this is the step the 2020
+correction is about. $\blacksquare$
+
+*The other direction.* Why not take $\gamma$ huge and be done? Because $\mathbb{E}\lvert Q_{near}
+\rvert = n \cdot \mu(B_{r_n}) / \mu(\Qfree) \propto \gamma^d \log n$: the per-iteration work is
+logarithmic for *any* fixed $\gamma$, but its constant is $\gamma^d$, and the $\eta$ cap on edge
+length means a large ball also wastes steer calls on neighbors the planner cannot reach in one step.
+The rate $(\log n / n)^{1/d}$ is forced by Step 4; the constant is a budget.
+</Derivation>
+
+<Deferred minHeight={560}>
+  <ShrinkingTiling />
+</Deferred>
+
+### The 2020 correction
+
+<KeyIdea title="Theorem (Solovey, Janson, Schmerling, Frazzoli and Pavone 2020)">
+The 2011 proof of RRT\*'s optimality has a gap at Step 7: rewiring reconsiders only the nodes inside
+the *current* ball, so the tree need not reproduce the RRG's shortest path along the shadow. A
+repaired argument establishes asymptotic optimality of RRT\* — with a *smaller* constant,
+$$
+\gamma > \gamma^*_{2020} = \big(2(1 + 1/d)\big)^{1/d} \Big(\frac{\mu(\Qfree)}{\zeta_d}\Big)^{1/d},
+$$
+and correspondingly for the $k$-nearest variant.
+</KeyIdea>
+
+<Derivation title="Repairing Step 7" result="\text{asymptotic optimality of RRT}^* \text{ with } \gamma^*_{2020} < \gamma^*_{2011}">
+**Step 1 — locate the gap.** In Step 7 above, the shadow path exists in $G_n$, but RRT\* is a tree:
+a node's parent is chosen among the nodes present *when it was inserted*, and rewiring later touches
+only nodes within $r_n$ of each new node. Nothing guarantees that the tree's chain of parents ever
+aligns with the graph's shortest path.
+
+**Step 2 — track a chain in the tree directly.** Instead of comparing with the graph, follow a
+sequence of tree nodes, one per tiling ball along $\sigma^*$, and bound the tree path's cost through
+them.
+
+**Step 3 — samples must arrive in a usable order.** For the chain to form, each ball must contain a
+sample *and* the samples must arrive so that when the sample in ball $i + 1$ is inserted, a node in
+ball $i$ is already present and within $r_n$ — then choose-parent can pick it, or a later rewire can
+fix it. That is a per-ball probability, smaller than mere occupancy.
+
+**Step 4 — close the union bound.** The modified events are still summable for $\gamma$ above a
+threshold, and the threshold that comes out is $\gamma^*_{2020}$ — smaller than the 2011 constant,
+because the repaired argument needs one sample per ball at the right time rather than a geometric
+factor of slack. $\blacksquare$
+
+The implementation names both constants, defaults to the corrected one, and the widget lets you pick
+either. The chapter says plainly: the 2011 proof had a gap that took nine years to notice, and the
+result survived.
+</Derivation>
+
+### The $(\epsilon, \alpha, \beta)$ lens, and the $k$-nearest variant
+
+Two remarks tie the theorem back to Chapter 11. First, Step 6 needs consecutive balls to *see*
+each other through the local planner, which is $\epsilon$-goodness in miniature: the shadowing
+balls are mutually visible because the tube around $\sigma^*$ is free. A space that is not
+$\epsilon$-good — a corridor thinner than every $r_n$ for the $n$ you can afford — defeats the
+asymptotic argument in practice exactly as it defeated Theorem 7.4.2's constants. Second, the
+$k$-nearest rule is the same theorem in a different coordinate. In a region of density $\rho$ the
+$k_n$ nearest neighbors occupy a ball of radius $(k_n / \rho \zeta_d)^{1/d} \propto (\log n /
+n)^{1/d}$ — the radius rule again, with the density made implicit — and the constant $k^* = e(1 +
+1/d)$ comes out of the same union bound with a Chernoff bound on a Poisson count in place of the
+emptiness probability. The $k$-nearest rule adapts to local density, which is why some
+implementations prefer it; the radius rule is the one whose constant is tied to $\mu(\Qfree)$ and
+therefore to the world. The check `k-nearest RRT*` runs both on seed 13 and finds their costs
+within one percent of each other.
+
+### The constants, for $n = 1000$ in the unit square
+
+$(\log n / n)^{1/2} = (6.9078 / 1000)^{1/2} = 0.08311$. With $d = 2$, $\mu(\Qfree) = 1$,
+$\zeta_2 = \pi$:
+
+| constant | value | $r_{1000}$ |
+|---|---|---|
+| $\gamma^*_{2011} = 2 \cdot 1.5^{1/2} \pi^{-1/2}$ | $1.3820$ | $0.1149$ |
+| $\gamma^*_{2020} = 3^{1/2} \pi^{-1/2}$ | $0.9772$ | $0.0812$ |
+| $k^* = e(1 + 1/2)$ | $4.077$ | $k_{1000} = \lceil 4.077 \cdot 6.9078 \rceil = 29$ |
+
+A ball of radius $0.08$ in a unit square after a thousand samples: about twenty neighbors to
+consider per insertion, each a steer call. That is the price of the asterisk, and the check
+`r_1000 in the unit square` pins every number in the table.
+
+### Informed sampling is exactly where improvement is possible
+
+<KeyIdea title="Theorem (Gammell, Srinivasa and Barfoot 2014)">
+With `dist` cost and admissible $\hat g, \hat h$, no configuration outside $X_{\hat f}$ lies on a
+path cheaper than $c_{best}$. Sampling uniformly in $X_{\hat f}$ preserves RRT\*'s guarantees and
+multiplies the probability of a useful sample by $\mu(\Qfree) / \mu(X_{\hat f})$.
+</KeyIdea>
+
+<Derivation title="The ellipse, and how to sample it" result="X_{\hat f} = \text{ellipse with foci } \qstart, \qgoal,\ \text{string length } c_{best}">
+**Step 1 — triangle inequality.** Any path through $x$ costs at least $\mathrm{dist}(\qstart, x) +
+\mathrm{dist}(x, \qgoal) = \hat g(x) + \hat h(x)$.
+
+**Step 2 — outside is useless.** If $\hat g(x) + \hat h(x) > c_{best}$, no path through $x$ can beat
+the incumbent. The set of useful points is $\{x : \hat g(x) + \hat h(x) \le c_{best}\}$ — the set of
+points whose string from one focus to the other has length at most $c_{best}$: an ellipse in the
+plane, a prolate hyperspheroid in $\mathbb{R}^d$, with transverse semi-axis $c_{best}/2$ and
+conjugate semi-axes $\sqrt{c_{best}^2 - c_{min}^2} / 2$.
+
+**Step 3 — sample it directly.** Draw a uniform point of the unit ball, scale by
+$\mathrm{diag}(c_{best}/2, \sqrt{c_{best}^2 - c_{min}^2}/2, \dots)$, rotate so the first axis
+points along $(\qgoal - \qstart) / c_{min}$ — a Householder reflection does it in one line — and
+translate to the midpoint. Uniform in the ball maps to uniform in the ellipsoid because the map is
+affine.
+
+**Step 4 — reject what leaves $\Q$.** Early on the ellipse spills far outside the room, and the draws
+that leave the chart's box are rejected. On $T^2$ the formula is wrong once $c_{best}$ exceeds the
+torus circumference (Exercise 2); the implementation falls back to rejection against the manifold
+metric there, exact and slower. $\blacksquare$
+
+*Necessary, not sufficient.* Every improving path lies in the ellipse; most of the ellipse lies in no
+improving path, because obstacles cut it. The readout in the widget is $\mu(X_{\hat f} \cap \Q) /
+\mu(\Q)$ — the part of the room worth sampling at all — and the check `informed set measure` pins
+it against a Monte Carlo count and the unclipped $\pi a b$.
+</Derivation>
+
+<Deferred minHeight={700}>
+  <EllipseShrinker />
+</Deferred>
+
+### FMT\* and BIT\*: search the graph you never build
+
+<KeyIdea title="Theorem (Janson, Schmerling, Clark and Pavone 2015)">
+On one batch of $n$ samples with $r_n = \gamma(\log n/n)^{1/d}$ and $\gamma > 2 (1/d)^{1/d}
+(\mu(\Qfree)/\zeta_d)^{1/d}$, growing the tree outward in cost-to-come order and connecting each
+frontier node to the locally optimal parent *chosen ignoring obstacles, then checking only that
+edge* is asymptotically optimal with $O(n \log n)$ expected collision checks.
+</KeyIdea>
+
+<Derivation title="Lazy dynamic programming is wrong only where it does not matter" result="\Pr[\lim c_n^{\mathrm{FMT}^*} = c^*] = 1 \text{ with } O(n\log n) \text{ checks}">
+**Step 1 — the lazy choice.** FMT\* expands the open node $z$ of least cost-to-come and, for each
+unvisited $x$ within $r_n$, picks the parent $y$ minimizing $\mathrm{Cost}(y) + c(y, x)$ over the
+open nodes in $x$'s ball *without* collision checking, then checks the one edge $(y, x)$. If it is
+blocked, $x$ is left for later — it is not given a second-best parent.
+
+**Step 2 — when the lazy choice is wrong.** The choice is wrong only when the optimal in-ball parent
+is blocked: $x$ gets no parent now and may get a worse one later. Inside a $\delta$-clear corridor
+the ball of radius $r_n$ is eventually inside the corridor, and that event stops happening.
+
+**Step 3 — bounded error.** Each lazily chosen edge is within $O(r_n)$ of the local optimum, there
+are $O(1 / r_n)$ edges along the shadow path, and the total excess stays bounded and vanishes along a
+subsequence.
+
+**Step 4 — the bill.** One nearest-neighbor structure, $O(\log n)$ expected neighbors per node, one
+collision check per *accepted* edge: $O(n \log n)$ in all, and no rewiring. $\blacksquare$
+
+*BIT\*.* Gammell, Srinivasa and Barfoot's Batch Informed Trees runs the same idea in batches. Each
+batch adds informed samples to an implicit random geometric graph of radius $r_n$ and searches it
+exactly like [Chapter 6](/chapters/ch06-graph-search)'s A\*: an edge queue keyed $\hat g(v) + \hat
+c(v, x) + \hat h(x)$, a vertex queue keyed $\hat g(v) + \hat h(v)$, collision checks only when an
+edge is popped. After a solution, samples and vertices that cannot improve it are pruned, and the
+tree is kept across batches so the next batch repairs rather than rebuilds — an LPA\*-style reuse.
+</Derivation>
+
+## The algorithm
+
+<Algorithm
+  name="RRT* — one iteration: sample, extend, choose-parent, rewire"
+  inputs="the cost tree T, the sampler, η, the neighborhood rule (r_n or k_n), the local planner Δ"
+  outputs="T with q_new inserted at its cheapest reachable parent and its neighbors rewired; a new incumbent if a goal-connected node got cheaper"
+  complexity="|Q_near| = O(log n) steer calls per iteration, O(n log n) total; cost propagation O(|subtree|) per rewire"
+>
+1. $q_{rand} \leftarrow$ SAMPLE; $q_{near} \leftarrow$ NEAREST($T$, $q_{rand}$); $q_{new} \leftarrow$ EXTEND($q_{near}$, $q_{rand}$, $\eta$) — `Trapped` ends the iteration
+2. $Q_{near} \leftarrow \{\, v \in T : \mathrm{dist}(v, q_{new}) \le \min(r_n, \eta) \,\}$, or the $k_n$ nearest; always including $q_{near}$
+3. **choose-parent:** $v^* \leftarrow \arg\min_{v \in Q_{near}} \mathrm{Cost}(v) + c(v, q_{new})$ subject to $\Dist(v, q_{new}) \ne$ NIL — try candidates in order of that sum and stop at the first free one
+4. add $q_{new}$ with parent $v^*$ and $\mathrm{Cost}(q_{new}) = \mathrm{Cost}(v^*) + c(v^*, q_{new})$
+5. **rewire: for all** $v \in Q_{near} \setminus \{v^*\}$ **do**
+6. &nbsp;&nbsp;&nbsp;&nbsp;**if** $\mathrm{Cost}(q_{new}) + c(q_{new}, v) < \mathrm{Cost}(v)$ **and** $\Dist(q_{new}, v) \ne$ NIL **then** $\mathrm{par}(v) \leftarrow q_{new}$; propagate the decrease through $v$'s subtree
+7. **goal test:** if $\mathrm{dist}(q_{new}, \qgoal) \le \eta$ and $\Dist(q_{new}, \qgoal) \ne$ NIL, record $q_{new}$ as goal-connected
+8. incumbent $\leftarrow \min$ over goal-connected $v$ of $\mathrm{Cost}(v) + c(v, \qgoal)$ — a rewire deep in the tree lowers it without touching the goal
+</Algorithm>
+
+Line 3 is sorted so that the first free candidate is the answer; line 2's $\eta$ cap is what keeps
+the steer calls short. With `rewire = false` and $Q_{near} = \{q_{near}\}$ the same code is Chapter
+12's RRT, which is how the widgets feed one seed to both.
+
+<Algorithm
+  name="PRM* — the radius rule for a roadmap"
+  inputs="n, γ (or k*), the sampler, Δ"
+  outputs="a roadmap with O(n log n) expected edges whose shortest paths converge to the optimum"
+  complexity="O(n log n) expected edges, each one steer call"
+>
+1. **for** $i = 1 \dots n$ **do** $q_i \leftarrow$ SAMPLE; $r \leftarrow \gamma (\log i / i)^{1/d}$ (or $k \leftarrow \lceil k^* \log i \rceil$)
+2. &nbsp;&nbsp;&nbsp;&nbsp;**for all** $q_j$ within $r$ of $q_i$ (or its $k$ nearest) **do if** $\Dist(q_i, q_j) \ne$ NIL **then** add the edge with cost $c(q_i, q_j)$
+3. query by Chapter 11's Algorithm 7
+</Algorithm>
+
+<Algorithm
+  name="FMT* — lazy dynamic programming on one batch"
+  inputs="n samples including q_start, q_goal; r_n; Δ"
+  outputs="a tree over the samples and the path to q_goal, or failure if the open set empties first"
+  complexity="O(n log n) expected: one kd-tree, O(log n) neighbors per node, one check per accepted edge"
+>
+1. $\mathrm{Cost}(\qstart) \leftarrow 0$; OPEN $\leftarrow \{\qstart\}$; all other samples UNVISITED
+2. **while** OPEN is not empty **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;$z \leftarrow$ the OPEN node of least $\mathrm{Cost}$; **if** $z = \qgoal$ **then return** the path
+4. &nbsp;&nbsp;&nbsp;&nbsp;**for all** UNVISITED $x$ within $r_n$ of $z$ **do**
+5. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$y \leftarrow \arg\min$ over OPEN nodes within $r_n$ of $x$ of $\mathrm{Cost}(y) + c(y, x)$ — obstacles ignored
+6. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**if** $\Dist(y, x) \ne$ NIL **then** $\mathrm{par}(x) \leftarrow y$; $\mathrm{Cost}(x) \leftarrow \mathrm{Cost}(y) + c(y, x)$; move $x$ to OPEN
+7. &nbsp;&nbsp;&nbsp;&nbsp;move $z$ to CLOSED
+8. **return** failure
+</Algorithm>
+
+<Algorithm
+  name="BIT* — one batch, searched like A*"
+  inputs="the current tree, the unconnected samples, a batch size, γ, the incumbent c_best"
+  outputs="an improved incumbent, or an exhausted batch"
+  complexity="per batch: an implicit RGG of radius r_n over tree vertices and samples, searched by an edge queue keyed ĝ(v) + ĉ(v, x) + ĥ(x) with collision checks only on pop"
+>
+1. **prune:** drop every sample and vertex $x$ with $\hat g(x) + \hat h(x) \ge c_{best}$; detach children of dropped vertices and return them to the sample set if they could still help
+2. **sample:** draw `batch` new configurations from the informed set; $r_n \leftarrow \gamma (\log n / n)^{1/d}$ over vertices plus samples
+3. **re-key:** every tree vertex $v$ enters the vertex queue keyed $g(v) + \hat h(v)$
+4. **repeat** while a queue is non-empty:
+5. &nbsp;&nbsp;&nbsp;&nbsp;while the best vertex key $\le$ the best edge key, pop a vertex and push its edges $(v, x)$ to samples (and to vertices it could rewire) within $r_n$, keyed $\hat g(v) + \hat c(v, x) + \hat h(x)$
+6. &nbsp;&nbsp;&nbsp;&nbsp;pop the best edge $(v, x)$; **if** $g(v) + \hat c(v, x) + \hat h(x) \ge c_{best}$ **then** the batch is exhausted — clear both queues
+7. &nbsp;&nbsp;&nbsp;&nbsp;**if** $g(v) + c(v, x) < g(x)$ **and** $\Dist(v, x) \ne$ NIL **then** attach or rewire $x$ under $v$, propagate, and push $x$ to the vertex queue; update $c_{best}$ if $\qgoal$ got cheaper
+</Algorithm>
+
+### The five-node rewire, by hand
+
+Euclidean plane, no obstacles, a tree of four nodes before one RRT\* iteration: the root $A = (0, 0)$
+with $\mathrm{Cost} = 0$; $B = (3, 0)$ under $A$, $\mathrm{Cost} = 3$; $C = (3, 3)$ under $B$,
+$\mathrm{Cost} = 6$; $D = (0, 3)$ under $A$, $\mathrm{Cost} = 3$. The new sample is $E = (1.5, 1.5)$
+and the neighborhood radius for this step is $r = 2.5$.
+
+**Near set.** $\mathrm{dist}(E, \cdot) = 1.5\sqrt2 = 2.1213$ to each of $A, B, C, D$: all four are
+in $Q_{near}$.
+
+**Choose-parent.** Via $A$: $0 + 2.1213 = 2.1213$. Via $B$ or $D$: $3 + 2.1213 = 5.1213$. Via $C$:
+$6 + 2.1213 = 8.1213$. Parent $A$; $\mathrm{Cost}(E) = 2.1213$.
+
+**Rewire.** The cost through $E$ to any neighbor is $2.1213 + 2.1213 = 4.2426 = 3\sqrt2$. $B$:
+$4.2426 > 3$, keep. $D$: keep. $C$: $4.2426 < 6$ — **rewire** $\mathrm{par}(C) := E$ and
+$\mathrm{Cost}(C)$ drops from $6$ to $4.2426$, a $29.3$ percent saving; $C$ has no children, so the
+propagation is a no-op. Plain RRT would have attached $E$ under its nearest node — a tie here,
+broken toward $A$ — and left $C$ at $6$ forever.
+
+## Implementation in Rust
+
+`sampling::optimal` wraps Chapter 12's tree; it does not fork it. Nothing from Chapters 11 or 12 is
+redefined, and the radius functions are plain, so that a widget can violate the bound on purpose.
+
+```rust title="crates/sampling/src/optimal/radius.rs"
+/// r_n = γ (log n / n)^{1/d}. γ is a parameter, not hidden: the widget must be able to break it.
+pub fn r_n(n: usize, d: usize, gamma: f64) -> f64 {
+    gamma * ((n as f64).ln() / n as f64).powf(1.0 / d as f64)
+}
+/// γ* = 2 (1 + 1/d)^{1/d} (μ_free / ζ_d)^{1/d} — Karaman & Frazzoli 2011, Theorem 38.
+pub fn gamma_star_kf2011(d: usize, mu_free: f64) -> f64 {
+    2.0 * (1.0 + 1.0 / d as f64).powf(1.0 / d as f64) * (mu_free / unit_ball_volume(d)).powf(1.0 / d as f64)
+}
+/// γ* = (2 (1 + 1/d))^{1/d} (μ_free / ζ_d)^{1/d} — Solovey, Janson, Schmerling, Frazzoli & Pavone 2020.
+pub fn gamma_star_solovey2020(d: usize, mu_free: f64) -> f64 {
+    (2.0 * (1.0 + 1.0 / d as f64)).powf(1.0 / d as f64) * (mu_free / unit_ball_volume(d)).powf(1.0 / d as f64)
+}
+/// k_n = ⌈e (1 + 1/d) log n⌉.
+pub fn k_n(n: usize, d: usize) -> usize { (std::f64::consts::E * (1.0 + 1.0 / d as f64) * (n as f64).ln()).ceil() as usize }
+
+pub enum Neighborhood { Radius { gamma: f64, eta: f64 }, KNearest { k_star: f64 } }
+```
+
+```rust title="crates/sampling/src/optimal/rrt_star.rs" {24-40}
+/// Ch. 12's tree plus cost-to-come and child lists. Wrapping, not forking: `inner` is the
+/// same arena the Ch. 12 widgets draw, so RRT and RRT* can be fed identical samples.
+pub struct CostTree<M: Chart> { pub inner: Tree<M>, pub cost: Vec<f64>, children: Vec<SmallVec<[NodeId; 4]>> }
+
+impl<M: Chart> CostTree<M> {
+    pub fn near(&self, q: &M::Point, r: f64) -> Vec<(NodeId, f64)> { self.inner.nn.within(q, r) }   // Ch. 11 KdTree::within
+    pub fn add(&mut self, q: M::Point, parent: NodeId, edge: f64) -> NodeId {
+        let id = self.inner.add(q, parent);
+        self.cost.push(self.cost[parent] + edge);
+        self.children.push(SmallVec::new());
+        self.children[parent].push(id);
+        id
+    }
+    /// Change v's parent and push the cost change through its subtree (iterative DFS).
+    pub fn reparent(&mut self, v: NodeId, new_parent: NodeId, edge: f64) -> usize {
+        let old = self.inner.nodes[v].parent.unwrap();
+        self.children[old].retain(|&c| c != v);
+        self.inner.nodes[v].parent = Some(new_parent);
+        self.children[new_parent].push(v);
+        let delta = self.cost[new_parent] + edge - self.cost[v];
+        let (mut stack, mut touched) = (vec![v], 0);
+        while let Some(u) = stack.pop() { self.cost[u] += delta; touched += 1; stack.extend(self.children[u].iter().copied()); }
+        touched - 1
+    }
+}
+
+impl<M: Chart, S: Extend<M>, Smp: Sampler<M>> RrtStar<M, S, Smp> {
+    /// (parent, edge cost) minimizing Cost(v) + c(v, q_new) over `near` with Δ succeeding.
+    /// Sorted by that sum, so the first candidate whose segment is free is the answer.
+    fn choose_parent(&self, free: &dyn FreeSpace<M>, q_new: &M::Point, near: &[(NodeId, f64)]) -> Option<(NodeId, f64)> {
+        let mut cands: Vec<_> = near.iter().map(|&(v, d)| (self.tree.cost[v] + d, v, d)).collect();
+        cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        cands.into_iter().find(|&(_, v, _)| self.steer.steer(&self.space, free, &self.tree.q(v), q_new).is_some())
+             .map(|(_, v, d)| (v, d))
+    }
+
+    /// For each v in `near`: if Cost(new) + c(new, v) < Cost(v) and Δ(new, v), reparent.
+    fn rewire(&mut self, free: &dyn FreeSpace<M>, new: NodeId, near: &[(NodeId, f64)]) -> usize {
+        let c_new = self.tree.cost[new];
+        let mut count = 0;
+        for &(v, d) in near {
+            if v == self.tree.parent(new) { continue; }
+            if c_new + d < self.tree.cost[v] && self.steer.steer(&self.space, free, &self.tree.q(new), &self.tree.q(v)).is_some() {
+                self.propagated += self.tree.reparent(v, new, d);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// One iteration: sample → nearest → extend → near set → choose_parent → rewire → goal test.
+    pub fn iterate(&mut self, free: &dyn FreeSpace<M>) -> Option<f64> {
+        let q_rand = self.sample(free)?;
+        let (near_id, _) = self.tree.inner.nearest(&q_rand);
+        let q_new = match self.steer.extend(&self.space, free, &self.tree.q(near_id), &q_rand, self.eta) {
+            ExtendStatus::Trapped => return None, ExtendStatus::Reached(q) | ExtendStatus::Advanced(q) => q };
+        let n = self.tree.size() + 1;
+        let mut near = match self.nbhd {
+            Neighborhood::Radius { gamma, eta } => self.tree.near(&q_new, r_n(n, M::D, gamma).min(eta)),
+            Neighborhood::KNearest { k_star } => self.tree.inner.nn.k_nearest(&q_new, k_n(n, M::D)),
+        };
+        if !near.iter().any(|&(v, _)| v == near_id) { near.push((near_id, self.space.dist(&self.tree.q(near_id), &q_new))); }
+        // The nearest node's segment is already known free: it is always a valid parent.
+        let (parent, edge) = self.choose_parent(free, &q_new, &near).unwrap_or((near_id, self.space.dist(&self.tree.q(near_id), &q_new)));
+        let id = self.tree.add(q_new.clone(), parent, edge);
+        self.rewires += self.rewire(free, id, &near);
+        if self.space.dist(&q_new, &self.goal) <= self.goal_radius && self.steer.steer(&self.space, free, &q_new, &self.goal).is_some() { self.goal_nodes.push(id); }
+        self.refresh_best()                                 // Some(cost) only if the incumbent dropped
+    }
+}
+```
+
+PRM\* is Chapter 11's `Prm` with the connection rule tied to $n$, and the anytime contract is a
+trait with three methods.
+
+```rust title="crates/sampling/src/optimal/prm_star.rs"
+/// Ch. 11's PRM with the connection rule tied to n: a ball of radius r_n, or the k_n nearest.
+/// Each new node connects under the *current* rule (the incremental form); the expected number
+/// of edges is O(n log n), which is what makes the roadmap both connected and affordable.
+pub struct PrmStar<M: Chart, S: Sampler<M>> { pub prm: Prm<M, S, KdTree<M>>, nbhd: Neighborhood }
+
+impl<M: Chart, S: Sampler<M>> PrmStar<M, S> {
+    pub fn add_sample(&mut self, free: &dyn FreeSpace<M>) -> Option<usize> {
+        let n = self.prm.roadmap.node_count() + 1;
+        self.prm.connect = match self.nbhd {
+            Neighborhood::Radius { gamma, .. } => Connect::Radius { r: r_n(n, M::D, gamma) },
+            Neighborhood::KNearest { .. } => Connect::KNearest { k: k_n(n, M::D) },
+        };
+        self.prm.add_sample(free)
+    }
+}
+```
+
+```rust title="crates/sampling/src/optimal/anytime.rs"
+pub struct Solution<P> { pub path: Vec<P>, pub cost: f64 }
+
+/// "Deadline in, best-so-far out." One unit of work per `step`, `Some(cost)` when the incumbent
+/// improved; `best()` is always available. Chapter 23's planning stack consumes exactly this.
+pub trait Anytime<P> {
+    fn step(&mut self) -> Option<f64>;
+    fn best(&self) -> Option<Solution<P>>;
+    fn run_until(&mut self, deadline: std::time::Instant) -> Option<Solution<P>> {
+        while std::time::Instant::now() < deadline { self.step(); }
+        self.best()
+    }
+}
+```
+
+FMT\* is a batch and a heap; BIT\* is the same heap with a heuristic and a second queue.
+
+```rust title="crates/sampling/src/optimal/fmt.rs"
+impl<M: Chart, S: Steer<M>> Anytime<M::Point> for Fmt<M, S> {
+    /// Expand one frontier node — lazy dynamic programming, one collision check per accepted edge.
+    fn step(&mut self) -> Option<f64> {
+        let z = self.open.pop()?;                                    // least cost-to-come
+        for (x, _) in self.nn.within(&self.samples[z], self.r) {
+            if self.state[x] != Unvisited { continue; }
+            // Locally optimal parent among OPEN nodes in x's ball, obstacles ignored …
+            let Some((y, c)) = self.nn.within(&self.samples[x], self.r).into_iter()
+                .filter(|&(y, _)| self.state[y] == Open)
+                .map(|(y, d)| (y, self.cost[y] + d))
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) else { continue };
+            // … then check only that edge. Wrong exactly when the best parent is blocked.
+            if self.steer.steer(&self.space, &*self.free, &self.samples[y], &self.samples[x]).is_some() {
+                self.cost[x] = c; self.parent[x] = Some(y); self.state[x] = Open; self.open.push(x, c);
+            }
+        }
+        self.state[z] = Closed;
+        (z == self.goal_idx).then(|| { self.done = true; self.cost[z] })
+    }
+    fn best(&self) -> Option<Solution<M::Point>> { self.done.then(|| self.path_to(self.goal_idx)) }
+}
+```
+
+```rust title="crates/sampling/src/optimal/bit.rs"
+impl<M: Chart, S: Steer<M>> Anytime<M::Point> for Bit<M, S> {
+    /// One unit of work: pop the best edge (expanding vertices while a vertex could beat it), or
+    /// open a new batch when both queues are empty. Keys are Ch. 6's f = g + h on the implicit RGG.
+    fn step(&mut self) -> Option<f64> {
+        if self.q_v.is_empty() && self.q_e.is_empty() { self.new_batch(); return None; }   // prune, sample, re-key
+        while self.q_v.peek_key() <= self.q_e.peek_key() { let v = self.q_v.pop().unwrap(); self.expand(v); }
+        let (v, x) = self.q_e.pop()?;
+        let c = self.space.dist(&self.pts[v], &self.pts[x]);
+        if self.g[v] + c + self.h_hat(x) >= self.c_best { self.q_v.clear(); self.q_e.clear(); return None; }
+        if self.g[v] + c >= self.g[x] { return None; }
+        self.edge_checks += 1;
+        self.steer.steer(&self.space, &*self.free, &self.pts[v], &self.pts[x])?;    // lazy: checked on pop
+        self.attach(x, v, c);                                                       // or rewire + propagate
+        (self.in_tree[GOAL] && self.g[GOAL] < self.c_best).then(|| { self.c_best = self.g[GOAL]; self.c_best })
+    }
+    fn best(&self) -> Option<Solution<M::Point>> { self.c_best.is_finite().then(|| self.path_to(GOAL)) }
+}
+```
+
+The informed sampler is a Chapter 11 `Sampler`, so Informed RRT\* is RRT\* with a different sampler
+and no planner code changed.
+
+```rust title="crates/sampling/src/optimal/informed.rs"
+pub struct InformedSampler<M: Chart> {
+    start: M::Point, goal: M::Point, c_min: f64, pub c_best: f64,
+    center: SVector<f64, { M::D }>, axis: SVector<f64, { M::D }>, fallback: Uniform,
+}
+
+impl<M: Chart> Sampler<M> for InformedSampler<M> {
+    fn sample(&mut self, space: &M, free: &dyn FreeSpace<M>, rng: &mut SmallRng) -> Option<M::Point> {
+        if !self.c_best.is_finite() { return self.fallback.sample(space, free, rng); }   // no incumbent yet
+        let a = self.c_best / 2.0;
+        let b = (self.c_best.powi(2) - self.c_min.powi(2)).max(0.0).sqrt() / 2.0;
+        // Unit ball → scale → rotate (Householder: e₁ ↦ axis) → translate → reject outside 𝒬.
+        let u = unit_ball(rng);
+        let s = SVector::from_fn(|i, _| if i == 0 { a * u[i] } else { b * u[i] });
+        let v = (SVector::ith(0, 1.0) - self.axis).normalize();
+        let r = s - 2.0 * v.dot(&s) * v;
+        let c = r + self.center;
+        let q = space.from_coords(&c)?;                       // None if outside the chart's box
+        free.is_free(&q).then_some(q)
+    }
+}
+
+impl<M: Chart> InformedSampler<M> {
+    pub fn update(&mut self, c_best: f64) { self.c_best = c_best; }
+    /// μ(X_f̂ ∩ 𝒬)/μ(𝒬) — w13.2's readout; in the plane the ellipse is clipped against the box by quadrature.
+    pub fn measure_ratio(&self, space: &M) -> f64 { ellipse_box_area(self, space.bounds()) / space.measure() }
+}
+```
+
+The worked example is an executable whose output is the test's expectation.
+
+```rust title="crates/sampling/examples/rewire_five_nodes.rs"
+fn main() {
+    let plane = R2::unit_box(20.0).centered();                                    // no obstacles
+    let mut star = RrtStar::new(plane, [0.0, 0.0], StraightLine::subdivision(0.25), Uniform,
+                                Neighborhood::Radius { gamma: 1.0, eta: 10.0 }, SmallRng::seed_from_u64(0));
+    let b = star.tree.add([3.0, 0.0], 0, 3.0);
+    let c = star.tree.add([3.0, 3.0], b, 3.0);
+    let _d = star.tree.add([0.0, 3.0], 0, 3.0);
+    let e = [1.5, 1.5];
+    let near = star.tree.near(&e, 2.5);
+    for &(v, d) in &near { println!("{}: dist {d:.4}, via {:.4}", NAMES[v], star.tree.cost[v] + d); }
+    let (parent, edge) = star.choose_parent(&Free, &e, &near).unwrap();
+    let id = star.tree.add(e, parent, edge);
+    println!("parent {}, Cost(E) = {:.4}", NAMES[parent], star.tree.cost[id]);
+    let before = star.tree.cost[c];
+    star.rewire(&Free, id, &near);
+    println!("C: {before:.4} → {:.4}, parent now {}", star.tree.cost[c], NAMES[star.tree.parent(c)]);
+    for (name, g) in [("2011", gamma_star_kf2011(2, 1.0)), ("2020", gamma_star_solovey2020(2, 1.0))] {
+        println!("γ*_{name} = {g:.4}, r_1000 = {:.4}", r_n(1000, 2, g));
+    }
+    println!("k_1000 = {}", k_n(1000, 2));
+}
+```
+
+```text title="cargo run --example rewire_five_nodes -p sampling"
+A: dist 2.1213, via 2.1213
+B: dist 2.1213, via 5.1213
+C: dist 2.1213, via 8.1213
+D: dist 2.1213, via 5.1213
+parent A, Cost(E) = 2.1213
+B keep, D keep, C rewire
+C: 6.0000 → 4.2426, parent now E
+γ*_2011 = 1.3820, r_1000 = 0.1149
+γ*_2020 = 0.9772, r_1000 = 0.0812
+k_1000 = 29
+```
+
+```rust title="crates/sampling/tests/optimal.rs"
+#[test]
+fn reproduces_five_node_rewire() {
+    let r = five_node_rewire();
+    assert_eq!(r.near.len(), 4);
+    assert!((r.cost_e - 2.1213).abs() < 1e-4);
+    assert_eq!(r.parent_c, r.e);                  // rewired under E
+    assert!((r.cost_c - 4.2426).abs() < 1e-4 && (r.cost_b - 3.0).abs() < 1e-9);
+}
+
+#[test]
+fn radius_constants() {
+    assert!((r_n(1000, 2, gamma_star_kf2011(2, 1.0)) - 0.1149).abs() < 5e-5);
+    assert!((r_n(1000, 2, gamma_star_solovey2020(2, 1.0)) - 0.0812).abs() < 5e-5);
+    assert_eq!(k_n(1000, 2), 29);
+}
+
+/// Seed 13 on the Apartment, 6 000 iterations: RRT* non-increasing and within 5% of the lattice
+/// floor; RRT on the same samples never rewires and ends well above it.
+#[test]
+fn rrt_star_cost_converges_under_fixed_seed() {
+    let (plain, star, floor) = seed_13_scoreboard(6000);
+    assert!(star.cost_history.windows(2).all(|w| w[1].cost <= w[0].cost + 1e-9));
+    assert!(star.best_cost < floor * 1.05);
+    assert!(plain.best_cost > star.best_cost * 1.2);
+}
+```
+
+The TypeScript port's checks replay all of it: the five-node rewire and the radii exactly, and the
+seed-13 scoreboard — RRT at $13.680$ m, RRT\* at $10.885$ m against a lattice floor of $11.508$ m
+after six thousand iterations, the same node set in both trees, and every returned path re-checked
+at five millimetres.
+
+## Putting it together: the anytime contract
+
+The lab is the Batch Bench. Four asymptotically optimal planners, one seed, one world, and one
+deadline each: stop at the deadline, execute what you have, keep planning, and switch to the better
+path when it arrives. That loop is the one [Chapter 23](/chapters/ch23-capstone)'s planning stack
+runs for Reach, and it is what `trait Anytime` is for — one unit of work per `step`, `Some(cost)`
+when the incumbent improved, `best()` always available.
+
+<Deferred minHeight={820}>
+  <BatchBench />
+</Deferred>
+
+Read the curves at three deadlines. At a hundred milliseconds, RRT\* and Informed RRT\* have usually
+found a first path and begun to improve it; BIT\* has processed its first batch and often holds the
+best path of the four; FMT\* has nothing — it is still drawing its batch or marching through it.
+At half a second the curves have crossed at least once. At two seconds FMT\* has returned its single
+answer, often the best, and will never improve it; the incremental planners are still descending.
+The misconception the lab kills is *"asymptotically optimal means better at every budget."* The
+theorems are all about $n \to \infty$; at a deadline the winner is decided by constants, and the
+constants depend on the world.
+
+Three honesty items the chapter keeps. Every theorem here is asymptotic — at finite $n$ the cost is
+a random variable, and the widgets show its spread across seeds. The hypotheses are necessary:
+robust optimality, `dist` as the cost, and the $\gamma$ bound, which Rewire Watch lets you violate.
+And nothing in this chapter makes Hitch drivable: the straight-line steer is still wrong for a car,
+and the cost it optimizes is the length of a path the car cannot follow. Kinodynamic RRT\* replaces
+the steer with a two-point boundary-value solver in [Chapter 21](/chapters/ch21-nonholonomic-ii).
+
+One last contrast before Part III closes. Asymptotic optimality is *global* and *slow*: the planner
+converges to the best path in any homotopy class, eventually. [Chapter 19](/chapters/ch19-trajectory-optimization)'s
+trajectory optimization is the complementary route — *local* and *fast*, descending a cost from an
+initial guess and never leaving its homotopy class. The two meet in practice as a pipeline: an RRT\*
+path to pick the class, an optimizer to make it smooth.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={3} title="Where (1 + 1/d) comes from">
+    Carry out Step 4 of the optimality derivation with the constants kept. Tile a path of length $L$
+    with balls of radius $r_n / 4$ whose centers are $r_n / 4$ apart; count them; write the
+    probability that a given ball is empty after $n$ uniform samples in $\Qfree$; apply the union
+    bound; and find the smallest exponent of $\gamma$ for which $\sum_n \Pr[\text{some ball empty at }
+    n]$ converges. Identify the step at which $(1 + 1/d)$ enters.
+    <Hints>
+      <>The number of balls is about 4L / r_n ∝ (n / log n)^(1/d). The emptiness probability is at most n^(−cγ^d) with c = ζ_d / (4^d μ(Q_free)).</>
+      <>Σ_n n^(1/d − cγ^d) (log n)^(−1/d) converges iff cγ^d − 1/d &gt; 1.</>
+      <>So cγ^d &gt; 1 + 1/d, i.e. γ^d &gt; (1 + 1/d) · 4^d μ(Q_free) / ζ_d. The 4^d is the geometric slack of this particular tiling; a tighter tiling gives the paper's 2^d.</>
+    </Hints>
+    <CheckAnswer id="ch13.e1" prompt="With d = 2 and μ(Q_free)/ζ_d = 1/π, what is the threshold on γ² from this tiling (balls of radius r_n/4)?" answer={7.64} tolerance={0.2}>
+    $\gamma^2 > (1 + 1/2) \cdot 16 / \pi = 24 / \pi = 7.64$, so $\gamma > 2.76$ — looser than the
+    paper's $\gamma^*_{2011} = 1.38$ by exactly the factor $2$ of the tiling radius. The dependence
+    on $(1 + 1/d)$, $\mu(\Qfree)$ and $\zeta_d$ is the same.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="The informed set on the torus">
+    Show that on $T^2$ the planar ellipse formula undercounts $\mu(X_{\hat f})$ once $c_{best}$
+    exceeds the torus circumference $2\pi$: the geodesic from a focus to a point may go through the
+    seam, so points the planar formula excludes satisfy $\hat g + \hat h \le c_{best}$. Derive the
+    correct sampler — a union of ellipses over the seam images of the foci, or rejection on the
+    unwrapped cover — and say which the implementation uses and why.
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the half-radius, then verify">
+    <Predict
+      id="ch13.e3"
+      question="In Rewire Watch on the Apartment at γ/γ* = 1 and seed 13, RRT* ends within a few percent of the lattice floor by 6 000 iterations. Before touching the slider: what does γ/γ* = 0.5 do to its cost curve?"
+      options={[
+        { label: 'Nothing — the ball is still large enough for choose-parent and rewire to work', because: 'Early on, yes: r_n is large for small n at any γ. But the ball shrinks as n grows, and at half the critical γ it shrinks faster than samples arrive to fill it. The curve stalls above the floor rather than converging.' },
+        { label: 'A slower descent that stalls above the floor', correct: true, because: 'Right. Rewiring still happens while the ball is large, so the early descent survives, but the expected size of Q_near falls like γ² log n — a quarter of the critical value — and eventually a new node finds no neighbor but q_near. The tree reverts to RRT behavior and the curve flattens short of the optimum.' },
+        { label: 'A flat curve from the start, identical to RRT', because: 'Too strong. For n in the hundreds, r_n at γ/γ* = 0.5 is still a few multiples of the inter-node spacing, and the first rewires do happen. The failure is asymptotic, which is exactly the theorem\'s point.' },
+      ]}
+    >
+    Verify, then read the $\lvert Q_{near} \rvert$ histogram at both settings. Its mean scales with
+    $\gamma^d \log n$: at the critical $\gamma$ it hovers around a few times $\log n$; at half, around
+    a quarter of that, and the fraction of insertions with $\lvert Q_{near} \rvert = 1$ — no choice to
+    make — climbs as $n$ grows.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Where BIT* and RRT* cross">
+    In Batch Bench on the Workbench, find the deadline at which BIT\*'s and RRT\*'s costs are equal
+    on a fixed seed, then vary the batch size and find the one that moves the crossing earliest.
+    Relate it to how many batches fit before the deadline: a batch too small is searched before it
+    has enough samples to improve the incumbent, a batch too large is still being searched when the
+    clock stops.
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="The k-nearest neighborhood">
+    Implement `Neighborhood::KNearest` with $k_n = \lceil k^* \log n \rceil$, $k^* = e(1 + 1/d)$,
+    and a test that the radius and $k$-nearest variants reach costs within 3 percent of each other
+    after 6 000 iterations under seed 13 on the Apartment. The TypeScript check
+    `k-nearest RRT*` asks for 10 percent; tighten it and report how many seeds survive.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Shortcutting cannot win the homotopy class">
+    Run Chapter 11's `shortcut_greedy` on RRT's path and plot, over 100 seeds, its cost against
+    RRT\*'s at equal wall-clock time on the Apartment. Then build the two-homotopy-class map where it
+    cannot win: a single obstacle between start and goal, with the shorter way round narrower than
+    the longer. Show that RRT commits to the wide side on a fixed fraction of seeds and that no amount
+    of shortcutting moves it to the narrow one, while RRT\*'s incumbent eventually does.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Karaman, S. and Frazzoli, E."
+    year={2011}
+    title="Sampling-based Algorithms for Optimal Motion Planning"
+    venue="International Journal of Robotics Research 30(7), 846–894"
+    doi="10.1177/0278364911406761"
+    note="RRT's almost-sure suboptimality, PRM*, RRG and RRT*, and the radius r_n = γ(log n/n)^{1/d} with the 2011 constant this chapter calls γ*₂₀₁₁."
+  />
+  <Reference
+    authors="Solovey, K., Janson, L., Schmerling, E., Frazzoli, E., and Pavone, M."
+    year={2020}
+    title="Revisiting the Asymptotic Optimality of RRT*"
+    venue="IEEE International Conference on Robotics and Automation"
+    url="https://arxiv.org/abs/1909.09688"
+    note="The gap in the 2011 RRT* proof and its repair, with the smaller constant γ*₂₀₂₀ the implementation defaults to."
+  />
+  <Reference
+    authors="Gammell, J. D., Srinivasa, S. S., and Barfoot, T. D."
+    year={2014}
+    title="Informed RRT*: Optimal Sampling-based Path Planning Focused via Direct Sampling of an Admissible Ellipsoidal Heuristic"
+    venue="IEEE/RSJ International Conference on Intelligent Robots and Systems"
+    doi="10.1109/IROS.2014.6942976"
+    note="The informed set, its direct sampling by scaling and rotating the unit ball, and the measure ratio w13.2 reads out."
+  />
+  <Reference
+    authors="Gammell, J. D., Barfoot, T. D., and Srinivasa, S. S."
+    year={2020}
+    title="Batch Informed Trees (BIT*): Informed Asymptotically Optimal Anytime Search"
+    venue="International Journal of Robotics Research 39(5)"
+    url="https://arxiv.org/abs/1707.01888"
+    note="BIT* in its journal form: batches on an implicit random geometric graph, the edge queue keyed ĝ + ĉ + ĥ, pruning and tree reuse. The ICRA 2015 paper introduced it."
+  />
+  <Reference
+    authors="Janson, L., Schmerling, E., Clark, A., and Pavone, M."
+    year={2015}
+    title="Fast Marching Tree: a Fast Marching Sampling-Based Method for Optimal Motion Planning in Many Dimensions"
+    venue="International Journal of Robotics Research 34(7), 883–921"
+    doi="10.1177/0278364915577958"
+    note="FMT*: lazy dynamic programming on one batch, its radius constant, and the O(n log n) collision-check bound."
+  />
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="The scaffolding: Theorem 7.4.1's ball tiling and the (ε, α, β) constants reappear inside the optimality proofs; §7.1.2's shortcutting is the pre-2011 answer to path quality, and the epigraph's 'large dense roadmap' is the intuition PRM* turns into a theorem."
+  />
+  <Reference
+    authors="Şucan, I. A., Moll, M., and Kavraki, L. E."
+    year={2012}
+    title="The Open Motion Planning Library"
+    venue="IEEE Robotics and Automation Magazine 19(4), 72–82"
+    doi="10.1109/MRA.2012.2205651"
+    note="Reference implementations of RRT*, PRM*, Informed RRT*, FMT* and BIT*, against which this chapter's constants and defaults were compared."
+  />
+</References>

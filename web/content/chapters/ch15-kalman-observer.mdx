@@ -1,0 +1,985 @@
+---
+title: "Kalman Filtering: The Geometric Observer"
+description: The Kalman filter as Choset teaches it — a Luenberger observer whose gain is re-chosen every step so the correction is the shortest Mahalanobis step onto the most likely measurement hyperplane — plus observability, EKF localization, and Kalman SLAM, compressed to what a planner needs.
+chapter: 15
+part: PART IV
+partTitle: Planning with Uncertainty
+difficulty: Intermediate
+readingTime: 55 min
+quote: The Kalman filter is both an observer and a filter.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §8.2.1
+---
+
+import { DeadReckoningDrift } from '@/components/ch/ch15/dead-reckoning-drift';
+import { ObserverBench } from '@/components/ch/ch15/observer-bench';
+import { HyperplaneEllipse } from '@/components/ch/ch15/hyperplane-ellipse';
+import { ObservabilityProbe } from '@/components/ch/ch15/observability-probe';
+import { LinkedMath, RoleTag } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'See the Kalman filter as a Luenberger observer whose gain is recomputed every step, and say precisely what that gain optimizes',
+    'Derive the update as a projection onto the measurement hyperplane: first Euclidean, then Mahalanobis, then onto the most likely output',
+    'Run Choset\'s dead-reckoning example by hand and read off why one variance shrinks while the other grows under an optimal filter',
+    'State and apply the observability rank test, for linear systems and for the linearized pair of a landmark localizer',
+    'Wrap the sister book\'s vendored Kalman code in a thin estimate crate: observer, rank test, Choset-notation adapters, landmark models, Kalman SLAM',
+  ]}
+  prerequisites={[
+    'Rusty, the Apartment, and the range sensor (Chapter 2); SE(2) as a manifold and why heading needs care (Chapter 5)',
+    'Linear algebra: null spaces, column spaces, positive-definite matrices as inner products',
+    'Multivariate Gaussians — the sister book\'s Chapter 2 is the primer this chapter assumes',
+  ]}
+>
+Fourteen chapters of planners assumed the planner knew $q$. This chapter admits that Rusty does not.
+Encoders drift, landmarks are noisy, and the configuration a planner imagines is only a *belief* about
+the state the robot occupies. Choset's Chapter 8 teaches the Kalman filter as no other robotics text
+does — not as Bayes' rule with Gaussians, which the sister book does completely, but as an
+**observer**: a copy of the system corrected toward the set of states consistent with the latest
+measurement.
+
+The whole chapter is one picture. An ellipse of plausible states touches a line of
+measurement-consistent states, and the point of contact is the update. Once that picture is in
+place, the Kalman gain, the innovation covariance, data association by $\chi^2$, and Kalman SLAM all
+fall out of it — and so does the warning that an optimal observer still cannot learn a direction the
+sensors never see. Everything deeper is a link into the sister volume. What stays here is exactly the
+estimation vocabulary Chapters 16 and 23 consume.
+</Overview>
+
+## The problem: a planner that does not know where it is
+
+Put Rusty in the Apartment corridor and ask it to drive a loop on encoders alone. Each tick the wheels
+report how far they turned; integrate that and you have a position. The orange track below is that
+integral. The gray dashed track is where the robot actually went.
+
+<Deferred>
+  <DeadReckoningDrift />
+</Deferred>
+
+Two things go wrong, and they are different in kind. The right wheel is a fraction of a percent larger
+than the odometry believes, so every straight run bends into an arc — a *bias*, invisible to any
+amount of averaging. On top of it the wheels slip by a random amount each tick — *noise*, which
+random-walks the heading and, through the heading, the position. Choset's Figure 8.1 shows the same
+thing on a B21: a rotational error approaching 45° after one lap. The command-integration estimate
+"is continuously losing information about its location," and nothing in the integration can tell you
+how much.
+
+The cure is also in the widget. Tick *landmark fixes*. Whenever a mapped corner comes within range,
+one range-and-bearing sighting pulls the estimate back and collapses the ellipse. That pull is the
+subject of this chapter: how hard to tug, in which direction, and what the tug can and cannot fix.
+
+One sentence of bookkeeping, said once for all of Part IV. For Rusty the planner's configuration
+$q \in \SEtwo$ and the filter's state $x_t$ are the same object; the sister book writes $x_t, u_t,
+z_t$ and this book keeps Choset's $x(k), u(k), y(k)$ because his geometry reads better in it. The
+notation table below sits the two side by side so nobody translates twice.
+
+## Building intuition
+
+### The knob the filter turns
+
+Strip the problem to Choset's §8.2.6 toy: a robot on a rail with state $x = [x_r, v_r]\T$, a force
+input, Newton's law sampled at $T = 0.5$ s, and a noisy velocity sensor. An **observer** for it is a
+copy of the dynamics plus a correction proportional to the innovation — the difference between what
+the sensor said and what it would have said had the prediction been exact:
+
+<LinkedMath>
+$$
+\htmlClass{term-prediction}{\hat x(k{+}1 \mid k)} = F\,\hat x(k \mid k) + G\,u(k),
+\qquad
+\htmlClass{term-posterior}{\hat x(k{+}1 \mid k{+}1)} = \htmlClass{term-prediction}{\hat x(k{+}1 \mid k)}
++ K\,\bigl[\,\htmlClass{term-measurement}{y(k{+}1)} - H\,\htmlClass{term-prediction}{\hat x(k{+}1 \mid k)}\,\bigr].
+$$
+</LinkedMath>
+
+$K$ is a knob. Turn it to zero and you have dead reckoning; turn it up and the estimate chases the
+sensor, noise and all; turn it far enough and the estimate oscillates and diverges. The Observer Bench
+lets you turn it. Then it lets the filter turn it for you.
+
+<Deferred>
+  <ObserverBench />
+</Deferred>
+
+Watch three things. The ellipse in the phase plane grows orange on every predict and squishes purple
+on every update, always toward the green line of states consistent with the reading. The dots on the
+unit disc are the eigenvalues of the error dynamics; with the velocity sensor one of them sits at
+exactly $1$ no matter what you do, and the position variance climbs forever. And when you tick *let
+the filter choose*, the gain stops being a constant: it becomes a sequence $R(k)$ that starts large,
+settles, and the "equivalent knob" readout drifts to $1$ on its own. **The Kalman gain is not a
+tuning constant. It is a trajectory, and the knob you were turning is what the filter computes.**
+
+<NotationTable
+  rows={[
+    { sym: 'x(k) \\in \\R^n,\\ u(k) \\in \\R^m,\\ y(k) \\in \\R^p', meaning: 'State, input, output at sample k (period T).', note: 'Sister book: x_t, u_t, z_t' },
+    { sym: 'F(k),\\ G(k),\\ H(k)', meaning: 'Dynamics, input, and output matrices.', note: 'Sister book: A_t, B_t, C_t' },
+    { sym: 'v(k) \\sim \\Normal(0, V),\\ w(k) \\sim \\Normal(0, W)', meaning: 'Process and measurement noise and their covariances.', note: 'Sister book: N(0, R_t), N(0, Q_t)' },
+    { sym: '\\hat x(k_1 \\mid k_2),\\ P(k_1 \\mid k_2)', meaning: 'Estimate and error covariance at k₁ given outputs through k₂.', note: 'Sister book: μ_t, Σ_t (bars when predicted)' },
+    { sym: '\\Omega = \\{x : Hx = y\\},\\ \\Omega^*', meaning: 'States consistent with the output y; with the most likely output y*.' },
+    { sym: '\\nu = y - H\\hat x(k{+}1 \\mid k),\\quad S = HPH\\T + W', meaning: 'Innovation and its covariance.', note: 'Sister book: z_t − C_t μ̄_t, S_t' },
+    { sym: 'R = PH\\T S^{-1}', meaning: 'The Kalman gain — Choset\'s letter. Not a covariance.', note: 'Sister book: K_t. Thrun\'s R is the process covariance.' },
+    { sym: '\\norm{x}_M^2 = x\\T P^{-1} x', meaning: 'Mahalanobis norm under the predicted covariance P(k+1 | k).' },
+    { sym: 'Q = [H;\\ HF;\\ \\dots;\\ HF^{n-1}]', meaning: 'Observability matrix (Thm. 8.2.2).' },
+    { sym: 'a(\\cdot),\\quad \\chi^2_{ij} = \\nu_{ij}\\T S_{ij}^{-1} \\nu_{ij}', meaning: 'Association map; Mahalanobis innovation of measurement i against landmark j.', note: 'Sister book: c_t^i, d_ij' },
+  ]}
+/>
+
+<Callout type="warn" title="The symbol hazard, stated once">
+Choset's $R$ is the **gain** and his $V, W$ are **covariances**. The sister book, in Thrun's
+convention, uses $K$ for the gain and $R, Q$ for the covariances. The vendored code speaks Thrun; the
+`estimate` crate translates at its boundary and nowhere else, and every widget labels both.
+</Callout>
+
+### The picture
+
+Here is the one picture the chapter is built on, drawn from the numbers of Choset's example. The
+orange ellipse is the predicted belief. The green line is $\Omega$: every state that would produce the
+reading exactly. Where should the estimate go?
+
+<Deferred minHeight={520}>
+  <HyperplaneEllipse />
+</Deferred>
+
+The naive answer is the gray foot: drop perpendicularly onto $\Omega$, correct the velocity the sensor
+measured and leave the position alone. The right answer is the purple foot: perpendicular *in the
+metric of the covariance*. Position and velocity are correlated in $P$ — a robot that was going faster
+than we thought has also gone farther — so correcting the velocity should drag the position with it,
+and the correlated, more uncertain direction moves more. Add sensor noise and the line itself moves to
+$\Omega^*$ through the most likely output $y^*$; the Kalman update is the Mahalanobis foot on *that*
+line. Three derivations, one picture.
+
+## The mathematics
+
+### Definitions
+
+An **observer** for the system $x(k{+}1) = F x(k) + G u(k)$, $y(k) = H x(k)$ is a recursion that
+reconstructs $x(k)$ from the known signals $u(\cdot), y(\cdot)$ and the model $(F, G, H)$ when $H$ is
+not invertible — which it usually is not, being $p \times n$ with $p < n$ (§8.2.1; App. J.4). The
+Kalman filter is both an observer and a filter: it reconstructs the state *and* suppresses the noise.
+
+The **innovation** $\nu = y(k{+}1) - H\hat x(k{+}1 \mid k)$ is what the sensor said minus what it
+would have said had the prediction been exact. The **consistent set**
+$\Omega = \{x \in \R^n : H x = y(k{+}1)\}$ is the affine subspace of states that reproduce the output;
+its dimension is $n - p$ when $H$ has full row rank, which Choset assumes throughout §8.2.
+
+The **Mahalanobis distance** $d_M(x, \hat x) = \norm{x - \hat x}_M$ with
+$\norm{x}_M^2 = x\T P(k{+}1 \mid k)^{-1} x$ measures distance in standard deviations under the
+predicted covariance (§8.2.3, footnote 5). It comes from an inner product
+$\langle x_1, x_2 \rangle_M = x_1\T P^{-1} x_2$, so "orthogonal" has a meaning under it.
+
+A linear system is **observable** when the initial state is determined by $u, y$ over a finite window;
+for LTI systems, iff $\rank Q = n$ (App. J.4, Thm. J.4.1). The **Luenberger observer** (eq. J.9) is
+$\dot{\hat x} = A\hat x + Bu + K(y - C\hat x)$, with error dynamics $\dot e = (A - KC)e$; its discrete
+cousin is what the Bench runs.
+
+**Data association** is the choice of $a(i)$, the landmark that explains measurement $i$ (§8.3.2).
+
+### The simple observer is an orthogonal projection
+
+<KeyIdea title="Statement (§8.2.2)">
+With no noise, the update closest to the prediction in the Euclidean sense is
+$\hat x^+ = \hat x^- + H\T (HH\T)^{-1}\,\nu$.
+</KeyIdea>
+
+<Derivation title="Projecting the prediction onto Ω" result="Δx = Hᵀ(HHᵀ)⁻¹ ν">
+Write $\Delta x = \hat x(k{+}1 \mid k{+}1) - \hat x(k{+}1 \mid k)$ and ask for the shortest $\Delta x$
+that lands in $\Omega$.
+
+**Step 1 — the true state lies in $\Omega$.** With no measurement noise, $Hx(k{+}1) = y(k{+}1)$
+exactly. So the update should land in $\Omega$, and since the prediction is our best guess, it should
+be the point of $\Omega$ nearest the prediction.
+
+**Step 2 — shortest means orthogonal.** The shortest vector from a point to an affine subspace is
+orthogonal to it: $a\T \Delta x = 0$ for every $a$ parallel to $\Omega$. A vector is parallel to
+$\Omega$ iff $Ha = 0$, i.e. $a \in \operatorname{null}(H)$ (Choset's problems 4–5).
+
+**Step 3 — orthogonal to the null space means in the column space of $H\T$.** This is the fundamental
+theorem of linear algebra (problem 6): $\operatorname{null}(H)^\perp = \operatorname{column}(H\T)$.
+So $\Delta x = H\T\gamma$ for some $\gamma \in \R^p$.
+
+**Step 4 — guess $\gamma$ linear in the innovation.** Try $\gamma = K\nu$ with $K \in \R^{p \times p}$,
+so $\Delta x = H\T K \nu$. Enforce membership in $\Omega$: $H(\hat x^- + \Delta x) = y$, i.e.
+$H\Delta x = \nu$.
+
+**Step 5 — solve.** $HH\T K\nu = \nu$ for every $\nu$ forces $K = (HH\T)^{-1}$, which exists because
+$H$ has full row rank. The guess is verified and the observer is complete.
+
+*Why it is not enough.* The update is always perpendicular to $\Omega$, so only the component of the
+state that directly affects the current reading is corrected. Errors parallel to $\Omega$ — position,
+for a velocity sensor — are never touched, and the estimate does not in general converge. The
+covariance is what fixes this.
+</Derivation>
+
+### Prediction grows the ellipse; the update is the Mahalanobis-closest point
+
+<KeyIdea title="Statement (§8.2.3)">
+$P(k{+}1 \mid k) = F P(k \mid k) F\T + V$. With noiseless outputs, the most likely point of $\Omega$
+under the predicted Gaussian is reached by $\Delta x = P H\T (HPH\T)^{-1}\nu$, and
+$P(k{+}1 \mid k{+}1) = P - RHP$ with $R = PH\T(HPH\T)^{-1}$.
+</KeyIdea>
+
+<Derivation title="Covariance prediction and the skewed projection" result="Δx = PHᵀ(HPHᵀ)⁻¹ ν">
+**Step 1 — expand the definition.** $P(k{+}1 \mid k) = \E[(x(k{+}1) - \hat x(k{+}1 \mid k))(\cdot)\T]$.
+Substitute $x(k{+}1) = Fx + Gu + v$ and $\hat x(k{+}1 \mid k) = F\hat x + Gu$; the input cancels and
+the error is $F(x - \hat x) + v$.
+
+**Step 2 — the cross terms vanish.** $v(k)$ is zero-mean and independent of both $x(k)$ and
+$\hat x(k \mid k)$, so $\E[F(x - \hat x)v\T] = F\,\E[x - \hat x]\,\E[v]\T = 0$. What remains is
+$F\,\E[(x - \hat x)(x - \hat x)\T]F\T + \E[vv\T] = FPF\T + V$. This is eq. (8.12). Note that $FPF\T$
+can shrink if $F$ is contractive; prediction only ever *adds* uncertainty because of $+V$.
+
+**Step 3 — most likely point on $\Omega$.** The Gaussian's exponent is
+$-\tfrac12 (x - \hat x^-)\T P^{-1}(x - \hat x^-)$, so maximizing it over $\Omega$ means minimizing
+$\norm{\Delta x}_M$ subject to $\hat x^- + \Delta x \in \Omega$. Replace Euclidean orthogonality by
+$\langle a, \Delta x\rangle_M = a\T P^{-1}\Delta x = 0$ for all $a \in \operatorname{null}(H)$.
+
+**Step 4 — the column space moves.** $P^{-1}\Delta x \in \operatorname{column}(H\T)$, hence
+$\Delta x \in \operatorname{column}(PH\T)$: $\Delta x = PH\T\gamma$. Figure 8.3 draws this: the
+Mahalanobis-equidistant ellipses around the prediction grow until one touches $\Omega$, and the touch
+point is not under the prediction unless $P$ is a multiple of the identity.
+
+**Step 5 — solve as before.** Guess $\gamma = K\nu$, enforce $H\Delta x = \nu$:
+$HPH\T K\nu = \nu$, so $K = (HPH\T)^{-1}$ and $R = PH\T(HPH\T)^{-1}$ — eq. (8.21). The covariance
+update $P^+ = P - RHP$, eq. (8.15), is Choset's problem 7 and this chapter's Exercise 1.
+
+*Why it is still not enough.* Noiseless outputs make $P^+$ singular in the measured directions —
+exactly zero uncertainty along $H$ — and a singular $P$ makes the Mahalanobis norm meaningless on the
+next step. The last ingredient is sensor noise.
+</Derivation>
+
+### The Kalman filter: most likely output, then project
+
+<KeyIdea title="Statement (§8.2.4)">
+With $w \sim \Normal(0, W)$:
+$R = P^- H\T (HP^-H\T + W)^{-1}$, $\;\hat x^+ = \hat x^- + R\nu$, $\;P^+ = P^- - RHP^-$.
+</KeyIdea>
+
+<Derivation title="From Ω to Ω*: Theorem 8.2.1 and the final gain" result="R = P⁻Hᵀ(HP⁻Hᵀ + W)⁻¹">
+**Step 1 — project the prediction into output space.** The state Gaussian $(\hat x^-, P^-)$ maps
+under $H$ to an output-space Gaussian with mean $\hat y = H\hat x^-$ and covariance
+$\hat W = HP^-H\T$.
+
+**Step 2 — the measurement is a second Gaussian there.** The reading $y(k{+}1)$ carries noise of
+covariance $W$, so the sensor's claim about the output is $\Normal(y, W)$. The two are independent.
+
+**Step 3 — Theorem 8.2.1 (product of Gaussians).** The product of Gaussians with pairs $(z_1, C_1)$
+and $(z_2, C_2)$ is proportional to a Gaussian with
+$z_3 = z_1 + \mathcal{Q}(z_2 - z_1)$, $C_3 = C_1 - \mathcal{Q}C_1$, $\mathcal{Q} = C_1(C_1 + C_2)^{-1}$.
+The proof (Choset's problem 8, Exercise 2 here) multiplies the exponentials and matches the terms
+quadratic and linear in $z$.
+
+**Step 4 — the most likely output.** Apply it with $(z_1, C_1) = (\hat y, \hat W)$ and
+$(z_2, C_2) = (y, W)$: the peak is $y^* = \hat y + \hat W(\hat W + W)^{-1}(y - \hat y)$. Define
+$\Omega^* = \{x : Hx = y^*\}$ — Figure 8.4's second line.
+
+**Step 5 — project onto $\Omega^*$ as before.** The noiseless result of the previous derivation gives
+$\Delta x = P^-H\T(HP^-H\T)^{-1}(y^* - H\hat x^-)$. Substitute $y^* - \hat y = \hat W(\hat W + W)^{-1}\nu$
+with $\hat W = HP^-H\T$: the two inverses collapse,
+$$
+\Delta x = P^-H\T\,(HP^-H\T)^{-1}\,HP^-H\T\,(HP^-H\T + W)^{-1}\,\nu = P^-H\T\,(HP^-H\T + W)^{-1}\,\nu .
+$$
+That is eq. (8.24) with $R$ as stated, and $P^+ = P^- - RHP^-$ follows as in problem 7.
+
+*Two honesty notes Choset insists on.* For Gaussian noise these are not merely the "best" estimates
+but the *correct* posterior: if the belief at $k$ is Gaussian, so is the belief at $k{+}1$, and this is
+it. For non-Gaussian noise the same equations give the best *linear* estimator, and a nonlinear one
+may do better. The sister book reaches the same formulas by completing the square — see
+[its Chapter 6](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch06-kalman-filters)
+for that route, the information form, and the proof the two coincide.
+</Derivation>
+
+### The Kalman filter is a Luenberger observer with a scheduled gain
+
+This is the chapter's lens, and Choset implies it across §8.2 and Appendix J without stating it.
+
+<KeyIdea title="Statement">
+Substituting the prediction into the update,
+$$
+\hat x(k{+}1 \mid k{+}1) = F\hat x(k \mid k) + Gu(k) + R(k{+}1)\bigl[\,y(k{+}1) - H\bigl(F\hat x(k \mid k) + Gu(k)\bigr)\bigr],
+$$
+a Luenberger observer whose gain $R(k{+}1)$ is recomputed from $P$ each step. With any *fixed* gain
+$K$ the error obeys $e(k{+}1) = (I - KH)F\,e(k) + (I - KH)v(k) - Kw(k)$, stable iff every eigenvalue
+of $(I - KH)F$ lies inside the unit disc (Thm. J.5.1). Among all gains, the Kalman gain is the one
+minimizing $\tr P^+$ at each step.
+</KeyIdea>
+
+<Derivation title="Error dynamics of the fixed-gain observer" result="e(k+1) = (I − KH)F e(k) + noise">
+**Step 1 — write the observer.** $\hat x^+ = F\hat x + Gu + K(y - H(F\hat x + Gu))$.
+
+**Step 2 — subtract from the true dynamics.** $x^+ = Fx + Gu + v$ and $y = Hx^+ + w = H(Fx + Gu + v) + w$.
+The inputs cancel.
+
+**Step 3 — collect the error** $e = x - \hat x$:
+$e^+ = Fe + v - K\bigl(HFe + Hv + w\bigr) = (I - KH)Fe + (I - KH)v - Kw$.
+
+**Step 4 — read off stability.** The noise-free part is the unforced linear system
+$e^+ = (I - KH)Fe$; by Thm. J.5.1 it decays iff $|\lambda_i| < 1$ for every eigenvalue of
+$(I - KH)F$. Choosing $K$ is choosing where those eigenvalues sit — Thm. J.3.2 transposed. For a
+single output this is Ackermann's formula on the pair $(F, HF)$, which `placeObserverGain` implements,
+and which *fails* exactly when $(F, H)$ is unobservable: for the velocity-sensor rail robot the
+position eigenvalue is pinned at $1$ and no $K$ moves it.
+
+**Step 5 — the filter's choice.** Take the error covariance of the fixed-gain observer under the noise
+model, in the form valid for *any* $K$ (the Joseph form):
+$P^+(K) = (I - KH)P^-(I - KH)\T + KWK\T$. Differentiating $\tr P^+(K)$ in $K$ and setting it to zero
+gives $K = P^-H\T(HP^-H\T + W)^{-1}$ — the Kalman gain. For a scalar state with $P^- = 1.7$, $H = 1$,
+$W = 0.5$ a brute-force search over $K$ lands on $0.7727 = 1.7/2.2$ with $P^+ = 0.3864$; the check file
+does this search so you need not trust the calculus.
+
+*From knob to schedule.* Iterate predict and update on $P$ alone and, for an observable pair, $P^-$
+converges to the fixed point of the Riccati recursion; the gain converges with it to a constant $R_\infty$.
+That constant is a perfectly good Luenberger gain — the Bench's knob is scaled so that $g = 1$ is
+$R_\infty$. For the position sensor, $R_\infty = [0.589, 0.287]\T$ and the error eigenvalues are
+$0.634 \pm 0.097i$, modulus $0.641$. For the velocity sensor $P$ never converges but $R$ still does,
+to $[0.500, 0.358]\T$, with eigenvalues $\{1, 0.642\}$ — the $1$ is the position direction nobody
+measures.
+</Derivation>
+
+### Observability: the rank test
+
+<KeyIdea title="Theorem 8.2.2 (Observability Test)">
+The LTI system $x(k{+}1) = Fx(k) + Gu(k) + v(k)$, $y(k) = Hx(k) + w(k)$ is observable iff
+$$
+Q = \begin{bmatrix} H \\ HF \\ HF^2 \\ \vdots \\ HF^{n-1} \end{bmatrix}
+\quad\text{has rank } n.
+$$
+For any observable linear system the Kalman estimate converges in the sense that the expected error
+between the actual and estimated state is bounded for all time.
+</KeyIdea>
+
+<Derivation title="Why stacking powers of F decides everything" result="rank Q = n ⇔ x(0) recoverable">
+**Step 1 — stack the outputs.** With zero noise, $y(0) = Hx(0)$, $y(1) = HFx(0) + HGu(0)$,
+$y(2) = HF^2x(0) + \text{known input terms}$, and so on. Move the known input terms to the left: the
+stacked vector $\tilde y = Q\,x(0)$.
+
+**Step 2 — recoverability is injectivity.** $x(0)$ is determined by $\tilde y$ iff $Q$ has a trivial
+null space, i.e. rank $n$. Knowing $x(0)$ and the inputs, every later state follows.
+
+**Step 3 — higher powers add nothing.** By Cayley–Hamilton $F^n$ is a linear combination of
+$I, F, \dots, F^{n-1}$, so rows $HF^k$ for $k \ge n$ lie in the span of those already stacked.
+
+**Step 4 — duality.** $(F, H)$ is observable iff $(F\T, H\T)$ is controllable (App. J.5.2), which is
+why the same rank test, transposed, appears in Chapter 20 as the controllability matrix.
+
+*The dead-reckoning case.* Velocity sensor: $Q = [0\ 1;\ 0\ 1]$, rank $1$. The null direction is
+$[1, 0]\T$ — position — and the position variance grows without bound through optimal updates. Choset's
+verdict: "This failure is not the fault of the Kalman filter … The problem instead lies with the system
+itself." Position sensor: $Q = [1\ 0;\ 1\ 0.5]$, rank $2$, and both variances settle.
+
+*For nonlinear systems* the test is applied to the linearized pair $(\partial f/\partial x,
+\partial h/\partial x)$ at the current estimate and is only *local* — true at this pose, this input,
+these landmarks. The Observability Probe recomputes it every frame for that reason.
+</Derivation>
+
+### Two hand-checked steps
+
+Choset's §8.2.6 robot, with his numbers: $T = 0.5$, $m = 1$,
+$F = \bigl[\begin{smallmatrix}1 & 0.5\\ 0 & 1\end{smallmatrix}\bigr]$, $G = [0,\, 0.5]\T$, $u = 0$,
+$V = \bigl[\begin{smallmatrix}0.2 & 0.05\\ 0.05 & 0.1\end{smallmatrix}\bigr]$, $H = [0\ \ 1]$,
+$W = 0.5$, $\hat x(k \mid k) = [2, 4]\T$, $P(k \mid k) = \diag(1, 2)$. He reports no measurement value;
+this chapter fixes $y(k{+}1) = 2.7$ and $y(k{+}2) = 2.0$. These two readings are ours, not his.
+
+**Step 1.** Predict: $\hat x^- = F[2, 4]\T = [4, 4]\T$ and
+$P^- = FPF\T + V = \bigl[\begin{smallmatrix}1.7 & 1.05\\ 1.05 & 2.1\end{smallmatrix}\bigr]$.
+Update: $\nu = 2.7 - 4 = -1.3$, $S = 2.1 + 0.5 = 2.6$, $R = [1.05,\ 2.1]\T / 2.6 = [0.4038,\ 0.8077]\T$,
+so $\nu / S = -0.5$ exactly and
+
+<LinkedMath>
+$$
+\htmlClass{term-posterior}{\hat x^+} = \htmlClass{term-prediction}{[4,\ 4]\T} + R\,\htmlClass{term-measurement}{(-1.3)} = [3.475,\ 2.95]\T,
+\qquad
+\htmlClass{term-posterior}{P^+} = \htmlClass{term-prediction}{P^-} - R\,[1.05\ \ 2.1]
+= \begin{bmatrix}1.2760 & 0.2019\\ 0.2019 & 0.4038\end{bmatrix}.
+$$
+</LinkedMath>
+
+**Step 2.** Predict: $\hat x^- = [4.95,\ 2.95]\T$,
+$P^- = \bigl[\begin{smallmatrix}1.7788 & 0.4538\\ 0.4538 & 0.5038\end{smallmatrix}\bigr]$. Update:
+$\nu = -0.95$, $S = 1.0038$, $R = [0.4521,\ 0.5019]\T$, $\hat x^+ = [4.520,\ 2.473]\T$,
+$P^+ = \bigl[\begin{smallmatrix}1.5737 & 0.2261\\ 0.2261 & 0.2510\end{smallmatrix}\bigr]$.
+
+Read the diagonal. The velocity variance goes $2 \to 0.404 \to 0.251$: the squish of Figure 8.7. The
+position variance goes $1 \to 1.276 \to 1.574$: growing, through two *optimal* updates, because the
+sensor never sees position. That is Theorem 8.2.2 in two numbers.
+
+<CheckAnswer
+  id="ch15.step3"
+  prompt="Carry the example one more step with y(k+3) = 2.3. What is the position variance P₁₁(k+3 | k+3)?"
+  answer={1.873}
+  tolerance={0.01}
+>
+Predict: $P^-_{11} = 1.5737 + 2(0.5)(0.2261) + 0.25(0.2510) + 0.2 = 2.0625$,
+$P^-_{12} = 0.2261 + 0.5(0.2510) + 0.05 = 0.4015$, $P^-_{22} = 0.2510 + 0.1 = 0.3510$. Update:
+$S = 0.3510 + 0.5 = 0.8510$, $R_1 = 0.4015 / 0.8510 = 0.4719$, and
+$P^+_{11} = 2.0625 - 0.4719 \times 0.4015 = 1.8730$. Larger again than last step's $1.5737$: the
+optimal update recovers some of what prediction added, never all of it, and never enough to turn the
+trend. The velocity variance, meanwhile, falls to $0.2062$.
+</CheckAnswer>
+
+### EKF for range-and-bearing localization
+
+<KeyIdea title="Statement (§8.3, §8.3.1)">
+For $x = [x_r, y_r, \theta_r]\T$ with $f(x, u) = [x_r + u_1\cos\theta_r,\ y_r + u_1\sin\theta_r,\
+\theta_r + u_2]\T$ and
+$h_j(x) = [\rho_j,\ \operatorname{atan2}(y_r - y_{\ell j},\, x_r - x_{\ell j}) - \theta_r]\T$,
+the EKF is the Kalman filter with $F = \partial f/\partial x$ at $\hat x(k \mid k)$ and
+$H_j = \partial h_j/\partial x$ at $\hat x(k{+}1 \mid k)$ (eqs. 8.37–8.45).
+</KeyIdea>
+
+<Derivation title="Linearizing the unicycle and the landmark sensor" result="F and H_j by first-order Taylor">
+**Step 1 — Taylor about the estimate.** Expand $f$ about $\hat x(k \mid k)$ and $h$ about
+$\hat x(k{+}1 \mid k)$ to first order; the Kalman equations then apply to the deviation. Nothing else
+changes: the EKF is eqs. (8.26)–(8.32) with $f, h$ for the means and their Jacobians for the covariances.
+
+**Step 2 — the motion Jacobian.**
+$$
+F = \begin{bmatrix} 1 & 0 & -u_1\sin\theta_r \\ 0 & 1 & u_1\cos\theta_r \\ 0 & 0 & 1\end{bmatrix}.
+$$
+The third column is the whole story of heading error: a small $\delta\theta$ becomes a position error
+$u_1\,\delta\theta$ sideways to the motion, every step.
+
+**Step 3 — the sensor Jacobian.** With $\Delta = \hat x - x_{\ell j}$ and $\rho = \norm{\Delta}$,
+$$
+H_j = \begin{bmatrix} \Delta x/\rho & \Delta y/\rho & 0 \\ -\Delta y/\rho^2 & \Delta x/\rho^2 & -1\end{bmatrix}.
+$$
+Choset prints the bearing row before simplifying, as the raw derivative of $\operatorname{atan2}$
+through $1/(1 + (\Delta y/\Delta x)^2)$; the check file keeps both forms and confirms they agree to
+$10^{-15}$, and both agree with a central-difference Jacobian to $10^{-9}$. Read the second row: bearing
+sensitivity to position falls off as $1/\rho$ while its sensitivity to heading is exactly $-1$ at any
+range. A distant landmark is nearly a pure heading sensor.
+
+**Step 4 — stack the visible landmarks.** $p(k)$ sightings give a $2p \times 3$ matrix $H$ by stacking
+$H_{a(1)}, \dots, H_{a(p)}$ and a block-diagonal $W$. For block-diagonal $W$ this equals applying the
+sightings one at a time.
+
+**Step 5 — range-only is a deletion.** Drop the bearing rows from $h$ and $H$ (§8.3.3). The
+observability consequences are the subject of the Probe below.
+
+*Wrap the bearing innovation.* The 2005 text subtracts angles; near $\pm\pi$ that produces an innovation
+of $2\pi$ and a catastrophic update. The implementation here takes the residual through `angleDiff` and
+the heading through $\bplus$. The sister book's
+[Chapter 7](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch07-ekf-ukf-manifolds)
+does this properly — the UKF and the error-state EKF on $\SEtwo$ — and its
+[Chapter 11](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch11-localization-gaussian)
+covers gating and multi-hypothesis tracking when association is genuinely ambiguous.
+</Derivation>
+
+## The algorithm
+
+Choset numbers none of Chapter 8's algorithms; the names below follow his section titles.
+
+<Algorithm
+  name="kalman_filter(x̂(k|k), P(k|k), u(k), y(k+1); F, G, H, V, W)"
+  inputs="the current belief, the input applied, the output observed, the model"
+  outputs="x̂(k+1|k+1), P(k+1|k+1), and (ν, S, R) for association and diagnostics"
+  complexity="O(n³) in general; O(n²p + p³) when p ≪ n"
+>
+1. $\hat x(k{+}1 \mid k) = F\hat x(k \mid k) + Gu(k)$ — eq. 8.26
+2. $P(k{+}1 \mid k) = FP(k \mid k)F\T + V$ — eq. 8.27
+3. $\nu = y(k{+}1) - H\hat x(k{+}1 \mid k)$ — eq. 8.30
+4. $S = HP(k{+}1 \mid k)H\T + W$ — eq. 8.31
+5. $R = P(k{+}1 \mid k)H\T S^{-1}$ — eq. 8.32
+6. $\hat x(k{+}1 \mid k{+}1) = \hat x(k{+}1 \mid k) + R\nu$ — eq. 8.28
+7. $P(k{+}1 \mid k{+}1) = P(k{+}1 \mid k) - RHP(k{+}1 \mid k)$ — eq. 8.29; in code, the Joseph form, which equals this at the optimal gain and stays positive-definite under round-off
+8. return $\hat x(k{+}1 \mid k{+}1),\ P(k{+}1 \mid k{+}1),\ (\nu, S, R)$
+</Algorithm>
+
+Choset's reading of $R$: if $R$ is "large" the sensor is more believable than the prediction and the
+update leans on it; if "small", the reading barely moves the estimate. Line 5 says exactly how large —
+the ratio of predicted uncertainty to total innovation uncertainty, in matrix form.
+
+<Algorithm
+  name="observability_rank(F, H)"
+  inputs="the LTI pair, or the Jacobian pair of a nonlinear system at the current estimate"
+  outputs="rank Q, and a basis of null(Q): the directions no output can correct"
+  complexity="one rank computation on an np × n matrix"
+>
+1. $Q \leftarrow H$
+2. for $k = 1, \dots, n-1$: append $HF^k$ to $Q$
+3. return $\rank Q$ under a relative tolerance; observable iff it equals $n$ — Thm. 8.2.2
+</Algorithm>
+
+<Algorithm
+  name="ekf_localize(x̂, P, u, {y_i}; f, h, ∂f, ∂h, V, W)"
+  inputs="belief, input, the sightings this step, the nonlinear models and their Jacobians"
+  outputs="updated belief and the association map a(·)"
+  complexity="as kalman_filter plus the Jacobians; association O(n_ℓ p³) per sighting"
+>
+1. $\hat x^- = f(\hat x, u)$; $F = \partial f/\partial x|_{\hat x}$; $P^- = FPF\T + V$ — eqs. 8.37–8.39
+2. for each sighting $y_i$ and each landmark $j$: $\nu_{ij} = y_i - h_j(\hat x^-)$, $S_{ij} = H_jP^-H_j\T + W_i$, $\chi^2_{ij} = \nu_{ij}\T S_{ij}^{-1}\nu_{ij}$ — §8.3.2
+3. $a(i) = \arg\min_j \chi^2_{ij}$; reject the sighting if the minimum exceeds a gate, found a new landmark if it exceeds a high threshold (§8.4.2)
+4. stack $h_{a(i)}$, $H_{a(i)}$ over accepted sightings; wrap bearing residuals
+5. one `kalman_filter` update with the stacked $(H, W)$ — eqs. 8.40–8.45
+6. return $\hat x^+, P^+, a$
+</Algorithm>
+
+Choset minimizes $\chi^2_{ij}$ alone. When the candidates' gates differ in size this is not quite
+maximum likelihood: the $\log\det S_{ij}$ term matters, and the sister's `mlAssociate`, which the
+range–bearing path here delegates to, keeps it. The range-only path uses Choset's rule verbatim because
+the sister's routine assumes a bearing row.
+
+### The ellipse that never shrinks
+
+Now the question the Probe was built to answer. Rusty drives a square in room A of the Apartment while
+the EKF above localizes it against known landmarks. How many does it need?
+
+<Deferred minHeight={560}>
+  <ObservabilityProbe />
+</Deferred>
+
+With one range-only landmark the rank of the linearized pair is $2$. The single range row and its
+products with $F$ all share the same $(x, y)$ direction — radial from the landmark — so the direction
+*tangent* to the constant-range circle never appears in $Q$. The posterior ellipse stretches along that
+circle and stays stretched: after 240 steps its trace is $0.482$ against $0.034$ with two landmarks, an
+order of magnitude, and no number of further iterations closes the gap. Switch to two non-collinear
+landmarks and the rank is $3$; put both landmarks and the robot on one line and it falls to $2$ again
+(Exercise 4). Range *and* bearing from one landmark is observable while the robot moves — the third
+column of $HF$ carries $u_1$ — and loses a rank the moment it stops: two numbers cannot pin three.
+The NEES tile reads near $3$ for the observable cases, which is what a consistent 3-DOF filter should
+report ([sister Ch. 6](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch06-kalman-filters)
+on NEES and NIS).
+
+### Kalman SLAM
+
+If the landmarks are unknown, put them in the state (§8.4; Smith, Self and Cheeseman). For an
+omnidirectional vehicle measuring the *relative displacement* to $n_\ell$ uniquely identified landmarks,
+the system is linear:
+$x = [x_r, y_r, x_{\ell 1}, y_{\ell 1}, \dots]\T$, $F = I$, $G = [I_2; 0]$, $V = \operatorname{blkdiag}(V_r, 0, \dots)$,
+and each $H_i$ has $-1$ in the robot columns and $+1$ in landmark $i$'s. The sister's plain `Kf` runs
+it unchanged. Its observability matrix has rank $4$ of $6$ for two landmarks: the two null directions
+shift robot and map together. The filter learns the map's *shape* — in the check, the covariance of
+$x_{\ell 1} - x_r$ falls monotonically from trace $0.079$ to $0.020$ — while the map's absolute
+covariance stalls at $0.059$ and goes no lower. No sighting can say where the world is.
+
+For range and bearing on the unicycle (§8.4.2) the state is $[x_r, y_r, \theta_r, x_{\ell 1}, \dots]$
+and $H_i$ is eq. (8.47): dense in the first three columns, two nonzero entries at landmark $i$, zero
+elsewhere. Association is eq. (8.48) against every landmark in the state, and a minimum $\chi^2$ above
+a high threshold founds a new one. The *forget the map* toggle in the Probe runs this: three landmarks
+founded from their first sightings, $588$ of the remaining $597$ sightings matched, the worst map error
+$0.12$ m at $1.6\sigma$. Honest caveats: the covariance update is $O(n_\ell^2)$ per step, and on long
+loops the linearization makes the filter inconsistent. The sister book's
+[Chapter 14](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch14-ekf-slam) shows
+the cost and the inconsistency, and its Chapter 15 shows what replaced it.
+
+## Implementation in Rust
+
+The `estimate` crate is thin by design: every file is either an adapter over the sister book's
+vendored filters or a piece Choset has and the sister does not. No filter is re-implemented.
+
+```rust title="crates/estimate/src/lti.rs"
+use nalgebra::{DMatrix, SMatrix};
+
+/// An LTI system in Choset's letters. Every field names the Thrun symbol the
+/// sister book uses, because the two conventions collide in the worst place:
+/// Choset's `R` is the Kalman *gain*; Thrun's `R` is the process *covariance*.
+pub struct Lti<const N: usize, const U: usize, const M: usize> {
+    pub f: SMatrix<f64, N, N>, // A_t
+    pub g: SMatrix<f64, N, U>, // B_t
+    pub h: SMatrix<f64, M, N>, // C_t, assumed full row rank
+    pub v: SMatrix<f64, N, N>, // R_t  (process covariance)
+    pub w: SMatrix<f64, M, M>, // Q_t  (measurement covariance)
+}
+
+impl<const N: usize, const U: usize, const M: usize> Lti<N, U, M> {
+    /// App. J.5: F = I + T A, G = T B, H = C.
+    pub fn discretize(a: SMatrix<f64, N, N>, b: SMatrix<f64, N, U>, c: SMatrix<f64, M, N>, t: f64,
+                      v: SMatrix<f64, N, N>, w: SMatrix<f64, M, M>) -> Self {
+        Self { f: SMatrix::identity() + t * a, g: t * b, h: c, v, w }
+    }
+
+    /// Thm. 8.2.2: Q = [H; HF; …; HF^{N−1}]. Dynamic because N·M is not a
+    /// const expression — the one place this crate leaves the stack.
+    pub fn observability_matrix(&self) -> DMatrix<f64> {
+        let mut q = DMatrix::zeros(N * M, N);
+        let mut hf = self.h;
+        for k in 0..N {
+            q.view_mut((k * M, 0), (M, N)).copy_from(&hf);
+            hf = hf * self.f; // Cayley–Hamilton says stopping at N−1 loses nothing
+        }
+        q
+    }
+
+    /// rank Q == N under a *relative* SVD tolerance — a parameter, not a magic
+    /// number: a 0/1 matrix needs none, a linearized Jacobian mixing metres
+    /// and radians needs a generous one.
+    pub fn is_observable(&self, tol: f64) -> bool {
+        self.observability_matrix().rank(tol) == N
+    }
+}
+```
+
+The observer is the knob. Its `step` is three lines; `error_eigs` is the unit-disc inset, and
+`place_gain` is Theorem J.3.2 transposed — Ackermann's formula on the pair $(F, HF)$, which is why it
+can only succeed when $(F, H)$ is observable.
+
+```rust title="crates/estimate/src/observer.rs" {18-24}
+use nalgebra::{Complex, SMatrix, SVector};
+use crate::lti::Lti;
+
+/// Fixed-gain Luenberger observer, App. J.4 discretized by J.5:
+///   x̂⁺ = F x̂ + G u + K (y − H(F x̂ + G u)).
+pub struct Observer<const N: usize, const U: usize, const M: usize> {
+    pub sys: Lti<N, U, M>,
+    pub k: SMatrix<f64, N, M>,
+    pub xhat: SVector<f64, N>,
+}
+
+impl<const N: usize, const U: usize, const M: usize> Observer<N, U, M> {
+    pub fn step(&mut self, u: &SVector<f64, U>, y: &SVector<f64, M>) {
+        let predicted = self.sys.f * self.xhat + self.sys.g * u;
+        let nu = y - self.sys.h * predicted; // the innovation: what the sensor saw minus what it should have
+        self.xhat = predicted + self.k * nu;
+    }
+
+    /// e(k+1) = (I − K H) F e(k): inside the unit disc ⇔ the error decays (Thm. J.5.1).
+    pub fn error_matrix(&self) -> SMatrix<f64, N, N> {
+        (SMatrix::identity() - self.k * self.sys.h) * self.sys.f
+    }
+
+    pub fn error_eigs(&self) -> Vec<Complex<f64>> {
+        self.error_matrix().complex_eigenvalues().iter().copied().collect()
+    }
+
+    /// The error covariance a fixed gain *actually* produces (Joseph form) —
+    /// valid for any K, not only the optimal one. The Kalman gain is the
+    /// argmin of its trace; see `kf::kalman_step`, which never calls this.
+    pub fn covariance_update(&self, p: &SMatrix<f64, N, N>) -> SMatrix<f64, N, N> {
+        let ikh = SMatrix::<f64, N, N>::identity() - self.k * self.sys.h;
+        ikh * p * ikh.transpose() + self.k * self.sys.w * self.k.transpose()
+    }
+}
+```
+
+The Kalman step itself is an adapter. `filters::kalman::Kf` is the sister book's filter, vendored
+unchanged; this function only renames its inputs into Choset's letters and hands back $(\nu, S, R)$
+because data association and the widgets need them.
+
+```rust title="crates/estimate/src/kf.rs"
+pub use filters::kalman::{Gaussian, Kf}; // sister Ch. 6 — not re-derived, not re-implemented
+use nalgebra::{SMatrix, SVector};
+use crate::lti::Lti;
+
+/// One Choset step, eqs. 8.26–8.32, through the sister's `Kf`.
+pub fn kalman_step<const N: usize, const U: usize, const M: usize>(
+    sys: &Lti<N, U, M>, bel: &mut Gaussian<N>, u: &SVector<f64, U>, y: &SVector<f64, M>,
+) -> (SVector<f64, M>, SMatrix<f64, M, M>, SMatrix<f64, N, M>) {
+    let mut kf = Kf::from(bel.clone());
+    kf.predict(&sys.f, &sys.v, Some((&sys.g, u)));            // Thrun: A, R, (B, u)
+    let info = kf.update(y, &sys.h, &sys.w);                   // Thrun: C, Q
+    *bel = kf.belief();
+    (info.innovation, info.s, info.k)                          // Choset: ν, S, R
+}
+
+/// §8.2.6 constants: T = 0.5, m = 1, V, W = 0.5, x̂ = [2, 4], P = diag(1, 2).
+pub fn dead_reckoning() -> (Lti<2, 1, 1>, Gaussian<2>) {
+    let (t, m) = (0.5, 1.0);
+    let sys = Lti {
+        f: SMatrix::<f64, 2, 2>::new(1.0, t, 0.0, 1.0),
+        g: SMatrix::<f64, 2, 1>::new(0.0, t / m),
+        h: SMatrix::<f64, 1, 2>::new(0.0, 1.0),                 // velocity sensor
+        v: SMatrix::<f64, 2, 2>::new(0.2, 0.05, 0.05, 0.1),
+        w: SMatrix::<f64, 1, 1>::new(0.5),
+    };
+    (sys, Gaussian { x: SVector::<f64, 2>::new(2.0, 4.0), p: SMatrix::from_diagonal(&[1.0, 2.0].into()) })
+}
+```
+
+```rust title="crates/estimate/examples/dead_reckoning.rs"
+use estimate::{kf::{dead_reckoning, kalman_step}, lti::Lti};
+use nalgebra::{SMatrix, SVector};
+
+fn main() {
+    let (sys, mut bel) = dead_reckoning();
+    for (k, y) in [2.7, 2.0].into_iter().enumerate() {
+        let (nu, s, r) = kalman_step(&sys, &mut bel, &SVector::zeros(), &SVector::<f64, 1>::new(y));
+        println!("step {}: ν = {:+.3}  S = {:.4}  R = [{:.4}, {:.4}]", k + 1, nu[0], s[(0, 0)], r[(0, 0)], r[(1, 0)]);
+        println!("        x̂⁺ = [{:.3}, {:.3}]   P⁺ = [[{:.4}, {:.4}], [{:.4}, {:.4}]]",
+            bel.x[0], bel.x[1], bel.p[(0, 0)], bel.p[(0, 1)], bel.p[(1, 0)], bel.p[(1, 1)]);
+    }
+    let pos = Lti { h: SMatrix::<f64, 1, 2>::new(1.0, 0.0), ..sys };
+    println!("rank Q = {} (velocity sensor), {} (position sensor)",
+        sys.observability_matrix().rank(1e-9), pos.observability_matrix().rank(1e-9));
+}
+```
+
+```text title="cargo run --example dead_reckoning -p estimate"
+step 1: ν = -1.300  S = 2.6000  R = [0.4038, 0.8077]
+        x̂⁺ = [3.475, 2.950]   P⁺ = [[1.2760, 0.2019], [0.2019, 0.4038]]
+step 2: ν = -0.950  S = 1.0038  R = [0.4521, 0.5019]
+        x̂⁺ = [4.520, 2.473]   P⁺ = [[1.5737, 0.2261], [0.2261, 0.2510]]
+rank Q = 1 (velocity sensor), 2 (position sensor)
+```
+
+```rust title="crates/estimate/src/kf.rs (tests)"
+#[test]
+fn reproduces_choset_8_2_6_two_steps() {
+    let (sys, mut bel) = dead_reckoning();
+    kalman_step(&sys, &mut bel, &SVector::zeros(), &SVector::<f64, 1>::new(2.7));
+    assert_relative_eq!(bel.x, SVector::<f64, 2>::new(3.475, 2.95), epsilon = 1e-3);
+    kalman_step(&sys, &mut bel, &SVector::zeros(), &SVector::<f64, 1>::new(2.0));
+    assert_relative_eq!(bel.p[(0, 0)], 1.5737, epsilon = 1e-3);
+    assert_relative_eq!(bel.p[(1, 1)], 0.2510, epsilon = 1e-3);
+    assert_eq!(sys.observability_matrix().rank(1e-9), 1);
+}
+
+/// Derivation 4 made executable: an `Observer` whose gain is set to R(k) each
+/// step reproduces the Kalman mean bit-for-bit.
+#[test]
+fn kf_is_observer_with_scheduled_gain() {
+    let (sys, mut bel) = dead_reckoning();
+    let mut obs = Observer { sys: sys.clone(), k: SMatrix::zeros(), xhat: bel.x };
+    for y in [2.7, 2.0, 2.4, 1.9] {
+        let (_, _, r) = kalman_step(&sys, &mut bel, &SVector::zeros(), &SVector::<f64, 1>::new(y));
+        obs.k = r;
+        obs.step(&SVector::zeros(), &SVector::<f64, 1>::new(y));
+        assert_eq!(obs.xhat, bel.x);
+    }
+}
+```
+
+The landmark models carry Choset's conventions — the bearing is measured *from* the landmark, a
+quirk the translation into the sister's `Feature` type absorbs with one rotation by $\pi$.
+
+```rust title="crates/estimate/src/landmarks.rs"
+use filters::nonlinear::MeasurementModel; // sister Ch. 7
+use geom::SE2;
+use nalgebra::{SMatrix, SVector};
+use sim::Landmark;
+
+/// h_j = [ρ, atan2(y_r − y_ℓ, x_r − x_ℓ) − θ_r]; rows of ∂h/∂x: [Δx/ρ, Δy/ρ, 0], [−Δy/ρ², Δx/ρ², −1].
+pub struct RangeBearing<'m> { pub map: &'m [Landmark] }
+/// §8.3.3: the same model with the bearing row removed.
+pub struct RangeOnly<'m> { pub map: &'m [Landmark] }
+
+impl MeasurementModel<SE2, 3, 2> for RangeBearing<'_> {
+    fn h(&self, x: &SE2, j: usize) -> SVector<f64, 2> {
+        let (dx, dy) = (x.x() - self.map[j].x, x.y() - self.map[j].y);
+        SVector::new((dx * dx + dy * dy).sqrt(), geom::wrap(dy.atan2(dx) - x.theta()))
+    }
+    fn jacobian(&self, x: &SE2, j: usize) -> SMatrix<f64, 2, 3> {
+        let (dx, dy) = (x.x() - self.map[j].x, x.y() - self.map[j].y);
+        let q = (dx * dx + dy * dy).max(1e-12);
+        let rho = q.sqrt();
+        SMatrix::new(dx / rho, dy / rho, 0.0, -dy / q, dx / q, -1.0)
+    }
+    /// The innovation wraps: the one place where z − h(x) is wrong.
+    fn residual(&self, z: &SVector<f64, 2>, zhat: &SVector<f64, 2>) -> SVector<f64, 2> {
+        SVector::new(z[0] - zhat[0], geom::wrap(z[1] - zhat[1]))
+    }
+}
+
+/// §8.3.2: a(i) = argmin_j ν_ijᵀ S_ij⁻¹ ν_ij. `None` above `chi2_new` ⇒ found a new landmark (§8.4.2).
+pub fn associate_ml(y_i: &SVector<f64, 2>, bel: &Gaussian<3>, map: &[Landmark],
+                    w: &SMatrix<f64, 2, 2>, chi2_new: f64) -> Option<usize> {
+    let model = RangeBearing { map };
+    let pose = SE2::from_vector(&bel.x);
+    let best = (0..map.len()).map(|j| {
+        let h = model.jacobian(&pose, j);
+        let s = h * bel.p * h.transpose() + w;
+        let nu = model.residual(y_i, &model.h(&pose, j));
+        (j, (nu.transpose() * s.try_inverse().expect("S is PD") * nu)[(0, 0)])
+    }).min_by(|a, b| a.1.total_cmp(&b.1))?;
+    (best.1 <= chi2_new).then_some(best.0)
+}
+```
+
+<Callout type="info">
+The widgets on this page run the TypeScript port of these files, `web/lib/estimate/`, over the
+vendored `web/lib/filters/kf.ts` and `ekf.ts`. Thirteen checks in `__checks_ch15__.ts` pin every
+number printed above: the two §8.2.6 steps to $10^{-3}$, both ranks, the placed eigenvalues
+$\{0.5, 0.2\}$ and the error ratio that converges to $0.5$, the brute-force gain $0.7727$, the
+Riccati limit, the Jacobian agreement, the linearized ranks $2/3/3/2/2$, the one-versus-two-landmark
+traces, both SLAM instances, and Problem 9.
+</Callout>
+
+## Putting it together
+
+The integration lab is the two widgets above, run in sequence on the Apartment, and it ends with the
+object Chapter 16 inherits.
+
+**Dead reckoning.** Rusty's encoders through `odometryDelta` give Choset's input $u = [\Delta s,
+\Delta\theta]$ each tick. `ChosetEkf::predict` alone is Figure 8.1: the orange track in the hook bends
+off the gray one and the ellipse grows without bound. Its claimed $\sigma$ tracks the actual error only
+as long as the noise model is honest — the wheel-radius bias is *not* in the model, and when you raise
+it the error outruns the ellipse. That gap is what the sister book's NEES instrument measures, and the
+reason Chapter 16 will care about beliefs that are not Gaussian.
+
+**One landmark.** In the Probe with one range-only landmark the rank reads $2$ and the ellipse's major
+axis runs along the constant-range circle. After 240 steps the pose trace is $0.482$. The filter is
+doing nothing wrong; "the problem lies with the system." A planner handed this belief should read the
+long axis and plan a motion that *changes the geometry* — toward a second landmark, or around the
+first — because no amount of sitting still will shrink it.
+
+**Two landmarks.** Rank $3$, trace $0.034$, mean NEES $3.8$ against the expected $3$. This is the
+belief a planner wants: a Gaussian $\bel(x_t)$ with a covariance it can read, in the same $\SEtwo$
+coordinates its configuration lives in.
+
+**Forget the map.** Kalman SLAM founds the three landmarks from their first sightings and matches
+$588$ of $597$ later ones, with the worst landmark $0.12$ m off at $1.6\sigma$. The covariance is now
+$9 \times 9$ and grows by two rows per landmark; the correlations between landmarks are what let a
+re-sighting of one improve all the others. The state is also what makes the filter's eventual
+inconsistency possible, which is the sister book's story, not this one.
+
+What a planner takes from here is small and exact: a mean in $\SEtwo$, a $3 \times 3$ covariance, an
+innovation covariance $S$ for each candidate sighting, and the rank test to tell whether the next
+action can even reduce the uncertainty. Chapter 16 asks what happens when the belief is not Gaussian,
+and how to plan on it.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="The covariance update (Choset's problem 7)">
+    Starting from $P^+ = \E[(x - \hat x^+)(x - \hat x^+)\T]$ and $\hat x^+ = \hat x^- + R\nu$, derive
+    $P^+ = P^- - RHP^-$. Follow Choset's three steps: expand into $P^- - 2\,\E[R\nu(x - \hat x^-)\T] +
+    \E[R\nu\nu\T R\T]$; show the middle term is $2RHP^-$; show $\E[\nu\nu\T] = HP^-H\T$ *when the output is
+    noiseless* and mark that step — it is where §8.2.3's assumption enters, and where $+W$ appears in the
+    §8.2.4 version. Then check that with $R = P^-H\T(HP^-H\T + W)^{-1}$ the Joseph form
+    $(I - RH)P^-(I - RH)\T + RWR\T$ collapses to the same expression.
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Product of Gaussians, and two gains that are one">
+    Prove Theorem 8.2.1 via Choset's problem 8: write the product of the exponents, collect the terms
+    quadratic in $z$ to get $C_3^{-1} = C_1^{-1} + C_2^{-1}$, the terms linear in $z$ to get
+    $C_3^{-1}z_3 = C_1^{-1}z_1 + C_2^{-1}z_2$, and use the matrix identity
+    $(C_1^{-1} + C_2^{-1})^{-1} = C_1 - C_1(C_1 + C_2)^{-1}C_1$ to reach $\mathcal{Q} = C_1(C_1 + C_2)^{-1}$.
+    Then show the sister book's gain $K = \bar\Sigma C\T(C\bar\Sigma C\T + Q)^{-1}$ and Choset's $R$
+    coincide under the notation table's map — and say in one sentence why the sister's $Q$ is Choset's $W$,
+    not his $Q$.
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Predict the schedule's limit">
+    <Predict
+      id="ch15.e3"
+      question="In the Observer Bench with the default V and W and the velocity sensor, tick 'let the filter choose' and wait. Where do the two eigenvalues of (I − R(k)H)F settle?"
+      options={[
+        { label: 'Both inside the disc, near 0.6', because: 'Only the velocity eigenvalue can move. With H = [0 1], (I − KH)F is upper triangular with 1 and 1 − K₂ on the diagonal; no gain changes the 1.' },
+        { label: 'One at exactly 1, the other near 0.64', correct: true, because: 'Position is unobservable (rank Q = 1), so its eigenvalue is pinned at 1 for every gain. The velocity eigenvalue is 1 − R₂(∞) = 1 − 0.358 = 0.642, read off the Riccati limit R∞ = [0.500, 0.358]ᵀ.' },
+        { label: 'Both at 1: the filter stops correcting', because: 'The velocity sensor keeps informing velocity; its gain converges to a positive constant, not to zero.' },
+      ]}
+    >
+    Now switch to the position sensor. Predict which component of $P$ shrinks and verify: both do, the
+    eigenvalues become a complex pair of modulus $0.641$, and the gain converges to $[0.589, 0.287]\T$.
+    Reconcile the two outcomes with the two rank computations in the text.
+    </Predict>
+    <CheckAnswer
+      id="ch15.e3b"
+      prompt="With the velocity sensor and Choset's V, W, what is the steady-state velocity gain R₂(∞)?"
+      answer={0.358}
+      tolerance={0.01}
+    >
+    Iterate $P^- = FPF\T + V$, $R = P^-H\T/(HP^-H\T + W)$, $P = (I - RH)P^-(I - RH)\T + RWR\T$ from
+    $P = \diag(1, 2)$. $P_{22}$ converges even though $P_{11}$ does not, and
+    $R_2 = P^-_{22}/(P^-_{22} + 0.5) \to 0.358$.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="The collinear trap">
+    <Predict
+      id="ch15.e4"
+      question="In the Observability Probe, switch to range-only, show two landmarks, and drag them so that both landmarks and the robot's path lie on one line. What does the rank panel read while the robot is on that line?"
+      options={[
+        { label: '3 — two landmarks are always enough', because: 'Two range rows [Δx₁/ρ₁, Δy₁/ρ₁, 0] and [Δx₂/ρ₂, Δy₂/ρ₂, 0] are parallel when the landmarks are collinear with the robot; they span one direction, not two.' },
+        { label: '2 — the direction across the line is blind', correct: true, because: 'Both range rows point along the line. The HF rows add a heading column proportional to u₁, which buys one more rank but not two: motion across the line is never measured until the robot leaves it.' },
+        { label: '1 — nothing is observable', because: 'Along the line both ranges still change with position, and the HF rows still carry heading information when u₁ ≠ 0. Rank 1 needs the robot to also be driving along the line with no heading change.' },
+      ]}
+    >
+    Explain the reading with the linearized rank test: write the two range rows of $H$ and the two rows of
+    $HF$ for a robot at $(2, 0.35, 0.7)$ with landmarks at $(0.35, 0.35)$ and $(3.65, 0.35)$, and show the
+    four rows span only two directions. The check file computes exactly this case.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="The steady-state gain">
+    Implement `Lti::steady_state_gain(&self, p0, max_iters, tol) -> (SMatrix<f64, N, M>, bool)` by
+    iterating the Riccati recursion in Joseph form until $P(k{+}1 \mid k)$ stops moving, returning the
+    gain and whether it converged. Test that an `Observer` with that gain and the full Kalman filter agree
+    in their means to $10^{-6}$ after 50 steps on the §8.2.6 system with the *position* sensor, and that
+    with the velocity sensor the recursion reports non-convergence while the gain itself still settles.
+    The TypeScript `riccatiSteadyState` and `gainSchedule` in `web/lib/estimate/kf.ts` are the port.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Choset's problem 9 as a test (stretch)">
+    Implement the unicycle with a position-only sensor $y = x_1 + w$, $\Var w = 0.5$, no process noise,
+    and run one EKF step from $\hat x(1 \mid 1) = [1, 0.5, \pi/4]\T$ with $u = [3, \pi]$, $T = 0.25$,
+    $P(1 \mid 1) = I$, $y(2) = 1.7$. Print $\hat x(2 \mid 2)$ and $P(2 \mid 2)$, then run the same step
+    through the sister's UKF and report the gap.
+    <CheckAnswer
+      id="ch15.e6"
+      prompt="What is x̂₁(2 | 2), the corrected x-position?"
+      answer={1.652}
+      tolerance={0.005}
+    >
+    Prediction: $\hat x^- = [1 + 0.75\cos\tfrac{\pi}{4},\ 0.5 + 0.75\sin\tfrac{\pi}{4},\ \tfrac{\pi}{2}]
+    = [1.5303, 1.0303, 1.5708]$ and $P^- = FF\T$ with $F_{13} = -F_{23} = -0.5303$, so $P^-_{11} = 1.28125$.
+    Update: $S = 1.28125 + 0.5 = 1.78125$, $\nu = 0.1697$, $R_1 = 0.7193$, and
+    $\hat x_1^+ = 1.5303 + 0.1221 = 1.6524$; the full posterior is $[1.6524, 1.0035, 1.5203]\T$ with
+    $P^+_{11} = 0.3596$.
+    </CheckAnswer>
+    <Hints>
+      <>The input enters as a displacement: Choset's $f$ uses $T u_1$ and $T u_2$, so $u_1 T = 0.75$ m and $u_2 T = \pi/4$.</>
+      <>With $P = I$ and no process noise, $P^- = FF\T$; only the third column of $F$ is off the identity, so $P^-$ has $1 + F_{13}^2$ on the first two diagonal entries and $F_{13}F_{23}$ off them.</>
+      <>$H = [1\ 0\ 0]$ picks out the first row of $P^-$: $R = P^-_{\cdot 1}/S$.</>
+    </Hints>
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 8 is this chapter's source: the observer-first derivation (§8.2.2–8.2.4), the dead-reckoning example (§8.2.6), Theorem 8.2.2, the EKF Jacobians (§8.3), and Kalman SLAM (§8.4). Appendix J supplies the Luenberger observer and the rank tests."
+  />
+  <Reference
+    authors="Kalman, R. E."
+    year={1960}
+    title="A New Approach to Linear Filtering and Prediction Problems"
+    venue="Journal of Basic Engineering 82(1), 35–45"
+    doi="10.1115/1.3662552"
+    note="The original. Kalman's derivation is by orthogonal projection in the Hilbert space of random variables — the same geometry Choset draws in state space."
+  />
+  <Reference
+    authors="Luenberger, D. G."
+    year={1971}
+    title="An Introduction to Observers"
+    venue="IEEE Transactions on Automatic Control 16(6), 596–602"
+    doi="10.1109/TAC.1971.1099826"
+    note="The observer as a copy of the plant with a correcting term, and the error dynamics (A − KC)e that this chapter's Bench puts on the unit disc."
+  />
+  <Reference
+    authors="Thrun, S., Burgard, W., and Fox, D."
+    year={2005}
+    title="Probabilistic Robotics"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262201629/probabilistic-robotics/"
+    note="The Bayes-filter derivation of the same equations, and the convention (K for the gain, R and Q for the covariances) the vendored code speaks. Chapters 3, 7 and 10 of this book are the sister volume's Chapters 6, 11 and 14."
+  />
+  <Reference
+    authors="Bar-Shalom, Y., Li, X. R., and Kirubarajan, T."
+    year={2001}
+    title="Estimation with Applications to Tracking and Navigation"
+    venue="Wiley"
+    doi="10.1002/0471221279"
+    note="NEES, NIS and the χ² consistency tests the Probe's tiles report; §5.4 is the standard reference for reading them."
+  />
+  <Reference
+    authors="Huang, G. P., Mourikis, A. I., and Roumeliotis, S. I."
+    year={2010}
+    title="Observability-based Rules for Designing Consistent EKF SLAM Estimators"
+    venue="International Journal of Robotics Research 29(5), 502–528"
+    doi="10.1177/0278364909353640"
+    note="Why Kalman SLAM goes inconsistent: the linearized system acquires an observable direction the true system lacks, and the filter gains information it should not. The modern coda to §8.4."
+  />
+  <Reference
+    authors="Shannon Dynamics"
+    year={2026}
+    title="Probabilistic Robotics via Rust — Chapters 5–7, 11, 14"
+    venue="Sister volume, web edition"
+    url="https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch06-kalman-filters"
+    note="Completing the square, the information form and RTS smoothing (Ch. 6); UKF and the error-state EKF on SE(2) (Ch. 7); gating and multi-hypothesis tracking (Ch. 11); EKF-SLAM's cost and inconsistency (Ch. 14). The filters this chapter wraps are vendored from there."
+  />
+</References>

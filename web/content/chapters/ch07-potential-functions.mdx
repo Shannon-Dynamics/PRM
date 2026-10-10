@@ -1,0 +1,1058 @@
+---
+title: Potential Functions
+description: Attractive and repulsive potentials and gradient descent; distance from a range scan and from a grid; brushfire and wave-front as breadth-first search; the local-minimum disease of additive potentials and the navigation functions that cure it; and lifting workspace forces to Reach's joint torques through the transposed Jacobian.
+chapter: 7
+part: PART II
+partTitle: Classical Planners — Search, Potentials, Roadmaps, Cells
+difficulty: Intermediate
+readingTime: 60 min
+quote: The potential function approach directs a robot as if it were a particle moving in a gradient vector field.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 4
+---
+
+import { PotentialWell } from '@/components/ch/ch07/potential-well';
+import { NavigationSculptor } from '@/components/ch/ch07/navigation-sculptor';
+import { ArmInField } from '@/components/ch/ch07/arm-in-field';
+import { BrushfireFronts } from '@/components/ch/ch07/brushfire-fronts';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Write the attractive/repulsive potential of Choset §4.1 with its two honesty items — the blended attractive term whose gradient is continuous and bounded, and the per-obstacle repulsive sum whose gradient does not jump — and run gradient descent on it',
+    'Compute the distance a repulsive term needs three ways: from geometry, from the local minima of a range scan, and from a brushfire grid; say what each one gets wrong',
+    'Prove that brushfire and wave-front are the breadth-first search of Chapter 6 with a different seed set, and that the wave-front descent is a shortest grid path with exactly one minimum',
+    'Explain why additive potentials have spurious minima — with two convex discs, no concavity required — and classify a stuck point by the eigenvalues of the Hessian',
+    'State what a navigation function is, read Rimon and Koditschek\'s sphere-world construction, count its critical points as κ grows, and carry it to star worlds through a diffeomorphism',
+    'Lift a workspace force at a control point to a configuration-space torque with Jᵀ, sum the torques in configuration space, and say why repelling a few points does not keep a body safe',
+  ]}
+  prerequisites={[
+    'Rusty, Reach, the Apartment and the Workbench, and the distance queries of the collide module (Chapter 2)',
+    'The raw distance function ρ, D(x) and ∇D from a range scan (Chapter 3)',
+    'C-obstacles, the torus of a two-joint arm, and Reach\'s Jacobian (Chapter 4)',
+    'Breadth-first search on a grid graph (Chapter 6)',
+  ]}
+>
+Chapter 6 planned on a graph someone had already built. This chapter asks what a robot can do
+with nothing but a goal and a sense of distance: treat the goal as a valley, the obstacles as
+hills, and roll downhill. The construction is beautifully local. The gradient of the potential at
+$q$ needs only the goal and the nearest obstacle, so Rusty can compute it from a range scan and
+Reach from a few points on its links — no configuration space is ever built.
+
+The "aha" comes in two halves. The first is a failure: a sum of one valley and some hills can have
+a second valley that is not the goal, and gradient descent rolls into it and stops. The widget
+that opens the chapter shows a bead doing exactly that in the mouth of a horseshoe, and then —
+this is the part people get wrong — between two convex discs. The disease is in the *sum*, not in
+concavity. The second half is the cure, and it is not a tweak to the hills. A *distance-to-goal*
+field has exactly one minimum, and on a grid the breadth-first search the reader already owns
+computes it: wave-front is BFS rooted at the goal, brushfire is BFS rooted at the obstacles.
+Navigation functions show that the single minimum can even be had *smoothly*, on a restricted
+family of worlds, so the local-minimum problem is a fact about additive potentials, not about
+potentials.
+
+Everything here is incomplete except the wave-front planner, which is resolution complete and
+exponential in dimension; the chapter says so each time. What survives is the *field* idea: a
+scalar function whose gradient the robot follows. Chapter 8 collides brushfire fronts on the
+generalized Voronoi diagram, Chapter 19's CHOMP descends a distance field, and Chapter 23's
+reactive layer is this chapter running at a hundred hertz.
+</Overview>
+
+## The problem: roll downhill, and ask who built the hill
+
+Put a bead at the left edge of a table and a goal at the right. Define a scalar field $U$ that is
+small at the goal and large near obstacles, and let the bead move with velocity $-\nabla U$. With a
+single disc between them, the bead swerves around the disc and arrives. Replace the disc by a
+horseshoe whose mouth faces the bead, and it rolls into the mouth and stops.
+
+<Deferred>
+  <PotentialWell />
+</Deferred>
+
+Nothing is broken. The badge under the canvas reports what the mathematics says: the gradient has
+vanished at a point that is not the goal, and both eigenvalues of the Hessian there are positive.
+The bead sits at the bottom of a genuine bowl. The goal's pull and the base's push cancel exactly
+on the axis of the horseshoe, and the two arms push back toward the axis whenever the bead
+drifts off it, so the point is stable in every direction. Choset's figure 4.10 draws this and his
+figure 4.11 makes the sharper point: switch the widget to *two convex discs* and the bead still
+stops, between them. Concavity has nothing to do with it.
+
+Now switch on **wave-front mode**. The heightfield changes to the breadth-first cost-to-goal of
+Chapter 6, computed on a tenth-of-a-metre raster of the same obstacles, and the bead escapes
+along a grid-shortest path. That field has one minimum, provably, because it *is* distance to the
+goal. The rest of the chapter is the difference between those two heightfields.
+
+## Building intuition
+
+### Why a sum has extra valleys
+
+The additive potential is $U = U_{att} + U_{rep}$: a bowl centred at the goal plus a spike on
+each obstacle. Far from any obstacle only the bowl matters and the bead heads for the goal. Near
+an obstacle the spike takes over and pushes the bead off. In between, the two gradients can
+cancel, and the only question is whether the cancellation point is *stable*. Between two
+obstacles symmetric about the line to the goal it is: the repulsive push is purely axial on the
+axis by symmetry, it grows without bound toward the gap while the attractive pull stays bounded,
+so somewhere on the axis the two cancel; and off the axis both spikes push back toward it.
+Derivation 3 writes this out. The Potential Well's $Q^\star$ slider changes where the
+cancellation happens but cannot make it go away; the $\zeta$ and $\eta$ sliders in the disclosure
+move it along the axis. Only the obstacle layout can remove a minimum, and the planner does not
+control the layout.
+
+<KeyIdea title="The one sentence version">
+An additive potential is a valley plus hills; gradient descent finds *a* valley, and nothing in
+the sum promises it is the one with the goal in it. A distance-to-goal field is a single valley
+by construction — and on a grid it is one breadth-first search.
+</KeyIdea>
+
+### Fronts on a grid
+
+The grid cure is older than the word "potential". Label every obstacle pixel $1$, its free
+neighbours $2$, their unlabelled neighbours $3$, and so on: a fire spreading outward from every
+obstacle at once. When it is done, each pixel's label is one more than its link length to the
+nearest obstacle. That is **brushfire**, Choset §4.3.2, and it is a multi-source breadth-first
+search.
+
+<Deferred>
+  <BrushfireFronts />
+</Deferred>
+
+Two things to watch. First, the *shape* of a front: under 4-point connectivity the fronts are
+diamonds, because the label counts Manhattan steps; under 8-point they are squares, because the
+label counts chessboard steps. Neither is a circle. Brushfire computes a grid metric, and the
+hover readout compares it with the exact Euclidean distance transform ported from the sister
+book: the two agree only along the axes. Second, the solid pixels where two fronts meet. On the
+micro-grid that is column 4, equidistant from both obstacles; each of its three pixels was reached
+by both fronts and keeps *two back pointers*. Chapter 8 will call that column the grid
+generalized Voronoi diagram. Seed the same search from the goal pixel instead, labelled $2$, and
+you have the **wave-front** planner of §4.5: a pixel's label is $2 +$ its grid distance to the
+goal, and "step to any neighbour labelled one less" is a shortest grid path.
+
+### One minimum, smoothly
+
+Grids are exponential in dimension. Is the single minimum available without one? Rimon and
+Koditschek's answer is yes, on a *sphere world* — a disc with disjoint disc obstacles — and on
+anything diffeomorphic to one.
+
+<Deferred>
+  <NavigationSculptor />
+</Deferred>
+
+The field is $\varphi = d^2 / [d^{2\kappa} + \beta]^{1/\kappa}$, where $d$ is distance to the
+goal and $\beta$ is a product that vanishes on every obstacle boundary. At $\kappa = 2$ the
+Sculptor finds three minima; at $\kappa = 3$ two; from $\kappa = 7$ exactly one. Slide $\kappa$
+and watch the spurious minima slide toward their obstacles and turn into saddles. This is the
+point the widget exists to make: a potential with no spurious minima *exists*, and it is smooth.
+The price is the family of worlds it works on and a sharpening exponent whose threshold the
+theorem only promises exists. Star mode shows the trick that widens the family: a map
+$h_\lambda$ that squashes each star-shaped obstacle onto a disc, with $\varphi \circ h_\lambda$
+inheriting the single minimum because critical points correspond one-to-one under a
+diffeomorphism.
+
+### A body is not a point
+
+Reach's configuration space is a torus; there is no "goal point" in the workspace to put a bowl
+at. Choset's §4.7 writes the potential in the *workspace*, at a few control points on the arm,
+and lifts each workspace force to a joint torque with the transposed Jacobian of that point.
+
+<Deferred>
+  <ArmInField />
+</Deferred>
+
+Two red control points on the end effector pull it to the goal pose; slate points on the links
+push away from the block, the post and the shelf. The bars under the canvases are the lifted
+torques $J_j^\top f_j$, one row per control point, and their sum — the gradient the arm descends.
+Watch the default run twice. Without $r_{float}$ link 1 drives straight through the post *between*
+its two repulsive points, which are far enough from the post that their push is weak; with
+$r_{float}$ — a floating control point at whichever link point is nearest any obstacle — the same
+start reaches the goal. Repelling the vertices of a body does not protect its edges (Choset's
+figure 4.20); $r_{float}$ reduces the risk and does not eliminate it, and the widget's alternate
+mode lets you find starts where even that is not enough.
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: 'U,\\; U_{att},\\; U_{rep},\\; \\nabla U', meaning: 'potential, its attractive and repulsive parts, and the gradient the robot reads as a velocity', note: 'book-wide' },
+    { sym: '\\zeta,\\; \\eta', meaning: 'attractive and repulsive gains' },
+    { sym: 'd^\\star_{goal}', meaning: 'radius where the attractive potential switches from quadratic to conic' },
+    { sym: 'Q^\\star,\\; Q^\\star_i', meaning: 'repulsive distance of influence — global, or per obstacle' },
+    { sym: 'd_i(q),\\; D(q),\\; c', meaning: 'distance to QO_i, to the nearest obstacle, and the closest point on QO_i, so ∇d_i = (q − c)/d_i', note: 'book-wide' },
+    { sym: '\\alpha(i),\\; \\epsilon', meaning: 'descent step size at iteration i; the gradient tolerance in ‖∇U‖ < ε' },
+    { sym: '\\nabla^2 U', meaning: 'Hessian; nondegenerate critical point ⇔ nonsingular Hessian' },
+    { sym: '\\beta_i(q),\\; \\beta(q)', meaning: 'obstacle functions (< 0 inside, 0 on ∂QO_i, > 0 outside); their product' },
+    { sym: '\\gamma_\\kappa,\\; \\sigma_\\lambda,\\; \\xi_\\kappa', meaning: 'goal term d^{2κ}; analytic switch x/(λ + x); sharpening x^{1/κ}' },
+    { sym: '\\varphi(q)', meaning: 'navigation function (Choset Def. 4.6.1), φ = ξ_κ ∘ σ_1 ∘ γ_κ/β' },
+    { sym: 'h_\\lambda,\\; T_i,\\; \\nu_i,\\; s_i', meaning: 'star-to-sphere diffeomorphism; translated scaling maps; their scale factors; analytic switches' },
+    { sym: 'r_j(q),\\; J_j(q),\\; r_{float}', meaning: 'control point j and its Jacobian, u = J_jᵀ f; the floating control point nearest any obstacle' },
+  ]}
+/>
+
+### Potentials, critical points, and the Hessian
+
+<KeyIdea title="Definitions — potential function; gradient descent path (Choset Ch. 4 intro)">
+A **potential function** is a differentiable $U : \mathbb{R}^m \to \mathbb{R}$. Its gradient
+$\nabla U(q) = [\partial U / \partial q_1, \ldots, \partial U / \partial q_m]^\top$ points in the
+direction of locally steepest increase. For the first-order robots of §4.1–4.6 the gradient is
+read as a **velocity**; in §4.7 it is a **force**. The robot follows $\dot c = -\nabla U(c)$ —
+**gradient descent** — and stops at a $q^\star$ with $\nabla U(q^\star) = 0$, a **critical
+point**.
+</KeyIdea>
+
+<KeyIdea title="Definitions — critical point type; nondegeneracy">
+At a critical point the **Hessian** $\nabla^2 U$ decides the type: positive definite is a
+**minimum**, negative definite a **maximum**, indefinite a **saddle**. The point is
+**nondegenerate** if the Hessian is nonsingular, in which case it is isolated. Gradient descent
+generically ends only at a minimum: a maximum or a saddle is unstable under any perturbation,
+a minimum is stable under every one. The full Morse vocabulary — index, level-set topology —
+is Chapter 8's definition box; this chapter needs only "nondegenerate", which is what Choset
+means when he says a navigation function "is Morse".
+</KeyIdea>
+
+In the colours every figure on this page uses, the descent is
+
+<LinkedMath>
+$$
+\htmlClass{term-robot}{\dot c(t)} \;=\; -\nabla U(c(t)),
+\qquad
+U \;=\; \tfrac12 \zeta\, d^2(q, \htmlClass{term-goal}{\qgoal})
+\;+\; \sum_i \tfrac12 \eta \Big(\tfrac{1}{\htmlClass{term-obstacle}{d_i(q)}} - \tfrac{1}{Q^\star_i}\Big)^2 .
+$$
+</LinkedMath>
+
+The orange bead is $c(t)$, the red goal sits at the bottom of the bowl, and every slate obstacle
+contributes one spike through its distance $d_i$. Point at a term and the matching layer in the
+Potential Well comes forward.
+
+<KeyIdea title="Definition — distance to an obstacle (Choset eq. 4.6)">
+$d_i(q) = \min_{c \in \QO_i} d(q, c)$ is the distance from $q$ to C-obstacle $i$, and
+$D(q) = \min_i d_i(q)$ the distance to the nearest one. For a point robot in the plane these are
+the Chapter 2 and Chapter 3 quantities; for Reach they are workspace distances from control
+points (§4.7).
+</KeyIdea>
+
+<Derivation title="The blended attractive potential has a continuous, bounded gradient" result="\|\nabla U_{att}\| \le \zeta d^\star_{goal},\ \text{continuous at } d = d^\star_{goal}">
+**Statement** (Choset eqs. 4.2–4.3). With
+$$
+U_{att}(q) = \begin{cases} \tfrac12 \zeta\, d^2(q, \qgoal), & d \le d^\star_{goal}, \\ d^\star_{goal}\, \zeta\, d(q, \qgoal) - \tfrac12 \zeta (d^\star_{goal})^2, & d > d^\star_{goal}, \end{cases}
+$$
+$\nabla U_{att}$ is continuous and its magnitude never exceeds $\zeta d^\star_{goal}$.
+
+**Step 1 — inside.** $\nabla \tfrac12 \zeta d^2 = \zeta (q - \qgoal)$, of magnitude $\zeta d \le
+\zeta d^\star_{goal}$, vanishing linearly at the goal (eq. 4.1).
+
+**Step 2 — outside.** $\nabla [d^\star_{goal} \zeta d] = d^\star_{goal} \zeta\, (q - \qgoal)/d$,
+of magnitude exactly $\zeta d^\star_{goal}$ everywhere.
+
+**Step 3 — the seam.** At $d = d^\star_{goal}$ both expressions equal $\zeta (q - \qgoal)$; the
+constant $-\tfrac12 \zeta (d^\star_{goal})^2$ makes the *values* agree too, so $U_{att}$ is $C^1$.
+$\blacksquare$
+
+*Why blend at all.* The pure conic potential $\zeta d$ has gradient of magnitude $\zeta$
+everywhere and no direction at the goal — descent chatters around it. The pure quadratic
+vanishes nicely at the goal but asks for a velocity proportional to distance, which a far start
+turns into an absurd one. The blend takes each where it is good. The chapter's check pushes
+two hundred random seams and finds a gradient jump of $10^{-8}$ (the finite width of the
+test) and a bound excess of $10^{-16}$.
+</Derivation>
+
+<Derivation title="Gradient of distance to a convex obstacle" result="\nabla d_i(q) = (q - c)/\|q - c\|">
+**Statement** (Choset eq. 4.7). If $c$ is the unique closest point of a convex $\QO_i$ to
+$q \notin \QO_i$, then $\nabla d_i(q) = (q - c)/\|q - c\|$, a unit vector pointing away from the
+obstacle.
+
+**Step 1 — uniqueness.** $\|q - c\|$ is strictly convex in $c$ and $\QO_i$ is convex and closed,
+so the minimiser $c$ is unique.
+
+**Step 2 — the envelope theorem.** $d_i(q) = \min_c \|q - c\|$; at a unique minimiser the
+derivative of the minimum with respect to $q$ is the partial derivative of the objective with
+$c$ held fixed.
+
+**Step 3 — differentiate.** $\partial_q \|q - c\| = (q - c)/\|q - c\|$.
+
+**Step 4 — where convexity enters.** A nonconvex obstacle can have *two* closest points, and
+$d_i$ is then not differentiable: the gradient jumps as $q$ crosses the set where they tie.
+Choset's §4.1 warns that a repulsive term written in $D(q)$ oscillates where the nearest obstacle
+changes; a nonconvex obstacle does the same thing to $d_i$ *inside one term*. $\blacksquare$
+
+*The two cures.* Sum the repulsion per convex obstacle, $U_{rep} = \sum_i U_{rep_i}$, and
+decompose nonconvex obstacles into convex pieces. The Potential Well's horseshoe is three
+rectangles for exactly this reason; the disclosure toggle gives you the single nonconvex polygon
+instead, and the bead chatters on its axis — the badge says "stalled" with a gradient of order
+one, because $\nabla d$ flips sign every step. The check compares the analytic $\nabla U_{rep}$
+over discs, a polygon and a wall segment with central differences at 352 random points: worst
+relative error $6 \times 10^{-10}$. Choset's §4.3.1 reading of $d_i$ as a *local minimum of
+$\rho(q, \theta)$ over the bearing* is the sensor version of this derivation, and it is where the
+Apartment's thin walls expose a limit — see the algorithm section.
+</Derivation>
+
+### The local-minimum disease
+
+<Derivation title="Additive potentials admit non-goal minima — two convex discs suffice" result="\nabla U(q^\star) = 0,\ \nabla^2 U(q^\star) \succ 0,\ q^\star \ne \qgoal">
+**Statement** (Choset §4.4, figures 4.10–4.11). For two disc obstacles placed symmetrically about
+the line from the start to the goal, there is a point on that line with $\nabla U = 0$ and
+positive-definite Hessian.
+
+**Step 1 — symmetry.** On the axis of symmetry the two repulsive gradients are mirror images, so
+their sum is axial. The attractive gradient is axial too. So $\nabla U$ is axial on the axis.
+
+**Step 2 — unbounded push, bounded pull.** As the point on the axis moves toward the gap, each
+$d_i$ falls toward its minimum and $\eta (1/d_i - 1/Q^\star)/d_i^2$ grows without bound if the gap
+is narrower than $2Q^\star$; the attractive pull is bounded by $\zeta d^\star_{goal}$ (Derivation 1).
+Far from the discs, beyond $Q^\star$, the push is zero and the pull is toward the goal.
+
+**Step 3 — a zero.** The axial component of $\nabla U$ is continuous, negative (goalward) far
+from the gap and positive (away) close to it; the intermediate value theorem gives $q^\star$ with
+$\nabla U(q^\star) = 0$.
+
+**Step 4 — transversal stability.** Off the axis, the nearer disc pushes harder than the farther
+one and both push toward the axis; so the transverse second derivative is positive. The axial
+second derivative is positive because the push grows as the gap is approached. The Hessian is
+positive definite: $q^\star$ is a minimum. $\blacksquare$
+
+*The numbers.* Discs of radius $0.5$ at $(1, \pm 0.8)$, goal $(4, 0)$, $\zeta = \eta = 1$,
+$Q^\star = 1.5$, $\alpha = 0.01$. From $(-2, 0.05)$ the descent stops after **160** steps at
+$q^\star = (0.2409, 0.0000)$ with Hessian eigenvalues **14.15** and **16.16**, both positive. The
+chapter's check pins all of it. The horseshoe case is the same argument with the base supplying the
+push; Barraquand and Latombe's RPP escapes such minima with random walks and tries again, which
+is the honest fix of 1991 and the ancestor of Part III's sampling. The method is not complete.
+</Derivation>
+
+### Brushfire and wave-front are breadth-first search
+
+<Derivation title="Brushfire computes grid distance; wave-front computes grid cost-to-goal; both are BFS" result="\text{label} = 1 + \ell(\text{nearest obstacle}),\quad 2 + \ell(\text{goal})">
+**Statement** (Choset §4.3.2, §4.5; Chapter 6 Derivation 1). Labelling obstacle pixels $1$,
+their free neighbours $2$, theirs $3$, … assigns each free pixel $1 +$ its link length to the
+nearest obstacle — Manhattan distance under 4-point connectivity, chessboard under 8-point.
+Seeding the goal pixel with $2$ instead assigns $2 +$ link length to the goal, and "step to a
+neighbour labelled one less" is a shortest grid path.
+
+**Step 1 — it is a BFS.** Brushfire is breadth-first search on Chapter 6's grid graph with *every
+obstacle pixel in the initial queue at depth $0$*; wave-front is the same search with the goal
+alone at depth $0$. Labels are depth plus the seed label.
+
+**Step 2 — depth is link length.** Chapter 6, Derivation 1: a node's depth when first dequeued is
+its shortest link length from the seed set. On a unit-cost 4-connected grid that is the Manhattan
+distance; on an 8-connected one, the chessboard distance.
+
+**Step 3 — descent reaches the goal.** On a bounded grid every reachable free pixel receives a
+label. A non-goal pixel labelled $k > 2$ was labelled from a neighbour labelled $k - 1$, so such a
+neighbour exists; stepping to it strictly decreases the label and the walk ends at the goal after
+exactly $k - 2$ steps. The field has one minimum. $\blacksquare$
+
+*Two fronts meeting.* A pixel reached by fronts from two different obstacles keeps two back
+pointers (Choset §5.2.5); the set of such pixels is the grid GVD of Chapter 8, and the micro-grid's
+column 4 is its smallest instance. On an even gap the collision lands on a pixel; on an odd gap it
+lands on the edge between two pixels, and the port flags both so the ridge has no holes. *Grid
+versus Euclidean.* On forty random grids totalling 7020 free cells the 4-point and 8-point labels
+equal the exact Manhattan and chessboard distances cell for cell, the exact Euclidean distance
+lies between them, 99.5% of cells are within one cell of it, and the worst gap is 2.789 cells —
+along a diagonal, where Manhattan overshoots by $\sqrt 2$. The exact Euclidean distance transform
+is a different algorithm, ported from the sister book's
+[map chapter](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch19-map-representations)
+as `mapping/edt`, and Exercise 5 asks you to run the two side by side. *Dimension.* Pixels become
+voxels, 4-point becomes 6-point, 8-point becomes 26-point, and the cell count is exponential in
+the dimension of $\Q$ — which is why Part III exists.
+</Derivation>
+
+### Navigation functions
+
+<KeyIdea title="Definition 4.6.1 — navigation function">
+A function $\varphi : \Qfree \to [0, 1]$ is a **navigation function** if it is smooth (or at least
+$C^2$), has a unique minimum at $\qgoal$ in the connected component of $\Qfree$ containing it,
+is uniformly maximal on $\partial \Qfree$, and is Morse (all critical points nondegenerate).
+Gradient descent on a navigation function reaches the goal from every start except a set of
+measure zero — the saddles' stable manifolds.
+</KeyIdea>
+
+<KeyIdea title="Definitions — sphere world; star-shaped set (Choset §4.6.1–4.6.2)">
+A **sphere world** is a disc of radius $r_0$ with disjoint disc obstacles inside it; its
+boundary functions are $\beta_0 = r_0^2 - d^2(q, q_0)$ and $\beta_i = d^2(q, q_i) - r_i^2$. A set
+is **star-shaped** if some point of it sees every other point along a segment inside the set;
+every convex set is star-shaped, and a star-shaped obstacle has a centre $q_i$ from which the
+boundary is a function $\rho(\theta)$ of the bearing.
+</KeyIdea>
+
+<Derivation title="The sphere-world navigation function" result="\varphi(q) = \dfrac{d^2(q, \qgoal)}{\big[d^{2\kappa}(q, \qgoal) + \beta(q)\big]^{1/\kappa}}">
+**Statement** (Choset §4.6.1, eqs. 4.8–4.13; Rimon and Koditschek). On a sphere world,
+$\varphi = \xi_\kappa \circ \sigma_1 \circ (\gamma_\kappa / \beta)$ is a navigation function for
+sufficiently large $\kappa$, where $\gamma_\kappa = d^{2\kappa}(q, \qgoal)$, $\beta = \prod_{i=0}^n
+\beta_i$, $\sigma_\lambda(x) = x/(\lambda + x)$ and $\xi_\kappa(x) = x^{1/\kappa}$.
+
+**Step 1 — the raw ratio.** $\gamma_\kappa / \beta$ is zero only at the goal and $+\infty$ on
+every obstacle boundary, where some $\beta_i = 0$. It is positive in between.
+
+**Step 2 — large κ pushes the goal term ahead.** Away from obstacles, $\partial \gamma_\kappa /
+\partial q$ dominates $\partial \beta / \partial q$ once $\kappa$ is large, so the gradient of the
+ratio points goalward and no critical point survives there.
+
+**Step 3 — near an obstacle, only it matters.** The ratio is then $\gamma_\kappa / \beta_i$ times
+a slowly varying factor, and a critical point can lie only on the radial line from the obstacle to
+the goal; on that line the ratio *decreases* from the boundary toward the goal, so the Hessian
+cannot be positive definite. Spurious minima become saddles (Choset cites [239] for the proof).
+
+**Step 4 — squash.** $\sigma_1$ is strictly increasing, maps $[0, \infty)$ onto $[0, 1)$, and so
+moves no critical point and changes no type; it bounds the function.
+
+**Step 5 — sharpen.** $\xi_\kappa$ is strictly increasing on $(0, \infty)$ and makes the critical
+points nondegenerate (Morse); composing gives eq. (4.13). $\blacksquare$
+
+*Counting instead of eyeballing.* Because $\sigma_1$, $\xi_\kappa$ and $\log$ are strictly
+increasing, the critical points of $\varphi$ off the goal are those of $\psi = \log(\gamma_\kappa /
+\beta) = 2\kappa \log d - \sum_i \log \beta_i$, whose gradient is of order one where
+$\varphi$'s is $10^{-8}$ — the **plateau problem** Choset's last paragraph of §4.6.1 admits:
+$\varphi$ is flat near the goal and far from it and steep in between, which makes gradient descent
+on it numerically miserable. The Sculptor's beads descend the *normalized* gradient for that reason.
+The port finds critical points by damped Newton on $\nabla \psi$ from a lattice of seeds and
+classifies them by the Hessian of $\psi$. On the five-disc world the sweep reads:
+
+| $\kappa$ | 2 | 3 | 4 | 6 | 7 | 8 | 10 |
+|---|---|---|---|---|---|---|---|
+| minima | 3 | 2 | 2 | 2 | **1** | 1 | 1 |
+| saddles | 7 | 6 | 6 | 6 | 5 | 5 | 5 |
+
+Choset's own five-disc figure 4.15 has three minima at $\kappa = 3$ and one at $\kappa = 10$; our
+discs sit elsewhere and lose their last spurious minimum at $\kappa = 7$. In every column
+$\text{minima} - \text{saddles} = -4$: on a disc with five holes the Euler characteristic is $1 - 5
+= -4$, and Morse theory makes that an invariant of the count — each spurious minimum that
+disappears takes exactly one saddle with it. The chapter's check pins the whole table. Nothing
+in the theorem says *which* $\kappa$ suffices; it is existential, and in practice one sweeps.
+</Derivation>
+
+<Derivation title="Navigation functions pull back under diffeomorphisms; the star-to-sphere map" result="h_\lambda = s_{\qgoal}\,\mathrm{id} + \sum_{i=0}^{n} s_i\, T_i,\qquad \varphi \circ h_\lambda \text{ is a navigation function}">
+**Statement** (Choset §4.6.2, eqs. 4.14–4.19). If $\varphi$ is a navigation function on $M$ and
+$h : F \to M$ is a diffeomorphism — smooth, bijective, smooth inverse — then $\varphi \circ h$ is a
+navigation function on $F$. For a star world $F$ the map
+$$
+T_i(q) = \nu_i(q)\,(q - q_i) + p_i,\qquad \nu_i(q) = \frac{(1 + \beta_i(q))^{1/2}\, r_i}{d(q, q_i)},
+$$
+$$
+s_i(q, \lambda) = \frac{\gamma_\kappa \bar\beta_i}{\gamma_\kappa \bar\beta_i + \lambda \beta_i},\quad
+\bar\beta_i = \prod_{j \ne i} \beta_j,\quad s_{\qgoal} = 1 - \sum_{i=0}^{n} s_i,\quad
+h_\lambda(q) = s_{\qgoal}(q)\, q + \sum_{i=0}^{n} s_i(q)\, T_i(q)
+$$
+is such a diffeomorphism onto the model sphere world for suitable $\lambda$.
+
+**Step 1 — critical points correspond.** $\nabla (\varphi \circ h) = J_h^\top\, (\nabla \varphi
+\circ h)$, and $J_h$ is invertible, so $\nabla(\varphi \circ h)(q) = 0$ iff $\nabla \varphi(h(q)) =
+0$. The Hessians are congruent at critical points, so nondegeneracy and type survive. Minima map
+to minima: one on $M$, one on $F$.
+
+**Step 2 — each $T_i$ maps its star boundary onto a circle.** On $\partial \QO_i$, $\beta_i = 0$,
+so $T_i(q) = r_i (q - q_i)/d(q, q_i) + p_i$: the point at bearing $\theta$ from $q_i$ lands at
+distance $r_i$ from $p_i$ at the same bearing. A star boundary of radius $\rho(\theta)$ is squashed
+radially by $r_i / \rho(\theta)$.
+
+**Step 3 — the switches switch.** On $\partial \QO_i$, $\beta_i = 0$ gives $s_i = 1$ and every
+$\bar\beta_j$ with $j \ne i$ contains the factor $\beta_i = 0$, so $s_j = 0$ and $s_{\qgoal} = 0$.
+Hence $h_\lambda = T_i$ exactly on $\partial \QO_i$. At the goal $\gamma_\kappa = 0$, every $s_i =
+0$, and $h_\lambda(\qgoal) = \qgoal$.
+
+**Step 4 — suitable λ.** Smoothness and bijectivity for some $\lambda$ beyond a threshold are
+quoted from Rimon and Koditschek. The port measures the local half: $\det J_{h_\lambda} > 0$ on a
+$48 \times 48$ lattice of free points. $\blacksquare$
+
+*What the port had to learn.* Three things about this construction are easy to get wrong, and
+the chapter's check caught all three. First, $\gamma_\kappa \bar\beta_i$ is astronomically larger
+than $\lambda \beta_i$ for any $\lambda$ of order one — on our world $\lambda_0 \approx 2 \times
+10^{18}$ at $\kappa = 6$ — so a $\lambda = 1$ pins every switch at one *and* turns a rounding error
+of $-10^{-16}$ in a boundary $\beta_i$ into garbage for the other switches; the boundary is now
+handled exactly. Second, the model disc must be *inscribed* in its star: if a disc poked outside
+its star, $T_i - \mathrm{id}$ would point outward in the star's valleys while $\nabla s_i$ points
+inward, and $\det J_h$ went negative in the switch collar for every large $\lambda$ we tried. With
+inscribed discs, $\min \det J_h = 0.984$ at $\lambda_0$ over 1450 lattice points. Third, "suitable"
+is not decoration: at $10^{-6} \lambda_0$ the minimum determinant is $-55$ and the map folds. The
+Sculptor's $\lambda$ slider spans both regimes. *Virtual work*, the other half of this
+derivation's collapsible, follows in §4.7 below.
+</Derivation>
+
+### Lifting forces to configuration space
+
+<KeyIdea title="Definition — control point (Choset §4.7.2)">
+A **control point** $r_j$ is a point fixed on the robot whose workspace potential is lifted to a
+configuration-space force by $J_j^\top$, where $J_j = \partial r_j / \partial q$. Enough control
+points must be chosen to *pin the body down* — two for a rigid body in the plane. Attractive
+points carry an $U_{att,j}$ toward $r_j(\qgoal)$; repulsive points carry $U_{rep_i,j}$ for each
+workspace obstacle $\WO_i$ (eqs. 4.24–4.25). The **floating control point** $r_{float}$ is the
+point of the robot's boundary nearest any obstacle, recomputed at every $q$.
+</KeyIdea>
+
+<Derivation title="Virtual work: a workspace force is a configuration-space force through Jᵀ" result="u = J^\top f,\qquad u(q) = \sum_j J_j^\top(q)\, f_j">
+**Statement** (Choset §4.7.1, eq. 4.26). Power is coordinate-independent: $f^\top \dot x = u^\top
+\dot q$ for every $\dot q$. With $\dot x = J \dot q$, $f^\top J \dot q = u^\top \dot q$ for all
+$\dot q$, so $u = J^\top f$. The lifted forces of several control points are **summed in
+configuration space**, never in the workspace.
+
+**Example 4.7.1.** A vertex $a = (a_x, a_y)$ of a planar rigid body at $q = (x, y, \theta)$ sits at
+$\varphi(q) = (x + a_x \cos\theta - a_y \sin\theta,\ y + a_x \sin\theta + a_y \cos\theta)$ (eq. 4.20),
+with Jacobian
+$$
+J = \begin{bmatrix} 1 & 0 & -a_x \sin\theta - a_y \cos\theta \\ 0 & 1 & \phantom{-}a_x \cos\theta - a_y \sin\theta \end{bmatrix}
+$$
+(eq. 4.21), so $u = J^\top f = (f_x,\ f_y,\ -f_x (a_x \sin\theta + a_y \cos\theta) + f_y (a_x
+\cos\theta - a_y \sin\theta))$ (eq. 4.23), and $u_\theta = (r \times f)_z$ with $r$ the world
+vector from the body origin to the vertex. The check verifies this identity at a hundred random
+configurations to $10^{-12}$ against Chapter 4's `bodyPointJacobian`.
+
+**Reach.** A point at fraction $t$ along link $k$ is the tip of a shorter arm, so its Jacobian is
+Chapter 4's `jacobian` with the columns for joints beyond $k$ zero and the last link shortened to
+$t L_k$; at $t = 1$ on the last link it *is* `jacobian`, and the check says so. Then
+$u(q) = \sum_j J_j^\top(q)\, \nabla U_j(r_j(q))$ is the exact gradient of $\sum_j U_j(r_j(q))$ by
+the chain rule — including the floating point, by the envelope theorem of Derivation 2 — and the
+check compares it with central differences at 213 configurations: worst relative error
+$2 \times 10^{-9}$. $\blacksquare$
+
+*Why summing in the workspace is wrong.* Two control points have two Jacobians; $J_1^\top f_1 +
+J_2^\top f_2 \ne J^\top (f_1 + f_2)$ for any single $J$. Control points approximate the body; they
+are the finite sample that stands in for an integral over its area, and figure 4.20's collision
+between them is the price. $r_{float}$ reduces the price and does not eliminate it.
+</Derivation>
+
+## The algorithm
+
+Choset's Algorithm 4 is the whole method; brushfire and wave-front are Chapter 6's breadth-first
+search with a different seed set; navigation functions are a formula; and lifting is a sum.
+
+<Algorithm
+  name="GRADIENT DESCENT  —  Choset Alg. 4, with the sign the text intends"
+  inputs="a means to compute ∇U(q) at a point q; a step schedule α(i); a tolerance ε"
+  outputs="the iterates {q(0), q(1), …, q(i)}, and why the loop stopped"
+  complexity="O(number of potential terms) per step; the number of steps depends on α and the field"
+>
+1. $q(0) \leftarrow \qstart$; $i \leftarrow 0$
+2. **while** $\|\nabla U(q(i))\| \ge \epsilon$ **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;$q(i + 1) \leftarrow q(i) - \alpha(i)\, \nabla U(q(i))$
+4. &nbsp;&nbsp;&nbsp;&nbsp;$i \leftarrow i + 1$
+5. **end while**
+6. **report**: at the goal; or a local minimum (print the Hessian's eigenvalue signs); or a step limit
+
+*Honesty.* Line 4 of Algorithm 4 as printed reads $q(i+1) = q(i) + \alpha(i) \nabla U(q(i))$,
+while the text says "take a small step in the direction opposite the gradient" and $\dot c =
+-\nabla U$. It is a sign typo; the code uses the minus. The port adds a cap on the step length
+(a repulsive spike must not fling the bead across the table), a collision test (so an $\alpha$
+too large for the spike is reported, not ignored), and a *stall* detector for the chatter of
+Derivation 2's nonsmooth seam, where $\|\nabla U\|$ never falls below $\epsilon$ and the bead goes
+nowhere.
+</Algorithm>
+
+<Algorithm
+  name="BRUSHFIRE  —  Choset §4.3.2  ·  WAVE-FRONT  —  Choset §4.5"
+  inputs="an occupancy grid (0 free, 1 obstacle); 4- or 8-point connectivity; for wave-front, the goal pixel"
+  outputs="a label per pixel (1 + grid distance to the nearest obstacle, or 2 + grid distance to the goal); back pointers; the pixels where two fronts met"
+  complexity="O(#cells): one multi-source breadth-first search"
+>
+1. **Brushfire:** label every obstacle pixel $1$; enqueue every free pixel adjacent to an obstacle with label $2$ and the obstacle's component as its source
+2. **Wave-front:** enqueue the goal pixel with label $2$
+3. **while** the queue is not empty: pop $c$; for each free neighbour $x$ of $c$ (Chapter 6's `GridGraph.neighbors`):
+4. &nbsp;&nbsp;&nbsp;&nbsp;if $x$ is unlabelled: label it $\text{label}(c) + 1$, point its back pointer at $c$, inherit $c$'s source, enqueue it
+5. &nbsp;&nbsp;&nbsp;&nbsp;else if (brushfire) $x$'s source differs from $c$'s and $\text{label}(x) \ge \text{label}(c)$: record a second back pointer — two fronts met
+6. **Grid gradient** at a pixel: a neighbour with the lowest label (ties to the first in scan order E, W, N, S, then diagonals)
+7. **Wave-front descent** from $\qstart$: step to a neighbour labelled one less until the label is $2$
+
+*Reading distance off the grid:* $(\text{label} - 1) \cdot \text{cellSize}$ is the grid distance, and
+the gradient points from the back-pointer pixel to the robot's — four or eight possible
+directions, "just as the grid is an approximation of the workspace, so is the computed gradient an
+approximation of the actual distance gradient" (Choset). The micro-example's gradient at $(5, 3)$
+points to $(6, 3)$: both $(6,3)$ and $(5,2)$ carry label $3$ and east comes first.
+</Algorithm>
+
+<Algorithm
+  name="SENSOR-BASED DISTANCE  —  Choset §4.3.1"
+  inputs="a range scan ρ(q, θ_k) on n bearings (Chapter 3's rangeScan)"
+  outputs="one (d_i, ∇d_i) per visible obstacle: the local minima of ρ over θ, with ∇d_i = −(cos θ*, sin θ*)"
+  complexity="O(n)"
+>
+1. **for** each bearing $k$ with a finite reading: if $\rho_k \le \rho_{k-1}$ and $\rho_k \le \rho_{k+1}$ and at least one is strict, $k$ is a local minimum (a plateau counts once, at its first ray)
+2. emit $d_i = \rho_k$ and $\nabla d_i = -(\cos\theta_k, \sin\theta_k)$: the ray faces the closest point of its obstacle, so the gradient points back along it
+
+*What the Apartment taught the check.* Each ray reads the exact distance along itself, so the
+smallest local minimum is never *below* $D(q)$. Broadside — the foot of the perpendicular on
+the nearest wall at least $D \tan(\pi/n)$ from both ends — the ray nearest the perpendicular
+hits within $\pi/n$ of it and overestimates $D$ by at most $1/\cos(\pi/n) - 1$, which is
+$3.8 \times 10^{-5}$ for 360 rays. But a zero-thickness wall seen *end-on* subtends no angle, and a
+fan of 360 rays can miss its end entirely; the nearest *visible* thing is then farther away. In
+80 seeded poses, 70 were broadside and met the bound (the Apartment's axis-aligned walls are hit
+exactly perpendicularly by the fan, so the overestimate there is $10^{-16}$), and 10 were end-on
+with a worst overestimate of **8.3%**. No sensor-only estimator can do better; Choset's remark
+that "an obstacle distance function may be incorrect if the obstacle is partially occluded by
+another" is the same limit from the other side.
+</Algorithm>
+
+<Algorithm
+  name="NAVIGATION FUNCTION  —  Choset eq. (4.13), star worlds via h_λ (eq. 4.19)"
+  inputs="a sphere world (centre, r₀, discs) or a star world; q_goal; κ; for stars, λ"
+  outputs="φ(q) and ∇φ(q) by the quotient rule; for stars, (φ ∘ h_λ)(q) and J_hᵀ ∇φ by the chain rule"
+  complexity="O(n) per evaluation for n obstacles, plus a 2 × 2 finite-difference Jacobian of h_λ"
+>
+1. $A \leftarrow d^2(q, \qgoal)$; $\beta \leftarrow \prod_{i=0}^{n} \beta_i(q)$; $B \leftarrow A^\kappa + \beta$
+2. $\varphi \leftarrow A\, B^{-1/\kappa}$; $\nabla \varphi \leftarrow \nabla A\, B^{-1/\kappa} - (A/\kappa)\, B^{-1/\kappa - 1}\, (\kappa A^{\kappa-1} \nabla A + \nabla \beta)$
+3. **critical points:** damped Newton on $\nabla \psi$, $\psi = \kappa \log A - \sum_i \log \beta_i$, from a lattice of free seeds; polish, deduplicate, classify by the Hessian of $\psi$; the goal is the minimum it always is
+4. **star world:** $h_\lambda(q) = s_{\qgoal} q + \sum_{i=0}^{n} s_i T_i(q)$ with a $\beta_i \le 0$ sending $q$ to $T_i(q)$ outright; $(\varphi \circ h_\lambda)(q)$ and $J_h^\top \nabla\varphi(h_\lambda(q))$
+5. **suitable λ:** $\lambda_0 = \max$ over a lattice of free points, at least a quarter-radius clear of obstacle $i$, of $\gamma_\kappa \bar\beta_i / \beta_i$ — so every switch is $\le \tfrac12$ outside that collar
+
+The check verifies the quotient-rule gradient against central differences at 210 points (worst
+relative error $1.6 \times 10^{-7}$) and that $\varphi \in [0, 1]$ on the free space.
+</Algorithm>
+
+<Algorithm
+  name="CONTROL-POINT LIFTING  —  Choset eq. (4.26)"
+  inputs="Reach and its scene; control points (link, fraction t, role); the goal configuration; whether to add r_float"
+  outputs="u(q) = Σ_j J_j(q)ᵀ ∇U_j(r_j(q)), the configuration-space gradient; per-term forces and torques for drawing"
+  complexity="O(#points · dim Q) per evaluation, plus one segment–scene distance per link for r_float"
+>
+1. **for** each control point $j$: $r_j \leftarrow$ its world position from Chapter 2's FK; $f_j \leftarrow \nabla U_j(r_j)$ with $U_j$ attractive toward $r_j(\qgoal)$ or repulsive from every obstacle within $Q^\star$
+2. &nbsp;&nbsp;&nbsp;&nbsp;$J_j \leftarrow$ the control-point Jacobian (Chapter 4's `jacobian` for a shortened arm); $u \leftarrow u + J_j^\top f_j$
+3. **if** floating: $r_{float} \leftarrow$ the link point nearest any obstacle (one segment–scene distance per link); treat it as one more repulsive control point at its $(k, t)$
+4. **descend** $q \leftarrow q - \alpha\, u(q)$ with Algorithm 4, in joint space
+</Algorithm>
+
+## Implementation in Rust
+
+The `potential` crate is introduced here; `brushfire` is the owned grid distance transform that
+Chapters 8 and 10 import, and `Potential` is the interface Chapter 19's CHOMP reads a distance
+field through. Configurations are `SVector<f64, N>` so one `Attractive` serves a point in the
+plane and a control point on Reach.
+
+```rust title="crates/potential/src/lib.rs" {6-9,21-24}
+use nalgebra::SVector;
+
+/// A differentiable scalar field over an N-dimensional configuration space. The gradient is
+/// read as a *velocity* for first-order robots (Choset Ch. 4's convention through §4.6) and
+/// as a *force* once it is lifted through Jᵀ (§4.7).
+pub trait Potential<const N: usize> {
+    fn value(&self, q: &SVector<f64, N>) -> f64;
+    fn gradient(&self, q: &SVector<f64, N>) -> SVector<f64, N>;
+}
+
+/// Choset eqs. (4.2)–(4.3): quadratic within `d_goal_star`, conic beyond. The two agree in value
+/// and gradient at the seam (Derivation 1), so descent never sees it; `f64::INFINITY` gives the
+/// pure quadratic of eq. (4.1).
+pub struct Attractive<const N: usize> { pub goal: SVector<f64, N>, pub zeta: f64, pub d_goal_star: f64 }
+
+impl<const N: usize> Potential<N> for Attractive<N> {
+    fn value(&self, q: &SVector<f64, N>) -> f64 {
+        let d = (q - self.goal).norm();
+        if d <= self.d_goal_star { 0.5 * self.zeta * d * d }
+        else { self.d_goal_star * self.zeta * d - 0.5 * self.zeta * self.d_goal_star * self.d_goal_star }
+    }
+    fn gradient(&self, q: &SVector<f64, N>) -> SVector<f64, N> {
+        let diff = q - self.goal;
+        let d = diff.norm();
+        if d <= self.d_goal_star { self.zeta * diff }               // eq. (4.1): ζ(q − q_goal)
+        else { (self.d_goal_star * self.zeta / d) * diff }          // eq. (4.3): magnitude ζ d*
+    }
+}
+
+/// One repulsive term per obstacle (Choset §4.1, after eq. 4.7), so the gradient does not jump
+/// when the nearest obstacle changes. `dist` is the Chapter 4 query: d_i(q) and its closest point.
+pub struct Repulsive<'w, const N: usize> { pub dist: &'w dyn cspace::DistanceQuery<N>, pub eta: f64, pub q_star: f64 }
+
+impl<const N: usize> Potential<N> for Repulsive<'_, N> {
+    fn value(&self, q: &SVector<f64, N>) -> f64 {
+        self.dist.distances(q).iter().filter(|o| o.d <= self.q_star)
+            .map(|o| 0.5 * self.eta * (1.0 / o.d - 1.0 / self.q_star).powi(2))      // eq. (4.4)
+            .sum()
+    }
+    fn gradient(&self, q: &SVector<f64, N>) -> SVector<f64, N> {
+        let mut g = SVector::zeros();
+        for o in self.dist.distances(q).iter().filter(|o| o.d <= self.q_star) {
+            // eq. (4.5): η (1/Q* − 1/d) (1/d²) ∇d, with ∇d = (q − c)/d (Derivation 2).
+            g += self.eta * (1.0 / self.q_star - 1.0 / o.d) / (o.d * o.d) * o.grad;
+        }
+        g
+    }
+}
+
+/// U = Σ terms — the whole method and its local minima.
+pub struct Additive<const N: usize>(pub Vec<Box<dyn Potential<N>>>);
+```
+
+Gradient descent returns the iterates *and the reason it stopped*, with the Hessian's eigenvalues
+when it stopped at a critical point that is not the goal — the stuck badge of the Potential Well.
+
+```rust title="crates/potential/src/descent.rs" {15-23}
+use nalgebra::{SMatrix, SVector};
+
+pub enum DescentOutcome { Goal, LocalMinimum { hessian_eigs: Vec<f64> }, StepLimit, Collision, Stalled }
+
+/// Choset Algorithm 4 with the sign the text intends: q(i+1) = q(i) − α(i) ∇U(q(i)).
+/// `alpha` is a schedule ("often made on an ad hoc or empirical basis", Choset); `eps` the
+/// forgiving termination ‖∇U‖ < ε; `max_step` caps a repulsive spike's fling.
+pub fn gradient_descent<const N: usize>(
+    u: &dyn Potential<N>, q_start: SVector<f64, N>, alpha: impl Fn(usize) -> f64,
+    eps: f64, max_steps: usize, goal: Option<(SVector<f64, N>, f64)>, max_step: f64,
+) -> (Vec<SVector<f64, N>>, DescentOutcome) {
+    let mut path = vec![q_start];
+    for i in 0..max_steps {
+        let q = *path.last().unwrap();
+        if let Some((g, tol)) = goal { if (q - g).norm() <= tol { return (path, DescentOutcome::Goal); } }
+        let grad = u.gradient(&q);
+        if grad.norm() < eps {
+            // Not at the goal, gradient gone: classify the critical point by its Hessian.
+            let h = hessian(u, &q, 1e-4);
+            let eigs = h.symmetric_eigenvalues().iter().copied().collect();
+            return (path, DescentOutcome::LocalMinimum { hessian_eigs: eigs });
+        }
+        let mut step = -alpha(i) * grad;
+        if step.norm() > max_step { step *= max_step / step.norm(); }
+        path.push(q + step);
+    }
+    (path, DescentOutcome::StepLimit)
+}
+
+/// ∇²U by central differences of the gradient, symmetrized — Choset reads the type of a
+/// critical point off its signature, and Chapter 8 reads the Morse index off the same matrix.
+pub fn hessian<const N: usize>(u: &dyn Potential<N>, q: &SVector<f64, N>, h: f64) -> SMatrix<f64, N, N> {
+    let mut m = SMatrix::<f64, N, N>::zeros();
+    for j in 0..N {
+        let (mut qp, mut qm) = (*q, *q);
+        qp[j] += h; qm[j] -= h;
+        m.set_column(j, &((u.gradient(&qp) - u.gradient(&qm)) / (2.0 * h)));
+    }
+    0.5 * (m + m.transpose())
+}
+```
+
+Brushfire is the owned artifact. It is Chapter 6's breadth-first search with every obstacle pixel
+as a source, and it keeps the second back pointer that Chapter 8 reads as the grid GVD.
+
+```rust title="crates/potential/src/brushfire.rs" {27-38}
+use std::collections::VecDeque;
+
+#[derive(Clone, Copy)] pub enum Conn { Four, Eight }
+
+/// Choset's labels: obstacle 1, free pixels 2, 3, …; `back2` is set where a second front from a
+/// *different* obstacle arrived — §5.2.5's "two different back pointers", the grid GVD.
+pub struct DistGrid { pub label: Vec<u32>, pub back: Vec<Option<usize>>, pub back2: Vec<Option<usize>>, pub source: Vec<i32>, pub w: usize, pub h: usize }
+
+pub fn brushfire(occ: &cspace::Raster, conn: Conn) -> DistGrid {
+    let (w, h) = (occ.width(), occ.height());
+    let comp = obstacle_components(occ);                       // a front's source is an obstacle, not a pixel
+    let mut g = DistGrid { label: vec![0; w * h], back: vec![None; w * h], back2: vec![None; w * h], source: vec![-1; w * h], w, h };
+    let mut queue = VecDeque::new();
+    for k in 0..w * h {
+        if occ.is_occupied(k) { g.label[k] = 1; continue; }
+        // Step 1 of the text: free pixels neighbouring an obstacle are labelled 2.
+        if let Some(o) = occ.lattice_neighbors(k, conn).find(|&n| occ.is_occupied(n)) {
+            g.label[k] = 2; g.back[k] = Some(o); g.source[k] = comp[o]; queue.push_back(k);
+        }
+    }
+    while let Some(c) = queue.pop_front() {
+        let (lc, sc) = (g.label[c], g.source[c]);
+        for x in occ.free_neighbors(c, conn) {               // Star(c) on Chapter 6's grid graph
+            if g.label[x] == 0 {
+                g.label[x] = lc + 1; g.back[x] = Some(c); g.source[x] = sc; queue.push_back(x);
+            } else if g.source[x] != sc && g.source[x] >= 0 && g.label[x] >= lc {
+                // Two fronts meet. Even gap: x was labelled lc + 1 by the other front and now gets
+                // its second back pointer. Odd gap: both pixels carry lc and the collision falls on
+                // their shared edge — both are flagged so the ridge has no holes.
+                if g.label[x] == lc + 1 && g.back2[x].is_none() { g.back2[x] = Some(c); }
+                g.mark_ridge(x); if g.label[x] == lc { g.mark_ridge(c); }
+            }
+        }
+    }
+    g
+}
+
+impl DistGrid {
+    /// Pixels two fronts from different obstacles reached — Chapter 8's grid GVD.
+    pub fn ridge_cells(&self) -> Vec<usize> { (0..self.w * self.h).filter(|&k| self.is_ridge(k)).collect() }
+    /// "Point to a lowest neighbor" (Choset §4.3.2); ties to the first in scan order.
+    pub fn grid_gradient(&self, cell: usize, conn: Conn) -> Option<usize> { /* lowest-label neighbour */ todo_lowest(self, cell, conn) }
+}
+
+/// Wave-front (§4.5): the same propagation from the goal pixel alone, seeded with 2.
+pub fn wavefront(occ: &cspace::Raster, goal: usize, conn: Conn) -> DistGrid { propagate(occ, &[(goal, 2, 0)], conn) }
+```
+
+The navigation function is eq. (4.13) with its analytic gradient, and the lifted potential for
+Reach is a sum of `Jᵀ f` terms.
+
+```rust title="crates/potential/src/navigation.rs · src/lifted.rs"
+/// Eq. (4.13) on a sphere world; `Potential<2>` via the quotient rule.
+pub struct NavigationFunction<'w> { pub world: &'w SphereWorld, pub goal: Point2<f64>, pub kappa: u32 }
+
+impl Potential<2> for NavigationFunction<'_> {
+    fn value(&self, q: &Vector2<f64>) -> f64 {
+        let a = (q - self.goal.coords).norm_squared();                 // γ_1 = d²
+        let b = a.powi(self.kappa as i32) + self.world.beta(q);        // d^{2κ} + β
+        if b <= 0.0 { 1.0 } else { a * b.powf(-1.0 / self.kappa as f64) }
+    }
+    fn gradient(&self, q: &Vector2<f64>) -> Vector2<f64> {
+        let k = self.kappa as f64;
+        let diff = q - self.goal.coords;
+        let a = diff.norm_squared();
+        let (beta, grad_beta) = self.world.beta_and_gradient(q);
+        let b = a.powf(k) + beta;
+        let bm = b.powf(-1.0 / k);
+        let da = 2.0 * diff;
+        let db = k * a.powf(k - 1.0) * da + grad_beta;
+        da * bm - (a / k) * (bm / b) * db                              // quotient rule
+    }
+}
+
+/// §4.7.2–4.7.3: control points on Reach, each with a workspace potential; `gradient` is
+/// u(q) = Σ_j J_j(q)ᵀ ∇U_j(r_j(q)), summed in C-space (eq. 4.26) — never in the workspace.
+pub struct LiftedPotential<'r> { pub arm: &'r robots::Reach, pub scene: &'r collide::Scene, pub points: Vec<ControlPoint>, pub goal: Tn<2>, pub floating: bool }
+
+impl Potential<2> for LiftedPotential<'_> {
+    fn value(&self, q: &Vector2<f64>) -> f64 { self.terms(q).iter().map(|t| t.value).sum() }
+    fn gradient(&self, q: &Vector2<f64>) -> Vector2<f64> {
+        let mut u = Vector2::zeros();
+        for t in self.terms(q) {
+            let j = cspace::control_point_jacobian(self.arm, q, t.link, t.t);   // Chapter 4's jacobian, shortened
+            u += j.transpose() * t.force;                                          // u = Jᵀ f
+        }
+        u
+    }
+}
+```
+
+### The worked example, and its printed output
+
+```rust title="crates/potential/examples/descent_step.rs · brushfire_7x3.rs · kappa_sweep.rs"
+fn main() {
+    // Part B: one evaluation and one step, as in the text.
+    let goal = Vector2::new(4.0, 3.0);
+    let att = Attractive { goal, zeta: 1.0, d_goal_star: 10.0 };
+    let disc = cspace::DiscObstacle { center: Point2::new(0.0, -2.0), radius: 1.0 };
+    let rep = Repulsive { dist: &disc, eta: 1.0, q_star: 2.0 };
+    let q = Vector2::zeros();
+    println!("U_att = {}  grad = {:?}", att.value(&q), att.gradient(&q));
+    println!("U_rep = {}  grad = {:?}", rep.value(&q), rep.gradient(&q));
+    let u = Additive(vec![Box::new(att), Box::new(rep)]);
+    println!("U = {}  grad = {:?}", u.value(&q), u.gradient(&q));
+    println!("q1 = {:?}", q - 0.1 * u.gradient(&q));
+
+    // Part A: the 7 × 3 micro-grid.
+    let occ = cspace::Raster::from_ascii(&[".......", "#.....#", "......."]);  // first row is the top
+    let d = brushfire(&occ, Conn::Four);
+    for row in d.rows_top_first() { println!("{}", row.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")); }
+    println!("ridge: {}", d.ridge_cells().iter().map(|&k| d.col_row(k)).map(|(c, r)| format!("({c},{r})")).collect::<Vec<_>>().join(" "));
+
+    // The κ sweep on the five-disc world.
+    for kappa in [2, 3, 4, 6, 7, 8, 10] {
+        let c = critical_points(&FIVE_DISC_WORLD, FIVE_DISC_GOAL, kappa);
+        println!("kappa={kappa}: minima={} saddles={}", c.minima, c.saddles);
+    }
+}
+```
+
+```text title="cargo run -p potential --example descent_step · brushfire_7x3 · kappa_sweep"
+U_att = 12.5  grad = [-4.0, -3.0]
+U_rep = 0.125  grad = [0.0, -0.5]
+U = 12.625  grad = [-4.0, -3.5]
+q1 = [0.4, 0.35]
+2 3 4 5 4 3 2
+1 2 3 4 3 2 1
+2 3 4 5 4 3 2
+ridge: (4,1) (4,2) (4,3)
+kappa=2: minima=3 saddles=7
+kappa=3: minima=2 saddles=6
+kappa=4: minima=2 saddles=6
+kappa=6: minima=2 saddles=6
+kappa=7: minima=1 saddles=5
+kappa=8: minima=1 saddles=5
+kappa=10: minima=1 saddles=5
+```
+
+Read Part B against the text. $U_{att} = \tfrac12 \cdot 25 = 12.5$ with gradient $q - \qgoal =
+(-4, -3)$. The disc's closest point is $c = (0, -1)$, so $d_1 = 1$ and $\nabla d_1 = (0, 1)$; with
+$\eta = 1$ and $Q^\star = 2$, $U_{rep} = \tfrac12 (1 - \tfrac12)^2 = 0.125$ and $\nabla U_{rep} =
+(\tfrac12 - 1) \cdot 1 \cdot (0, 1) = (0, -0.5)$. The total is $U = 12.625$, $\nabla U = (-4,
+-3.5)$, and one step with $\alpha = 0.1$ lands at $q(1) = (0.4, 0.35)$ — away from the obstacle and
+toward the goal. `descent_step_matches_text` pins these to $10^{-12}$; `brushfire_7x3_labels`
+asserts all 21 labels and the ridge set; `brushfire_equals_bfs_depth_plus_one` checks on seeded
+grids that `brushfire` equals `search::bfs` multi-source depth $+ 1$ and that the wave-front
+descent has the Dijkstra cost under unit weights; `kappa_sweep` pins exactly one minimum from
+$\kappa = 7$; `reach_field` lifts a unit force at Reach's tip and asserts $u_\theta = (r \times
+f)_z$. The TypeScript port in `web/lib/potential/` runs the same thirteen checks, and every
+widget on this page is that port.
+
+<Callout type="info">
+Two of the port's checks failed on first writing, and both failures were mathematics, not typos.
+The sensor-based distance check assumed the ray fan overestimates $D$ by at most the ray
+quantisation, and the Apartment's free-standing wall stubs, seen end-on, broke it by 8%: a
+zero-thickness wall subtends no angle, and the bound only holds broadside. The star-world
+check assumed $h_\lambda$ maps every star boundary onto its circle for $\lambda = 1$, which is
+true in exact arithmetic and false by six units in floating point once a boundary $\beta_i$ rounds
+to $-10^{-16}$, because $\gamma_\kappa \bar\beta_i$ is $10^{17}$ and the switches cannot see a
+$\lambda$ of order one. Both are now stated as the theorems actually say them.
+</Callout>
+
+## Putting it together: Rusty in a doorway, Reach at the bench
+
+The integration lab runs Rusty in the Apartment under a *sensor-based* potential: the repulsive
+term is fed by the local minima of a 72-ray scan of radius 3 m (Algorithm SENSOR-BASED DISTANCE),
+the attractive term by the goal in the corridor, and the descent is Algorithm 4 at
+$\alpha = 0.02$. From the middle of room A Rusty heads for the door, and in the alcove beside the
+jamb — where the goal pulls through the wall and the two wall faces push toward the centre of the
+alcove — it stops, with the stuck badge reading a positive-definite Hessian. The same raster the
+Chapter 6 planner used, run through `wavefront` from the goal cell at 4-point connectivity, gives
+a field with one minimum, and the grid descent walks Rusty out of the alcove and through the
+door — hugging the jamb at one cell's clearance, which is Choset's "dangerously close to
+obstacles" and the reason Chapter 8's Voronoi roadmap exists. The Potential Well's wave-front
+toggle is this lab on a table; the Apartment version is Exercise 4's.
+
+Reach's half of the lab is the Arm in a Field widget run to the end: the same start descended
+twice, with the first collision logged. Without $r_{float}$ link 1 meets the post after a dozen
+steps between its two fixed repulsive points; with it the arm reaches the goal pose in about five
+hundred. Move the goal into the block's shadow and you will find starts where it stalls in a local
+minimum of the lifted potential instead — the additive disease, now on the torus — and starts
+where even $r_{float}$ fails, because a floating point repels the nearest link point and nothing
+else.
+
+Three pointers close the chapter. Brushfire's double-back-pointer pixels are the grid generalized
+Voronoi diagram, and Chapter 8 proves the exact version is a roadmap, with the Morse vocabulary
+this chapter's "nondegenerate critical point" was borrowing from. Chapter 19's CHOMP descends a
+potential whose obstacle term is a distance field exactly like the brushfire one, over a whole
+trajectory at once, and inherits every local minimum on this page. And Part III's planners are the
+field's eventual answer to incompleteness: when the valley you roll into is not the goal's, sample.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Convexity of d_i and the seams of U_rep">
+    Prove that $d_i(q) = \min_{c \in \QO_i} \|q - c\|$ is a convex function of $q$ when $\QO_i$ is
+    convex (Choset Ch. 5, Problem 19, brought forward). Conclude that with the per-obstacle sum
+    $U_{rep} = \sum_i U_{rep_i}$, the only places $\nabla U_{rep}$ can fail to be continuous are the
+    spheres $d_i = Q^\star_i$ — and show that in fact it is continuous there too, so the seams
+    that remain are those of Derivation 2's Step 4: where a *nonconvex* obstacle has two closest points.
+    <Hints>
+      <>A minimum over c of a jointly convex function of (q, c) is convex in q. Is ‖q − c‖ jointly convex? Is the constraint set convex?</>
+      <>For the seam at d_i = Q*: evaluate η(1/Q* − 1/d_i)/d_i² as d_i → Q* from below.</>
+      <>For the nonconvex case, take the horseshoe of the Potential Well and a point on its axis: name the two closest points and the two limiting gradients.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Wave-front paths are L₁-shortest">
+    Show that the path produced by wave-front descent under 4-point connectivity is shortest in the
+    $L_1$ (Manhattan) metric among all grid paths from the start to the goal (Choset Ch. 4,
+    Problem 2). Then give a $3 \times 3$ example where the 8-point descent path — shortest in link
+    length — is *not* Euclidean-shortest among 8-connected paths, and say by how much.
+    <CheckAnswer
+      id="ch07.e2"
+      prompt="On an empty 3 × 3 grid from the bottom-left to the top-right cell under 8-point connectivity, the wave-front path has two links. What is the Euclidean length of a two-link path that goes diagonal, diagonal, divided by the length of one that goes east, east, then north, north? (Give the ratio as a decimal.)"
+      answer={0.7071}
+      tolerance={0.01}
+    >
+    Two diagonals measure $2\sqrt 2 \approx 2.83$ against four axial steps' $4$: the ratio is
+    $\sqrt 2 / 2 \approx 0.707$. Both have the same wave-front label difference under 8-point
+    connectivity only if you count links, which is the point: the wave-front field measures the grid
+    metric, and under 8-point connectivity that metric is chessboard distance, which calls the
+    two-diagonal path and a two-link axial path (which does not exist here) equally short. Choset's
+    $1/1.4$ weights of Chapter 6 repair the worst of this; brushfire with those weights is a
+    Dijkstra, not a BFS — Exercise 5.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the κ threshold, then move an obstacle">
+    <Predict
+      id="ch07.e3"
+      question="In the Navigation Function Sculptor, read the critical-point count at κ = 6: two minima, six saddles. Without moving the slider: what is the smallest κ at which the count will read one minimum?"
+      options={[
+        { label: 'κ = 7', correct: true, because: 'The last spurious minimum sits near the obstacle at (−2.3, 1.6), on its radial line to the goal; at κ = 7 the goal term finally dominates ∂β there and the minimum merges with its saddle. The check pins the table: 2, 2, 2, 1, 1, 1 for κ = 4, 6, 7, 8, 10.' },
+        { label: 'κ = 10, as in Choset\'s figure 4.15', because: 'Choset\'s figure is for his obstacle layout, not ours. The theorem says a large enough κ exists; the threshold depends on where the discs are, and ours lose their last spurious minimum earlier.' },
+        { label: 'It never reads one — some layout always keeps a spurious minimum', because: 'That is the additive potential\'s disease, which the navigation function is built to avoid: on any sphere world a finite κ makes every spurious minimum a saddle. The widget\'s counter shows the moment it happens.' },
+      ]}
+    >
+    Verify, then drag the goal toward the obstacle at $(-2.3, 1.6)$ — the one that held the last
+    spurious minimum. The threshold moves *down*: a goal closer to an obstacle makes the goal term
+    steeper on that obstacle's radial line sooner. Drag it away and the threshold rises. Then
+    switch on star mode and confirm the count does not change for any $\lambda \ge \lambda_0$ — and
+    find the $\lambda$ at which it does.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="A world of only convex discs, and the price of the escape">
+    In the Potential Well choose *two convex discs*, drag the goal and the discs until the bead
+    gets stuck, and record the Hessian eigenvalues the badge prints. Then enable wave-front mode
+    and estimate how close the escape path passes to the discs — Choset's "dangerously close to
+    obstacles" in §4.5. Explain why the wave-front path *must* graze: among all grid paths of the
+    same link length to the goal it has no reason to prefer clearance, and the one found first by
+    "step to any neighbour labelled one less" is whichever the scan order produced.
+    <Hints>
+      <>Clearance on the grid is a brushfire label; the wave-front label is a different BFS. Which one does "step to a lower neighbour" consult?</>
+      <>Chapter 8 will combine the two: the GVD is the ridge of the brushfire field, and a path that follows it maximizes clearance while the wave-front minimizes length.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="Brushfire as Dijkstra, within one cell of the EDT">
+    Implement an 8-point `brushfire` with diagonal cost $1.4$ (Chapter 6's grid metric) as a
+    Dijkstra rather than a BFS: labels become real-valued distances and the queue becomes a heap.
+    Property-test it on 200 seeded grids against the exact Euclidean distance transform ported from
+    the sister book (`mapping/edt`): assert that every cell's label is within one cell of the EDT,
+    and record the worst gap. Then repeat with diagonal cost $\sqrt 2$ and report whether the worst
+    gap improves — and why it cannot reach zero (the octile metric is not the Euclidean one).
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Wave-front on the torus">
+    Implement Choset Ch. 4 Problem 5: a wave-front planner for Reach on the $T^2$ raster of
+    Chapter 4, with the goal seeded at the goal configuration and adjacency *wrapping across the
+    seam* at $\pm\pi$ in both axes. Animate the arm on the Workbench along the descent path, and
+    assert in a test that the path's link length equals the Chapter 6 breadth-first distance on the
+    same torus graph — then compare the number of cells the wave-front labels with the number A*
+    expands for the same query, and say which planner you would run twice.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 4 is this chapter's source: the additive potential and its honesty items, Algorithm 4, sensor-based and brushfire distance, the local-minimum figures 4.10–4.11, the wave-front planner, Definition 4.6.1 and the sphere- and star-world constructions, and the virtual-work lifting of §4.7 with Example 4.7.1 and figure 4.20."
+  />
+  <Reference
+    authors="Khatib, O."
+    year={1986}
+    title="Real-Time Obstacle Avoidance for Manipulators and Mobile Robots"
+    venue="International Journal of Robotics Research 5(1), 90–98"
+    doi="10.1177/027836498600500106"
+    note="The artificial potential field for manipulators: attractive goal, repulsive obstacles, and forces at points on the links lifted through the Jacobian — §4.7 in its original form, written for control rather than planning."
+  />
+  <Reference
+    authors="Rimon, E. and Koditschek, D. E."
+    year={1992}
+    title="Exact Robot Navigation Using Artificial Potential Functions"
+    venue="IEEE Transactions on Robotics and Automation 8(5), 501–518"
+    doi="10.1109/70.163777"
+    note="Navigation functions: Definition 4.6.1, the sphere-world formula (4.13) with its existence-in-κ theorem, and the star-to-sphere diffeomorphism h_λ with its switches — Derivations 5 and 6."
+  />
+  <Reference
+    authors="Barraquand, J. and Latombe, J.-C."
+    year={1991}
+    title="Robot Motion Planning: A Distributed Representation Approach"
+    venue="International Journal of Robotics Research 10(6), 628–649"
+    doi="10.1177/027836499101000604"
+    note="The Randomized Path Planner: gradient descent on a grid potential with random walks to escape local minima — Choset's reference [37], the honest 1991 fix and the ancestor of Part III's sampling."
+  />
+  <Reference
+    authors="Latombe, J.-C."
+    year={1991}
+    title="Robot Motion Planning"
+    venue="Kluwer Academic Publishers"
+    url="https://link.springer.com/book/10.1007/978-1-4615-4022-9"
+    note="Chapter 7 is the classical textbook treatment of potential-field methods, including the wave-front (numerical navigation function) planner and the local-minimum analysis this chapter condenses."
+  />
+  <Reference
+    authors="Ratliff, N., Zucker, M., Bagnell, J. A., and Srinivasa, S."
+    year={2009}
+    title="CHOMP: Gradient Optimization Techniques for Efficient Motion Planning"
+    venue="IEEE International Conference on Robotics and Automation (ICRA), 489–494"
+    doi="10.1109/ROBOT.2009.5152817"
+    note="Forward pointer only: the obstacle term of CHOMP is a distance field like brushfire's, descended over a whole trajectory, and it inherits this chapter's local minima. Chapter 19 derives it."
+  />
+  <Reference
+    authors="Thrun, S., Burgard, W., and Fox, D."
+    year={2005}
+    title="Probabilistic Robotics"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262201629/probabilistic-robotics/"
+    note="The sister volume's map representations chapter ports the exact Euclidean distance transform this chapter compares brushfire against; the two are different algorithms computing different metrics."
+  />
+</References>

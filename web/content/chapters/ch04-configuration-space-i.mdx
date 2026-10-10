@@ -1,0 +1,1269 @@
+---
+title: "Configuration Space I: Obstacles in the Space of Configurations"
+description: What a C-obstacle is — the set of configurations at which a function of q meets the obstacle — computed exactly for a disc, vertex by vertex for a polygon, and pixel by pixel for an arm on a torus; the star algorithm, GJK, and Reach's Jacobian with its singularities.
+chapter: 4
+part: PART I
+partTitle: Foundations — Robots, Worlds, and Configuration Space
+difficulty: Intermediate
+readingTime: 60 min
+quote: Although the example in figure 3.5 is quite simple, the main point is that it is easier to think about points moving around than bodies with volume.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §3.2.1
+---
+
+import { CSpaceMorph } from '@/components/ch/ch04/cspace-morph';
+import { MinkowskiStudio } from '@/components/ch/ch04/minkowski-studio';
+import { JacobianLens } from '@/components/ch/ch04/jacobian-lens';
+import { DiscInflation } from '@/components/ch/ch04/disc-inflation';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Define a configuration, the configuration space, and the degrees of freedom of a robot, and count them by constraints — three for a planar body, six in space, Grübler\'s formula for closed chains',
+    'Define the C-obstacle QO_i and the free space Q_free, and compute QO exactly for a translating disc (Minkowski inflation) and for a translating convex polygon (the star algorithm), and approximately for the two-joint arm (Choset\'s pixel method)',
+    'Open the collision box: the Type A / Type B contact test of Appendix F.2, the star algorithm of F.3, SE(2) as stacked slices (F.4), and GJK (F.5) — each verified against a brute-force oracle',
+    'Differentiate Reach\'s forward kinematics: the Jacobian J(q), det J = L₁L₂ sin θ₂, and what a singular configuration does and does not mean',
+    'Say honestly what a rasterized C-obstacle certifies — a picture, not a proof — and what thickening buys',
+    'Implement all of it in the cspace crate, with the five hand-checked cells, the 29-cell row, the five Minkowski vertices and Choset\'s Jacobian pinned by tests',
+  ]}
+  prerequisites={[
+    'Chapter 2: Reach\'s forward kinematics φ(θ₁, θ₂), the T2 and Pose2 configuration types, the Scene and the Collision contract',
+    'Chapter 3: the distance D(x) to the nearest obstacle — GJK is how a collision engine computes it',
+    'Chapter 1: the piano-mover reduction, "the robot is a point in the space of its configurations"',
+    'Elementary vector geometry: dot products, outward normals, convexity (Choset Appendix B, reviewed as needed)',
+  ]}
+>
+[Chapter 1](/chapters/ch01-robots-that-plan) promised that the piano is a point. This chapter pays.
+It answers the four questions Choset opens his Chapter 3 with — how much information specifies a
+robot's position, how to represent it, what its mathematical properties are, and how obstacles in
+the workspace become constraints on it — for every case that can be computed exactly, and it opens
+the collision box that [Chapter 2](/chapters/ch02-the-lab) deliberately sealed.
+
+The idea the whole chapter turns on is one sentence long and easy to say wrong. A configuration
+space obstacle is **not a picture of the workspace obstacle**. It is the set of configurations $q$ at
+which a *function* of the configuration, $R(q)$, meets the obstacle. For a disc that set happens to
+look like the obstacle, grown by the radius — and Choset warns on his page 44 that this is the one
+case where it does. For a polygon that rotates, it is a Minkowski difference computed one vertex at
+a time, and the vertices re-pair every time the robot turns. For a two-joint arm it is a blob on a
+torus that nobody can draw by hand and that a planner must nonetheless search. The widget at the top
+of this page draws it live; the mathematics below says why it has the shape it has; the Rust at the
+end computes it, and the tests hold every printed number to the code.
+
+Two things from Choset's §3.8 ride along, because every later planner for Reach — the potential
+fields of [Chapter 7](/chapters/ch07-potential-functions), the dynamics of
+[Chapter 17](/chapters/ch17-robot-dynamics), the steering of
+[Chapter 21](/chapters/ch21-nonholonomic-ii) — needs them already: the Jacobian
+$J(q) = \partial\varphi/\partial q$ that turns joint velocities into tip velocities, and the
+configurations $\sin\theta_2 = 0$ where it loses rank. The topology that makes the torus wrap, and
+why the square is only a chart of it, waits for [Chapter 5](/chapters/ch05-configuration-space-ii).
+</Overview>
+
+## The problem: a block, and its shadow
+
+Below, a slate block slides across the Workbench on a seeded path while Reach, the two-joint arm,
+sweeps through its configurations. Beside it, the square $[-\pi, \pi]^2$ of joint angles — the torus
+$T^2$ cut open and flattened — with an amber region that stretches, splits, and rejoins as the block
+moves. Before reading on: what is the amber region?
+
+<Deferred>
+  <CSpaceMorph />
+</Deferred>
+
+It is the set of joint-angle pairs $(\theta_1, \theta_2)$ at which some point of the arm lies inside
+the block. Choset calls it the **configuration space obstacle** $\QO$, and three things about it are
+the whole chapter.
+
+**It is not the block.** The block is a square in the plane. Its shadow on the torus is a curved blob
+whose shape depends on where the block is, how long the links are, and which link can reach it. Slide
+the block toward the base and a vertical band appears — link 1 now hits it for *every* $\theta_2$, so
+a whole column of the square is forbidden. Slide it the other way and the blob shrinks toward a point.
+Drag it in one direction and the blob can move in the other. The misconception this widget exists to
+kill is that the C-obstacle "looks like" the obstacle. It is a different shape in a different space.
+
+**It is the preimage of a function.** Write $R(q)$ for the set of workspace points the arm occupies
+at configuration $q$. The amber region is $\{q : R(q) \cap \text{block} \ne \emptyset\}$, the set of
+inputs for which a function of $q$ meets a fixed set. Every property of the blob — its convexity or
+lack of it, its connectedness, whether it wraps across the seam — is a property of that function.
+This is also why the same code draws the disc's C-space in the next section: nothing about the
+rasterizer knows what an arm is. It asks a `Collision` checker one question per cell.
+
+**It is a picture, not a certificate.** The amber cells are the configurations the raster *tested*.
+A path through the white cells passes through configurations no one tested. Choset's §3.2.2 says this
+plainly — the grid "only encodes collision information for the discrete set of points lying on the
+grid" — and offers the remedy the widget's *link thickness* slider implements: thicken the robot so
+that a free sample certifies a free neighborhood. The planner is then conservative and only
+*resolution complete*. We will come back to this.
+
+The readout under the torus counts cells and components. Load the *micro-example square* preset and
+the $\theta_1 = 0°$ row shows exactly $29$ occupied cells. That number is the chapter's handshake
+between hand, raster and code: the next section derives it with a protractor, the Rust at the end
+prints it, and a test asserts it.
+
+<KeyIdea title="The one sentence version">
+A configuration space obstacle is the set of configurations at which the robot's footprint
+$\Rq$ meets the workspace obstacle. For a disc that is the obstacle grown by $r$; for a convex
+polygon at fixed heading it is a Minkowski difference, built vertex by vertex from the two bodies'
+edge normals; for an arm it is a region of the torus that only a collision checker can draw. In every
+case the obstacle lives in the space of configurations, and planning happens there.
+</KeyIdea>
+
+## Building intuition
+
+### A disc only grows
+
+Start where the picture *is* easy. Choset's figure 3.5 puts three circular robots of increasing radius
+in one room with a doorway and asks each to cross it. The widget below is that figure with numbers:
+a $4 \times 5$ m room, a $0.6$ m doorway in the dividing wall, one convex crate, and three discs —
+a point, Rusty at $r = 0.11$ m, and a third whose radius you set.
+
+<Deferred>
+  <DiscInflation />
+</Deferred>
+
+For a disc translating in the plane the configuration is the center $(x, y)$, so $\Q = \mathbb{R}^2$
+and it is tempting to think of configuration space as the workspace. It is not — they are different
+spaces that happen to have the same coordinates — but the C-obstacle of a disc does have a closed
+form. The disc of radius $r$ at $q$ meets the crate iff some crate point lies within $r$ of $q$, so
+$\QO$ is the crate with every point pushed outward by $r$: edges slide out by $r$, corners become
+quarter-circles, and walls — zero-width obstacles — become capsules of width $2r$. Choset's phrase is
+that "we 'grow' the polygon outward and the walls inward." The point robot then plans in the grown
+map.
+
+Three numbers to check against the readouts. The point robot's free area is the room less the crate,
+$20 - 0.4 = 19.60\ \mathrm{m}^2$. For Rusty the crate's C-obstacle has area $|\WO| + r\,p + \pi r^2
+= 0.4 + 0.11 \cdot 2.6 + \pi \cdot 0.0121 = 0.7240\ \mathrm{m}^2$ — the original, a strip of width
+$r$ along the perimeter $p$, and corner arcs that together make exactly one disc. And the doorway,
+$0.6$ m wide, narrows to $0.6 - 2r$: Rusty passes with $0.19$ m to spare on each side, the free space
+is one component, and the purple path goes through. Raise the third radius past $0.30$ m and the two
+capsules meet in the doorway; $\Qfree$ falls into **two** components and the query has no answer —
+which is exactly what Choset's figure 3.5(c) shows and what no amount of clever search can fix. The
+check `doorway` pins the component counts $1/1/2$ for $r = 0, 0.11, 0.35$ and the free area
+$19.60\ \mathrm{m}^2$.
+
+Now the honesty item this widget is really about. The disc inflation is *correct* — "inflate by the
+radius and plan for a point" is exactly right — and it is right **only for discs**. A disc has no
+orientation, so its footprint is the same set translated; for any body that rotates, $R(q)$ changes
+shape with $\theta$, and the "grow the obstacle" picture fails at the first corner. The Minkowski
+Studio in the mathematics section shows what replaces it.
+
+### An arm's C-obstacle is a shape in a different space
+
+Here is the micro-example that runs through the rest of the chapter, chosen so that every number can
+be checked with a protractor. Reach has $L_1 = L_2 = 1$, zero-thickness links, base at the origin;
+the only obstacle is a small square $\WO = [1.4, 1.6] \times [-0.1, 0.1]$ — side $0.2$, centered at
+$(1.5, 0)$. Link 1 has length $1$ and the square begins at $x = 1.4$, so link 1 can never touch it:
+the C-obstacle comes from **link 2 alone**.
+
+Five configurations by hand.
+
+- **(a)** $q = (0°, 0°)$. Link 2 runs from the elbow $(1, 0)$ to the tip $(2, 0)$, straight through
+  the square's center. **Collision.**
+- **(b)** $q = (0°, 13°)$. Link 2 leaves $(1, 0)$ at $13°$; at $x = 1.4$ its height is
+  $0.4 \tan 13° = 0.092 < 0.1$, inside the square's left edge. **Collision.**
+- **(c)** $q = (0°, 15°)$. Height at $x = 1.4$ is $0.4 \tan 15° = 0.107 > 0.1$: the link clears the
+  corner $(1.4, 0.1)$. **Free.**
+- **(d)** $q = (45°, -90°)$. Elbow at $(0.7071, 0.7071)$, link 2 at absolute heading $-45°$, tip at
+  $(\sqrt2, 0) = (1.4142, 0)$ — inside the square. **Collision.**
+- **(e)** $q = (90°, \theta_2)$ for any $\theta_2$. Elbow at $(0, 1)$; the nearest point of the
+  square is the corner $(1.4, 0.1)$ at distance $\sqrt{1.96 + 0.81} = 1.664 > L_2$. **Free for every**
+  $\theta_2$.
+
+So the slice of $\QO$ at $\theta_1 = 0$ is exactly $|\theta_2| \le \arctan(0.1/0.4) = \arctan\tfrac14
+= 0.2450$ rad $= 14.04°$, the angle the near corner subtends from the elbow. On a $1°$ raster whose
+cells are centered at integer degrees, that is the cells $\theta_2 = -14°, \dots, 14°$: $2 \cdot 14 +
+1 = 29$ cells out of $360$ — the number the widget's readout shows for the preset. Generalizing (e),
+the $\theta_1$-extent of the blob is the set of elbow positions within $L_2 = 1$ of the square:
+$(1.4 - \cos\theta_1)^2 + (\sin\theta_1 - 0.1)^2 \le 1$, i.e. $2.8\cos\theta_1 + 0.2\sin\theta_1 \ge
+1.97$, i.e. $|\theta_1| \lesssim 0.864$ rad $= 49.5°$. On the raster, the rows $\theta_1 = \pm 49°$
+hold one cell each and the rows $\pm 50°$ are empty; the blob is one connected region of $2{,}015$
+cells ($1.55\%$ of $T^2$) and touches no seam. The check `cspace` asserts all of it, and bisects the
+exact segment test along the $\theta_1 = 0$ row to recover $\arctan\tfrac14$ to $10^{-9}$.
+
+Compare this with the square itself: a $0.2 \times 0.2$ box. Its shadow on the torus is a curved
+lens about $99°$ wide and $29°$ tall at its waist, with no straight edges and no right angles. That
+is the picture to carry into the mathematics.
+
+### Why "grow the obstacle" fails for a polygon
+
+One more experiment before the definitions. Suppose the robot is a convex polygon that translates at
+a fixed heading $\theta$ among a convex obstacle. Its C-obstacle is again convex, and it is again
+built from the obstacle and the robot — but *not* by growing the obstacle: it is the obstacle with
+the *reflected* robot swept along its boundary, the **Minkowski difference** $\WO \ominus R$. Turn the
+robot and the sweep changes; the C-obstacle's vertex count can change with it. The Minkowski Studio,
+placed beside the star algorithm below, computes it one vertex at a time. The misconception it kills
+is that Minkowski sums are expensive. For convex polygons they are a *merge of two sorted lists*.
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: '\\operatorname{cl}(\\cdot),\; \\operatorname{int}(\\cdot),\; \\partial', meaning: 'closure, interior, boundary of a set (Choset App. B)' },
+    { sym: 'A \\oplus B,\; A \\ominus B', meaning: 'Minkowski sum {a + b} and Minkowski difference {a − b}' },
+    { sym: 'M,\; N,\; k,\; n,\; f_i', meaning: 'mobility; ambient DOF (3 planar, 6 spatial); links; joints; DOF of joint i (Grübler)' },
+    { sym: 'g(q, t) = 0,\\quad g(q, \\dot q, t) = 0', meaning: 'a holonomic constraint; a nonholonomic (velocity) constraint' },
+    { sym: 'h(x, y) = ax + by - c,\; h^-,\; h^+', meaning: 'a line with unit normal (a, b) and its negative / positive half-planes (App. F.1)' },
+    { sym: 'r_i,\; E^R_i,\; n^R_i(\\theta);\\quad o_j,\; E^W_j,\; n^W_j', meaning: 'robot vertices, edges, outward normals (θ-dependent); obstacle vertices, edges, normals' },
+    { sym: 'f^R_{ij}(q),\; f^W_{ij}(q)', meaning: 'the half-plane constraints of a Type A and a Type B contact (eqs. F.4, F.6)' },
+    { sym: 'J(q) = \\partial\\varphi / \\partial q', meaning: 'the Jacobian of the forward kinematics; ẋ = J(q) q̇' },
+    { sym: 'h_Z(x),\; s_Z(x)', meaning: 'GJK support value max z·x and support point of a polytope Z in direction x (eqs. F.11–F.12)' },
+  ]}
+/>
+
+### Configuration, configuration space, degrees of freedom
+
+<KeyIdea title="Definitions (Choset §3.1) — configuration, C-space, degrees of freedom">
+The **configuration** of a robot system is a complete specification of the position of every point
+of that system. The **configuration space** $\Q$ is the space of all configurations; a
+configuration $q$ is a point of it. The number of **degrees of freedom** is $\dim \Q$ — equivalently,
+the minimum number of parameters needed to specify a configuration. $\Rq \subset \W$ denotes the set
+of workspace points the robot occupies at $q$.
+</KeyIdea>
+
+For the disc, $q = (x, y)$ and $R(x, y) = \{(x', y') : (x - x')^2 + (y - y')^2 \le r^2\}$, so
+$\Q = \mathbb{R}^2$. For the two-joint arm, $q = (\theta_1, \theta_2)$ with each $\theta_i \in S^1$,
+so $\Q = S^1 \times S^1 = T^2$, the torus. Choset's figure 3.2 cuts the torus along $\theta_1 = 0$ and
+$\theta_2 = 0$ and flattens it to a square whose opposite edges are identified — the square the
+widgets draw, with its seams marked. The *workspace* of the arm, in the sense of the set of points
+the end effector reaches, is an annulus; it is **not** a configuration space, because every interior
+point is reached by two configurations (elbow-up and elbow-down), so a tip position does not specify
+where every point of the robot is. Chapter 2's `Reach::ik` returns both.
+
+### C-obstacles, free space, and the two kinds of path
+
+<KeyIdea title="Definitions (Choset §3.2) — C-obstacle, free space, free and semifree paths">
+The **configuration space obstacle** of workspace obstacle $\WO_i$ is
+$\QO_i = \{q \in \Q : \Rq \cap \WO_i \ne \emptyset\}$. The **free space** is
+$\Qfree = \Q \setminus \bigcup_i \QO_i$, assumed open unless noted. A **free path** is a continuous
+$c : [0, 1] \to \Qfree$; a **semifree path** is a continuous $c : [0, 1] \to \operatorname{cl}(\Qfree)$,
+which may touch obstacle boundaries.
+</KeyIdea>
+
+<LinkedMath>
+$$
+\htmlClass{term-cobstacle}{\QO_i} = \{\, q \in \Q : \htmlClass{term-robot}{\Rq} \cap
+\htmlClass{term-obstacle}{\WO_i} \neq \emptyset \,\},
+\qquad
+\Qfree = \Q \setminus \bigcup_i \htmlClass{term-cobstacle}{\QO_i}.
+$$
+</LinkedMath>
+
+Hover a tinted term and every figure on the page mutes the other roles: the amber of the C-obstacle
+is the amber of the torus, the slate of the workspace obstacle is the slate of the block. The
+definition is a *preimage*: $\QO_i$ is the set of $q$ that the map $q \mapsto \Rq$ sends into the
+sets that meet $\WO_i$. Two consequences follow at once and both matter for code. First, obstacles
+union: $\QO(\WO_i \cup \WO_j) = \QO_i \cup \QO_j$, because $\Rq$ meets a union iff it meets a member
+(Choset problem 3.5) — so a rasterizer may ask one checker about a whole `Scene` rather than one
+obstacle at a time. Second, for a *convex* robot translating against a *convex* obstacle, $\QO$ is
+convex (problem 3.4; the star algorithm below is its constructive proof).
+
+<Derivation title="Derivation 1 — The disc's C-obstacle is a Minkowski inflation (Choset §3.2.1)" result="\QO = \WO \oplus B_r(0),\qquad |\WO \oplus B_r| = |\WO| + r\,p + \pi r^2">
+**Statement.** For a disc of radius $r$ translating in the plane, with configuration its center $q$,
+$\QO_i = \WO_i \oplus B_r(0) = \{o + b : o \in \WO_i,\ \|b\| \le r\}$. For a convex polygon $\WO$ with
+perimeter $p$ the inflated area is $|\WO| + r\,p + \pi r^2$.
+
+**Step 1 — the preimage, unpacked.** $R(q) = q + B_r(0)$. Then $R(q) \cap \WO \ne \emptyset$ iff
+there is an $o \in \WO$ with $\|q - o\| \le r$ iff $q = o + b$ for some $o \in \WO$, $\|b\| \le r$,
+iff $q \in \WO \oplus B_r$. Nothing about the disc's shape entered except that it is a ball about
+its reference point: the sum is exactly the obstacle "grown" by $r$.
+
+**Step 2 — the boundary.** The boundary of $\WO \oplus B_r$ for a convex polygon consists of each edge
+offset outward by $r$ along its normal, joined at each vertex by a circular arc of radius $r$
+sweeping from the incoming edge's normal to the outgoing edge's normal. `inflateDisc` builds exactly
+this: `arcSegments` chords per full turn, so the chord polygon approaches the true inflation from
+the inside.
+
+**Step 3 — the area.** The offset strips contribute $r$ times the perimeter $p$. The arcs at the
+vertices have angles that sum to the total turning of a convex polygon, $2\pi$, so together they make
+one full disc, $\pi r^2$. For $\WO = [1, 2]^2$ and $r = 0.5$: $1 + 0.5 \cdot 4 + \pi \cdot 0.25 =
+\mathbf{3.7854}$. The check `inflate` asserts the closed form and that the chord polygon's area
+climbs toward it from below — $3.7804$ with $32$ chords, $3.7854$ with $720$. $\blacksquare$
+
+*Choset's warning* (his page 44): "although both the workspace and the configuration space for this
+system can be represented by $\mathbb{R}^2$, and the obstacles appear to simply 'grow' in this
+example, the configuration space and workspace are different spaces, and the transformation from
+workspace obstacles to configuration space obstacles is not always so simple." A rotating body's
+footprint is not a ball about any point; Derivations 3 and 4 are what "not so simple" costs.
+</Derivation>
+
+### Dimension: counting by constraints
+
+<KeyIdea title="Definitions (Choset §3.3) — holonomic and nonholonomic constraints; mobility; redundancy">
+A **holonomic constraint** is an equation on the configuration variables, $g(q, t) = 0$. Each linearly
+independent holonomic constraint reduces $\dim \Q$ by one: $n$ coordinates with $m$ independent
+holonomic constraints give an $(n - m)$-dimensional configuration space. A **nonholonomic constraint**
+is a velocity constraint $g(q, \dot q, t) = 0$ and removes no dimension — Chapter 20's subject. For a
+**closed chain** of $k$ links and $n$ joints with $f_i$ degrees of freedom at joint $i$, in an ambient
+space with $N$ rigid-body DOF ($3$ planar, $6$ spatial), the **mobility** is Grübler's
+$M = N(k - n - 1) + \sum_i f_i$, valid when the joint constraints are independent. A robot with more
+DOF than its task needs is **redundant**.
+</KeyIdea>
+
+<Derivation title="Derivation 2 — Dimension by point counting (Choset §3.3)" result="\dim \Q = 3 \text{ (planar body)},\; 6 \text{ (spatial body)},\; 12 - 10 = 2 \text{ (Reach)}">
+**Statement.** A planar rigid body has three degrees of freedom and a spatial one six; a system of
+$n$ coordinates with $m$ independent holonomic constraints has $n - m$.
+
+**Step 1 — place $A$ freely.** Fix three non-collinear points $A, B, C$ on the body. $A$'s position
+is free: $2$ coordinates in the plane, $3$ in space.
+
+**Step 2 — $B$ is constrained to a circle (sphere).** Rigidity fixes $d(A, B)$, so $B$ lies on a
+circle about $A$ in the plane — one angle $\theta$ remains — or on a sphere in space, where two
+angles remain.
+
+**Step 3 — $C$ follows, up to a discrete choice.** Two fixed distances $d(A, C)$, $d(B, C)$ place
+$C$ in the plane up to a reflection: zero continuous freedoms remain. In space, three distances leave
+$C$ on a circle about the axis $AB$: one angle remains. Every other point of the body is then fixed by
+its three distances. Totals: $2 + 1 = 3$ and $3 + 2 + 1 = 6$, with configuration spaces
+$\mathbb{R}^2 \times S^1$ and $\mathbb{R}^3 \times SO(3)$. $\blacksquare$
+
+*Reach, counted the indirect way* (Choset's own example). Treat each link as a spatial rigid body:
+$12$ coordinates. Six constraints confine the two links to the table plane, two pin the first joint
+to a point, and — once link 1's angle is chosen — two pin the second joint to the end of link 1:
+$12 - 10 = 2$. The direct count is shorter: one revolute joint, one degree of freedom, twice. *A
+closed chain*: Choset's figure 3.9 has six links and seven revolute joints in the plane, so
+$M = 3(6 - 7 - 1) + 7 = 1$ — a one-parameter mechanism, like the four-bar linkage of problem 3.7.
+</Derivation>
+
+Choset's table 3.1 collects the configuration spaces this book plans in, and the inequalities beside
+it are the ones a planner written against coordinates cannot see:
+
+| Robot | $\Q$ |
+|---|---|
+| Mobile robot translating in the plane (Rusty as a disc) | $\mathbb{R}^2$ |
+| Mobile robot translating and rotating in the plane (Rusty, Hitch's chassis) | $SE(2)$ or $\mathbb{R}^2 \times S^1$ |
+| Rigid body translating in space | $\mathbb{R}^3$ |
+| A spacecraft | $SE(3)$ or $\mathbb{R}^3 \times SO(3)$ |
+| An $n$-joint revolute arm (Reach) | $T^n$ |
+| A planar mobile robot with an attached $n$-joint arm | $SE(2) \times T^n$ |
+
+$S^1 \times \cdots \times S^1 = T^n \ne S^n$; $S^1 \times S^1 \times S^1 \ne SO(3)$; $SE(2) \ne
+\mathbb{R}^3$; $SE(3) \ne \mathbb{R}^6$. The torus is compact and the plane is not; this chapter
+*uses* the difference (the blob wraps, the seam is a lie of the chart) and Chapter 5 proves it.
+
+### Polygons as intersections of half-planes
+
+<KeyIdea title="Definitions (Choset App. F.1) — half-planes, convex polygonal region, polygon">
+A line $h(x, y) = ax + by - c = 0$ with unit normal $(a, b)$ splits the plane into the **positive
+half-plane** $h^+ = \{h \ge 0\}$ and the **negative half-plane** $h^- = \{h \le 0\}$. A **convex
+polygonal region** is an intersection of finitely many negative half-planes (by convention; multiply
+$h$ by $-1$ to flip a side). A **polygonal region** is a finite union of convex ones, not necessarily
+bounded or connected. A **polygon** is a closed, simply connected polygonal region — a polygonal
+region homeomorphic to the closed unit disc.
+</KeyIdea>
+
+The convention is what makes the rest of the appendix mechanical. List a convex polygon's vertices
+counterclockwise; edge $i$ runs from $r_i$ to $r_{i+1}$; its outward unit normal $n_i$ is the edge
+direction rotated clockwise by $90°$; its half-plane is $h_i(x, y) = n_i \cdot ((x, y) - r_i) \le 0$.
+A point is inside iff every $h_i \le 0$. Choset's figure F.2 is the triangle $h_1 = -x + y - 3$,
+$h_2 = -y$, $h_3 = x$, whose negative half-planes intersect in the region $x \ge 0$, $y \ge 0$,
+$y \le x + 3$ — wait: $x \le 0$. Read the signs: $h_3 = x \le 0$ is the *left* half-plane. The
+convention is easy to say and easy to get backwards, which is why `halfPlaneOfEdge` fixes it once and
+every polygon in the module reads the same way.
+
+### Contacts, and the half-planes they define
+
+<KeyIdea title="Definition (Choset App. F.2) — Type A and Type B contacts">
+Fix the robot's heading $\theta$. Two convex polygons touch without overlapping — eq. F.2,
+$R(q) \cap W \ne \emptyset$ and $\operatorname{int} R(q) \cap \operatorname{int} W = \emptyset$ — in
+exactly two ways. A **Type A contact**: an edge $E^R_i$ of the robot contains a vertex $o_j$ of the
+obstacle. A **Type B contact**: an edge $E^W_j$ of the obstacle contains a vertex $r_i$ of the robot.
+(Both at once, figure F.4(c), is an edge lying along an edge.)
+</KeyIdea>
+
+<Derivation title="Derivation 3 — Contact half-planes characterize collision for convex polygons (App. F.2)" result="q \in \QO(\theta) \iff f^R_{ij}(q) \le 0 \;\forall\text{ applicable A},\quad f^W_{ij}(q) \le 0 \;\forall\text{ applicable B}">
+**Statement.** For fixed $\theta$, $\QO(\theta) = \{(x, y) : (x, y, \theta) \in \QO\}$ is a convex
+polygon, and $q \in \QO(\theta)$ iff every *applicable* contact's half-plane inequality holds. A
+Type A pair $(E^R_i, o_j)$ is applicable (eq. F.3) when
+
+$$
+(o_{j-1} - o_j) \cdot n^R_i(\theta) \ge 0 \quad\text{and}\quad (o_{j+1} - o_j) \cdot n^R_i(\theta) \ge 0,
+$$
+
+equivalently when the *negated* robot normal $-n^R_i$ lies between the normals of the two obstacle
+edges meeting at $o_j$; its half-plane is (eq. F.4) $f^R_{ij}(q) = n^R_i(\theta) \cdot (o_j -
+r_i(x, y, \theta)) \le 0$. Symmetrically a Type B pair $(E^W_j, r_i)$ is applicable (F.5) when
+$(r_{i-1} - r_i) \cdot n^W_j \ge 0$ and $(r_{i+1} - r_i) \cdot n^W_j \ge 0$, with half-plane (F.6)
+$f^W_{ij}(q) = n^W_j \cdot (r_i(x, y, \theta) - o_j) \le 0$.
+
+**Step 1 — the boundary is where the bodies touch.** If the interiors overlap at $q$, every nearby
+$q'$ is also in $\QO(\theta)$, so $q$ is interior to $\QO(\theta)$. Boundary configurations are
+therefore exactly those satisfying F.2: contact without overlap.
+
+**Step 2 — only Type A and Type B realize contact.** Two convex polygons whose interiors are disjoint
+meet in a point or a segment of their boundaries; the meeting set contains a vertex of one body lying
+on an edge of the other (or an edge along an edge, which is both). That is the dichotomy.
+
+**Step 3 — each applicable pair gives a supporting half-plane.** Take an applicable Type A pair. The
+condition F.3 says both obstacle edges leaving $o_j$ point into or along the robot normal's
+half-space, so the whole obstacle lies on the side $n^R_i \cdot (o - r_i) \ge n^R_i \cdot (o_j -
+r_i)$; the robot edge $E^R_i$ can touch the obstacle only at $o_j$. Translating the robot, the
+contact persists while $n^R_i \cdot (o_j - r_i(q)) = 0$ — a line in the $(x, y)$-plane — and the robot
+overlaps the obstacle exactly on the side $f^R_{ij} \le 0$. So $\QO(\theta) \subseteq \{f^R_{ij} \le
+0\}$ and the line is a *supporting line* of $\QO(\theta)$. Type B is the same with roles swapped.
+Non-applicable pairs give nothing: a robot edge whose normal does not point at $o_j$ cannot touch it
+from outside.
+
+**Step 4 — a convex set is the intersection of its supporting half-planes.** $\QO(\theta)$ is convex
+(it is a Minkowski difference of convex sets, Derivation 4), and every edge of its boundary is a
+contact line from Step 3, so $\QO(\theta)$ equals the intersection of the applicable half-planes.
+Hence $q \in \QO(\theta)$ iff all applicable inequalities hold — and *one* failing inequality is a
+certificate of separation. $\blacksquare$
+
+*Why $n^R_i$ depends on $\theta$ only.* The robot's normals rotate with it and do not move with it;
+applicability is a function of $\theta$ alone, and the star algorithm exploits this by sorting
+normals once per heading.
+
+*Nonconvex bodies.* Decompose both into convex pieces $\{R_l\}$, $\{W_k\}$ and test every pair; the
+union of the pairwise $\QO$'s is the C-obstacle (the union property above).
+</Derivation>
+
+Choset's figure F.7 shows a triangle robot and a four-sided obstacle in two placements and tabulates
+seven inequalities: all satisfied in (a), one violated in (b). His figure carries no coordinates, so
+here is the same table with numbers the check `contacts` pins. Robot $r_1 = (0, 0)$, $r_2 = (0.6,
+0.1)$, $r_3 = (0.15, 0.5)$; obstacle the square $[1, 2] \times [0, 1]$ with $o_1 = (1, 0)$
+counterclockwise; heading $\theta = 0$. Three Type A pairs and four Type B pairs are applicable:
+
+| Contact pair | half-plane | at $q_a = (0.8, 0.3)$ | at $q_b = (0.3, 0.3)$ |
+|---|---|---|---|
+| $E^R_1, o_4$ | $n^R_1 \cdot (o_4 - r_1) \le 0$ | $-0.658$ yes | $-0.575$ yes |
+| $E^R_2, o_1$ | $n^R_2 \cdot (o_1 - r_2) \le 0$ | $-0.565$ yes | $-0.233$ yes |
+| $E^R_3, o_2$ | $n^R_3 \cdot (o_2 - r_3) \le 0$ | $-1.236$ yes | $-1.715$ yes |
+| $E^W_1, r_3$ | $n^W_1 \cdot (r_3 - o_1) \le 0$ | $-0.800$ yes | $-0.800$ yes |
+| $E^W_2, r_1$ | $n^W_2 \cdot (r_1 - o_2) \le 0$ | $-1.200$ yes | $-1.700$ yes |
+| $E^W_3, r_1$ | $n^W_3 \cdot (r_1 - o_3) \le 0$ | $-0.700$ yes | $-0.700$ yes |
+| $E^W_4, r_2$ | $n^W_4 \cdot (r_2 - o_4) \le 0$ | $-0.400$ yes | $+0.100$ **no** |
+
+At $q_a$ all seven hold: collision. At $q_b$ the obstacle's left edge $E^W_4$ (normal $(-1, 0)$,
+through $o_4 = (1, 1)$) separates the robot's vertex $r_2$ from the square by $0.1$: no collision, and
+that one line is the proof. The same check runs this test against Chapter 2's separating-axis box on
+$5{,}000$ seeded poses of random convex pairs — $470$ collisions among them — and finds no
+disagreement. The black box is now a verified box.
+
+### The star algorithm
+
+<Deferred>
+  <MinkowskiStudio />
+</Deferred>
+
+<Derivation title="Derivation 4 — The star algorithm computes QO(θ) = WO ⊖ R(0,0,θ) in linear time after sorting (App. F.3)" result="\QO(\theta) = \WO \ominus R(0, 0, \theta) = \operatorname{hull}\{\, o_j - r_i(\theta) \,\}">
+**Statement.** Negate the robot's edge normals; merge-sort them with the obstacle's by angle; scan
+the merged list once. Each time a negated robot normal $-n^R_i$ falls between adjacent obstacle
+normals, a Type A contact of $E^R_i$ with the vertex $o_j$ between those normals is applicable, and it
+contributes the vertices $o_j - r_i$ and $o_j - r_{i+1}$; each time an obstacle normal $n^W_j$ falls
+between adjacent negated robot normals, a Type B contact of $E^W_j$ with $r_i$ is applicable and
+contributes $o_j - r_i$ and $o_{j+1} - r_i$. The emitted points, in scan order, are the vertices of
+$\QO(\theta)$ counterclockwise, and $\QO(\theta)$ equals the Minkowski difference (eq. F.7)
+$\WO \ominus R = \{o - r : o \in \WO,\ r \in R\}$.
+
+**Step 1 — contacts persist along edges, and their extremes are vertices.** Fix an applicable Type A
+pair. Slide the robot so that $o_j$ stays on edge $E^R_i$: the configuration traces a segment of the
+boundary of $\QO(\theta)$. At one extreme $o_j$ coincides with $r_i$, at the other with $r_{i+1}$;
+the reference point is then at $o_j - r_i(0, 0, \theta)$ and $o_j - r_{i+1}(0, 0, \theta)$. These are
+two vertices of $\QO(\theta)$, and the edge between them is a translate of $E^R_i$ — with outward
+normal $-n^R_i$, since the robot is reflected through its reference point. Symmetrically a Type B
+pair gives the vertices $o_j - r_i$ and $o_{j+1} - r_i$, joined by a translate of $E^W_j$ with normal
+$n^W_j$.
+
+**Step 2 — angular order of normals is boundary order.** The boundary of a convex polygon, walked
+counterclockwise, has outward normals that rotate monotonically through $2\pi$. The boundary of
+$\QO(\theta)$ is made of translates of robot edges (normals $-n^R_i$) and obstacle edges (normals
+$n^W_j$), so walking it counterclockwise visits those edges in the angular order of
+$\{-n^R_i\} \cup \{n^W_j\}$. Merging the two already-sorted lists *is* that walk.
+
+**Step 3 — the merged scan visits every applicable pair exactly once.** Keep a current robot vertex
+$i$ and obstacle vertex $j$, starting from the pair extreme in the $+x$ direction. Consuming a robot
+entry means walking the (reflected) robot edge $E^R_i$ while $o_j$ stays put — a Type A contact — and
+advancing $i$; consuming an obstacle entry means walking $E^W_j$ while $r_i$ stays put — Type B — and
+advancing $j$. Each entry is consumed once, so each applicable contact is emitted once and the scan
+closes on its start after $n_R + n_W$ steps. Cost: $O((n_R + n_W)\log(n_R + n_W))$ for a general
+sort, $O(n_R + n_W)$ here because each list is already in order.
+
+**Step 4 — equality with the hull of all pairwise differences.** $\WO \ominus R = \WO \oplus (-R)$
+is a Minkowski sum of convex polygons, hence convex, and its extreme points are differences of
+extreme points, so it is the convex hull of the $n_R n_W$ points $o_j - r_i$. The star algorithm's
+vertices are among these points and its edges have the correct normals, so the two polygons coincide.
+That hull is `minkowskiBruteForce`, the oracle the check `star` holds the scan to on $500$ seeded
+convex pairs at random headings: identical polygons, worst area gap $2 \times 10^{-15}$.
+$\blacksquare$
+
+*The preset, worked.* Robot $(0, 0), (0.2, 0), (0, 0.2)$ at $\theta = 0$; obstacle $[1, 2]^2$. The
+merged list is $-n^R_3$ at $0°$, $n^W_1$ at $0°$, $-n^R_1$ at $90°$, $n^W_2$ at $90°$, $n^W_3$ at
+$180°$, $-n^R_2$ at $225°$, $n^W_4$ at $270°$ — seven entries, seven steps. The emitted points are
+$(2, 0.8), (2, 1), (2, 2), (1.8, 2), (0.8, 2), (0.8, 1), (1, 0.8)$; two of them, $(2, 1)$ and $(1.8,
+2)$, lie on edges because a robot edge is parallel to an obstacle edge, and dropping collinear
+vertices leaves the five the design doc names — $(1, 0.8), (2, 0.8), (2, 2), (0.8, 2), (0.8, 1)$ —
+with area $1 + 0.2 + 0.2 + 0.02 = \mathbf{1.42}$: the square, two strips, and the reflected triangle
+in the corner. Turn the robot to $\theta = 30°$ and no edges are parallel: **seven** vertices. The
+check `star` pins all of it.
+</Derivation>
+
+### $SE(2)$: the C-obstacle as stacked slices
+
+A polygon that also rotates has $\Q = SE(2)$, three-dimensional, and its C-obstacle is a solid. Choset's
+App. F.4 visualizes it the only honest way there is: fix $\theta$, compute the convex slice
+$\QO(\theta)$ by the star algorithm, and stack the slices along a vertical $\theta$-axis — his figure
+F.8, a triangle against a five-sided obstacle. The *stack* toggle of the Minkowski Studio does this
+with $24$ slices. Each slice is exact; the stack is a picture. The gap between two slices is the same
+honesty item as the arm's raster: a path that passes between $\theta_k$ and $\theta_{k+1}$ visits
+configurations no slice tested. Chapter 8's visibility graphs and Chapter 10's trapezoidal
+decomposition need exactly these polygonal slices, and import `se2Slices` for them.
+
+### GJK: distance as the distance from a Minkowski difference to the origin
+
+<Derivation title="Derivation 5 — GJK computes the distance between convex polytopes from support functions alone (App. F.5, Algorithm 23)" result="d(A, B) = \min_{z \in A \ominus B} \|z\|,\qquad h_{A \ominus B}(x) = h_A(x) + h_B(-x),\quad s_{A \ominus B}(x) = s_A(x) - s_B(-x)">
+**Statement.** $d(A, B) = \min_{a \in A, b \in B} \|a - b\| = \min_{z \in Z} \|z\|$ with
+$Z = A \ominus B$ (eqs. F.8–F.10); the minimizer $z^*$ is unique; and Gilbert, Johnson and Keerthi's
+iteration finds it using only the support value $h_Z(x) = \max_{z \in Z} z \cdot x$ and support point
+$s_Z(x)$ (F.11–F.12), which never require $Z$ to be built.
+
+**Step 1 — rewrite over the Minkowski difference.** Every $a - b$ is a point of $Z$ and every point
+of $Z$ is some $a - b$, so the two minima are the same number (F.10). The distance between two bodies
+is the distance from one convex set to the origin.
+
+**Step 2 — uniqueness.** $Z$ is convex (Derivation 4, Step 4) and $\|\cdot\|$ is a strictly convex
+function away from the origin, so $\arg\min_{z \in Z} \|z\|$ is a single point $z^*$. The witness pair
+$(a^*, b^*)$ with $a^* - b^* = z^*$ need *not* be unique — two parallel edges facing each other have a
+whole segment of nearest pairs — and Choset says so after F.10. Uniqueness is of the difference.
+
+**Step 3 — the simplex iteration.** Keep a working set $V_k$ of at most three points of $Z$ (a point,
+a segment or a triangle in the plane) and let $x_k$ be the point of $\operatorname{hull}(V_k)$
+nearest the origin. Ask $Z$ for its support point in direction $-x_k$: $z_k = s_Z(-x_k)$. If
+$h_Z(-x_k) = -\|x_k\|^2$ — no point of $Z$ projects farther toward the origin than $x_k$ itself —
+then $x_k = z^*$ and the iteration stops (Algorithm 23, step 4). Otherwise $z_k$ is strictly closer to
+the origin in the direction $-x_k$, so $\operatorname{hull}(V_k \cup \{z_k\})$ contains points nearer
+than $x_k$; keep the edge of the old simplex that contained $x_k$ plus $z_k$ (step 6) and repeat. The
+distance to the origin strictly decreases, the working set never revisits a vertex of $Z$ in exact
+arithmetic, and $Z$ has at most $n_A + n_B$ vertices, so the loop terminates in at most that many
+steps. If the origin lands inside the triangle, $d = 0$ and the bodies intersect.
+
+**Step 4 — support functions compose, so $Z$ is never built.** $h_{A \ominus B}(x) = \max\{(a - b)
+\cdot x\} = \max_a a \cdot x + \max_b b \cdot (-x) = h_A(x) + h_B(-x)$ (F.13), and if $a^*$, $b^*$
+attain those maxima then $s_{A \ominus B}(x) = a^* - b^*$ (F.14). For a polygon the support point is
+the vertex with the largest dot product — a scan of $n$ vertices — so one GJK step costs
+$O(n_A + n_B)$ and the whole query is linear with a tiny constant. $\blacksquare$
+
+*What the check pins.* `gjk` runs the two-dimensional iteration against Chapter 2's brute-force
+polygon distance on $500$ seeded convex pairs ($22$ of them intersecting): the distances agree to
+$4 \times 10^{-16}$, the witnesses realize the distance, the intersection verdict matches the
+separating-axis test, and no query needs more than $5$ iterations — well under the $n_A + n_B$ bound.
+
+*What `parry2d` adds.* The engine the Rust crate delegates to runs this same loop with a
+bounding-volume hierarchy to skip far pairs, EPA (expanding polytope algorithm) to recover the
+*penetration* depth when the origin is inside $Z$, and shape-casting — GJK along a motion — for the
+swept query of Chapter 2's `Collision::swept`. Choset's one-sentence extension to polyhedra is to
+start from four points and keep a face instead of an edge.
+</Derivation>
+
+### Reach's Jacobian and its singularities
+
+<Deferred>
+  <JacobianLens />
+</Deferred>
+
+Chapter 2 gave Reach's forward kinematics $\varphi : T^2 \to \mathbb{R}^2$,
+$\varphi(q) = (L_1\cos\theta_1 + L_2\cos(\theta_1 + \theta_2),\ L_1\sin\theta_1 + L_2\sin(\theta_1 +
+\theta_2))$. Choset's §3.8 asks how velocities transform: as the arm moves, $\dot x = \tfrac{\partial
+\varphi}{\partial q}\dot q = J(q)\dot q$, where $J$ is the Jacobian of $\varphi$, also called its
+differential $D\varphi$ — the linear map that Chapter 5 will show is independent of the chart.
+
+<KeyIdea title="Definition (Choset §3.8) — singular configuration">
+A configuration $q$ is **singular** when $J(q)$ loses rank. At such a $q$ the $n$-dimensional set of
+joint velocities $\dot q$ maps to a lower-dimensional set of end-point velocities $\dot x$:
+instantaneous end-point motion is impossible in some direction.
+</KeyIdea>
+
+<Derivation title="Derivation 6 — Reach's Jacobian, det J = L₁L₂ sin θ₂, and Example 3.8.1 (Choset §3.8)" result="J(q) = \begin{bmatrix} -L_1\sin\theta_1 - L_2\sin(\theta_1+\theta_2) & -L_2\sin(\theta_1+\theta_2) \\ L_1\cos\theta_1 + L_2\cos(\theta_1+\theta_2) & L_2\cos(\theta_1+\theta_2)\end{bmatrix},\quad \det J = L_1 L_2 \sin\theta_2">
+**Statement.** The matrix above is $\partial\varphi/\partial q$; its determinant is
+$L_1 L_2 \sin\theta_2$; the arm is singular exactly when $\sin\theta_2 = 0$ — straight or folded.
+Choset's numbers: $L_1 = L_2 = 1$, $q = (\pi/4, \pi/2)$, $\dot q = (1, 0)^{\mathsf T}$ give
+$J = \begin{bmatrix} -\sqrt2 & -\sqrt2/2 \\ 0 & -\sqrt2/2 \end{bmatrix}$, $\det J = 1$, and
+$\dot x = (-\sqrt2, 0)^{\mathsf T}$.
+
+**Step 1 — differentiate entrywise.** $\partial\varphi_1/\partial\theta_1 = -L_1\sin\theta_1 -
+L_2\sin(\theta_1 + \theta_2)$; $\partial\varphi_1/\partial\theta_2 = -L_2\sin(\theta_1 + \theta_2)$;
+$\partial\varphi_2/\partial\theta_1 = L_1\cos\theta_1 + L_2\cos(\theta_1 + \theta_2)$;
+$\partial\varphi_2/\partial\theta_2 = L_2\cos(\theta_1 + \theta_2)$. Read the columns: column $i$ is
+the tip velocity when joint $i$ alone turns at unit rate — every link beyond joint $i$ swings about
+it, so the column is the sum over those links of $L_k$ times the link's heading rotated by $90°$. That
+sentence is the implementation of `jacobian`, and it serves any number of links.
+
+**Step 2 — the determinant.** Write $s_1 = \sin\theta_1$, $c_1 = \cos\theta_1$, $s_{12} =
+\sin(\theta_1 + \theta_2)$, $c_{12} = \cos(\theta_1 + \theta_2)$. Then
+$\det J = (-L_1 s_1 - L_2 s_{12})(L_2 c_{12}) - (-L_2 s_{12})(L_1 c_1 + L_2 c_{12}) = -L_1 L_2 s_1
+c_{12} + L_1 L_2 s_{12} c_1 = L_1 L_2 \sin((\theta_1 + \theta_2) - \theta_1) = L_1 L_2 \sin\theta_2$
+by the sine difference identity.
+
+**Step 3 — what rank loss means.** At $\sin\theta_2 = 0$ the two columns are parallel (both are
+multiples of $(-\sin\theta_1, \cos\theta_1)$ when the arm is straight), so the image of
+$\dot q \mapsto J\dot q$ is a line perpendicular to the arm. Motion *along* the arm is instantaneously
+impossible — the tip is at the edge of the annulus and can only move tangentially. The arm has not
+broken; one direction is unavailable, and a planner that asks for it asks for $\dot q = J^{-1}\dot x$
+with $\det J \to 0$: infinite joint speed. Chapters 17–18 meet this as a velocity limit that goes to
+zero; Chapter 21 as a rank condition.
+
+**Step 4 — Choset's numbers.** At $q = (\pi/4, \pi/2)$: $\theta_1 + \theta_2 = 3\pi/4$, $s_1 = c_1 =
+\sqrt2/2$, $s_{12} = \sqrt2/2$, $c_{12} = -\sqrt2/2$. So $J_{11} = -\sqrt2/2 - \sqrt2/2 = -\sqrt2$,
+$J_{12} = -\sqrt2/2$, $J_{21} = \sqrt2/2 - \sqrt2/2 = 0$, $J_{22} = -\sqrt2/2$; $\det J = \sin(\pi/2)
+= 1$; and $J (1, 0)^{\mathsf T} = (-\sqrt2, 0)^{\mathsf T} = (-1.4142, 0)$ — the tip, at
+$(0, \sqrt2)$, moves straight left when the shoulder alone turns, as his figure 3.21 draws. The check
+`jacobian` asserts the four entries, the determinant and $\dot x$ to $10^{-12}$, and holds `jacobian`
+to central differences of `Reach::fk` on $300$ seeded arms to $10^{-7}$. $\blacksquare$
+
+*The velocity ellipse.* The Jacobian Lens maps the unit circle of joint velocities through $J$: an
+ellipse with semi-axes the singular values $\sigma_1 \ge \sigma_2$ of $J$ and area $\pi\sigma_1\sigma_2
+= \pi|\det J|$ — Yoshikawa's manipulability. At $\theta_2 = 10°$ (any $\theta_1$, any $L_1 = L_2 =
+1$): $\sigma_1\sigma_2 = \sin 10° = 0.1736$, $\sigma_1^2 + \sigma_2^2 = \|J\|_F^2 = 3 + 2\cos 10° =
+4.9696$, so $\sigma_1 = 2.228$, $\sigma_2 = 0.078$ and the ellipse is **28.6** times longer than it is
+wide; at $\theta_2 = 0$ it is a segment. Exercise 4 asks for this number before the widget shows it.
+
+*Example 3.8.2, the polygon.* A point fixed at $r = (r_1, r_2)$ on a body with configuration
+$q = (q_1, q_2, q_3) \in \mathbb{R}^2 \times S^1$ sits at $x = (q_1, q_2) + R(q_3)\, r$, with Jacobian
+$$
+J(q) = \begin{bmatrix} 1 & 0 & -r_1 \sin q_3 - r_2 \cos q_3 \\ 0 & 1 & \;\;\, r_1 \cos q_3 - r_2 \sin q_3 \end{bmatrix},
+$$
+a $2 \times 3$ matrix of rank $2$ *always*: a rigid body in the plane has no singular configurations,
+and $\varphi^{-1}$ is one-to-many because $\dim \Q > \dim M$. The third column is the lever arm
+rotated by $90°$, the velocity of the point under pure rotation. `bodyPointJacobian` implements it and
+the same check differences `bodyPointFk` against it.
+
+*$J^{\mathsf T}$ is the force map.* Power is coordinate-free: $\tau \cdot \dot q = f \cdot \dot x =
+f \cdot J\dot q$ for every $\dot q$, so $\tau = J^{\mathsf T} f$. The widget's $J^{\mathsf T}$ toggle
+shows a unit tip force becoming joint torques; Chapter 7 lifts workspace potentials through this map
+and Chapter 17 makes it dynamics.
+</Derivation>
+
+## The algorithm
+
+Four algorithms, each exact for the bodies it covers, in the order the chapter met them. Choset
+numbers only the last; the others are App. F.2, F.3 and §3.2.2 written as procedures.
+
+<Algorithm
+  name="RASTERIZE-C-OBSTACLE (Choset §3.2.2, the pixel method)"
+  inputs="a Collision checker for the robot in its scene; a 2-D chart of Q with n₁ × n₂ cell centers q(i, j) and a flag per axis saying whether it wraps"
+  outputs="a BitGrid: cell (i, j) set iff q(i, j) ∈ QO; its connected components on the torus"
+  complexity="O(n₁ n₂) collision queries — 129,600 at 1° on T²"
+>
+1. for $i = 0 \dots n_1 - 1$, $j = 0 \dots n_2 - 1$ do
+2. &nbsp;&nbsp;&nbsp;&nbsp;$\mathrm{grid}[i, j] \leftarrow \neg\,\mathrm{isFree}(q(i, j))$ &nbsp;&nbsp;— one query per cell center; the checker decides what "the robot" is
+3. components $\leftarrow$ flood fill over 4-neighbors, wrapping across the seams the chart marks periodic &nbsp;&nbsp;— connectivity measured, not assumed
+4. return grid, components &nbsp;&nbsp;— a free cell is a free *point*: thicken the footprint by the cell's reach if free cells must certify paths between them
+</Algorithm>
+
+<Algorithm
+  name="POLYGON-INTERSECTS (Choset App. F.2)"
+  inputs="convex robot R (vertices r_i CCW, normals n^R_i), configuration q = (x, y, θ), convex obstacle W (vertices o_j, normals n^W_j)"
+  outputs="true iff R(q) ∩ W ≠ ∅"
+  complexity="O(n_R n_W) as written; O(n_R + n_W) with the normals merged as in STAR"
+>
+1. for each robot edge $E^R_i$ and obstacle vertex $o_j$: if $(o_{j-1} - o_j) \cdot n^R_i(\theta) \ge 0$ and $(o_{j+1} - o_j) \cdot n^R_i(\theta) \ge 0$ &nbsp;&nbsp;— applicable Type A (F.3)
+2. &nbsp;&nbsp;&nbsp;&nbsp;if $n^R_i(\theta) \cdot (o_j - r_i(q)) > 0$ return **false** &nbsp;&nbsp;— one violated half-plane (F.4) separates the bodies
+3. for each obstacle edge $E^W_j$ and robot vertex $r_i$: if $(r_{i-1} - r_i) \cdot n^W_j \ge 0$ and $(r_{i+1} - r_i) \cdot n^W_j \ge 0$ &nbsp;&nbsp;— applicable Type B (F.5)
+4. &nbsp;&nbsp;&nbsp;&nbsp;if $n^W_j \cdot (r_i(q) - o_j) > 0$ return **false** &nbsp;&nbsp;— (F.6)
+5. return **true** &nbsp;&nbsp;— every applicable inequality holds: $q \in \QO(\theta)$ (Derivation 3)
+</Algorithm>
+
+<Algorithm
+  name="STAR (Choset App. F.3): QO(θ) = WO ⊖ R(0, 0, θ)"
+  inputs="convex robot R with reference point at the origin, heading θ, convex obstacle W, both CCW"
+  outputs="the vertices of QO(θ) counterclockwise, each tagged with the contact that produced it"
+  complexity="O((n_R + n_W) log(n_R + n_W)); O(n_R + n_W) since each list is already sorted"
+>
+1. rotate $R$ by $\theta$; compute normals $n^R_i(\theta)$, $n^W_j$
+2. $L_R \leftarrow$ the angles of $-n^R_i$; $L_W \leftarrow$ the angles of $n^W_j$; each cyclically sorted — rotate so each starts at its smallest angle
+3. merge $L_R$ and $L_W$ by angle into one list of $n_R + n_W$ entries
+4. $i \leftarrow$ the robot edge first in $L_R$, $j \leftarrow$ the obstacle edge first in $L_W$; emit $o_j - r_i$ &nbsp;&nbsp;— the pair extreme in $+x$
+5. for each entry of the merged list, in order:
+6. &nbsp;&nbsp;&nbsp;&nbsp;if it is robot edge $i$: $i \leftarrow i + 1$; emit $o_j - r_i$ &nbsp;&nbsp;— Type A: $E^R_i$ slid along $o_j$ (Derivation 4, Step 1)
+7. &nbsp;&nbsp;&nbsp;&nbsp;else it is obstacle edge $j$: $j \leftarrow j + 1$; emit $o_j - r_i$ &nbsp;&nbsp;— Type B: $E^W_j$ slid along $r_i$
+8. drop the closing duplicate and any collinear vertex; return the list &nbsp;&nbsp;— equals $\operatorname{hull}\{o_j - r_i\}$, the brute-force oracle
+</Algorithm>
+
+<Algorithm
+  name="GJK (Choset Algorithm 23) on Z = A ⊖ B"
+  inputs="convex polygons A, B through their support functions h, s; a tolerance"
+  outputs="d(A, B) = min_{z ∈ Z} ‖z‖, the unique minimizer z*, and a witness pair (a*, b*)"
+  complexity="each step O(n_A + n_B); at most n_A + n_B steps in exact arithmetic — 5 on the chapter's 500 random pairs"
+>
+1. $V_0 \leftarrow \{s_Z(d_0)\}$ for any direction $d_0$ &nbsp;&nbsp;— Choset seeds with three vertices of $Z$; one support point works equally and never needs $Z$ listed
+2. $k \leftarrow 0$
+3. $x_k \leftarrow \arg\min_{x \in \operatorname{hull}(V_k)} \|x\|$ &nbsp;&nbsp;— nearest point of a point, segment or triangle; if the origin is inside the triangle return $d = 0$
+4. if $\|x_k\|^2 = h_Z(-x_k) \cdot (-1)$, i.e. $h_Z(-x_k) = -\|x_k\|^2$ (within tolerance): return $\|x_k\|$ with the witnesses from $x_k$'s barycentric weights
+5. $z_k \leftarrow s_Z(-x_k) = s_A(-x_k) - s_B(x_k)$ &nbsp;&nbsp;— (F.14); the point of $Z$ farthest toward the origin
+6. $V_{k+1} \leftarrow$ the edge (or point) of $\operatorname{hull}(V_k)$ containing $x_k$, plus $z_k$
+7. $k \leftarrow k + 1$; go to 3
+</Algorithm>
+
+Line 4 of GJK is the step worth a sentence. $h_Z(-x_k) = \max_z z \cdot (-x_k)$; if that maximum is
+attained at $x_k$ itself the value is $-\|x_k\|^2$, and no point of $Z$ lies on the origin's side of
+the supporting line through $x_k$ perpendicular to $x_k$. That line is a certificate — the same kind
+of certificate as the single violated half-plane in POLYGON-INTERSECTS, and the same geometry: a
+supporting half-plane of a convex set.
+
+## Implementation in Rust
+
+**Crates.** `nalgebra` 0.35 for `Point2`, `Vector2`, `Matrix2`, `Isometry2`; `parry2d` 0.30 as
+`parry2d-f64`, still the black box for GJK/EPA and shape-casting, now *explained*; `collide` and
+`robots` from Chapter 2; `rand` 0.9 `SmallRng` for seeded polygon fields; `proptest` as a dev
+dependency for the star-versus-brute-force property test; `k` and `urdf-rs` as **test-only**
+dependencies that load a URDF of Reach and cross-check `jacobian()`.
+
+```text
+crates/cspace/
+  src/lib.rs
+  src/polygon.rs      # App. F.1: CCW convex polygons, half-planes, normals derived never stored
+  src/contact.rs      # App. F.2: applicable contacts, the half-plane test, the F.7 table
+  src/star.rs         # App. F.3–F.4: star algorithm, brute-force oracle, inflate_disc, se2_slices
+  src/raster.rs       # §3.2.2: FootprintAt<Q>, TorusGrid, BitGrid, rasterize_cobstacle
+  src/jacobian.rs     # §3.8: jacobian, det_jacobian, body_point_jacobian
+  examples/reach_square.rs      # the micro-example, printed
+  examples/workbench_map.rs     # the integration lab
+  tests/{star_vs_brute.rs, jacobian_vs_k.rs, contact_table_f7.rs, black_box_agrees.rs}
+web/lib/cspace/{polygon,star,gjk,raster,jacobian,examples}.ts   # the port the widgets run
+```
+
+### Polygons and contacts
+
+The polygon type enforces the one convention everything depends on — counterclockwise, convex — in
+its constructor, and derives normals on demand so they can never go stale after a transform.
+
+```rust title="crates/cspace/src/polygon.rs" {9-17,27-33}
+use nalgebra::{Point2, Vector2};
+use geom::Pose2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotConvexOrNotCcw;
+
+/// A convex polygon as Choset's App. F.1 writes it: an intersection of negative
+/// half-planes, stored as its counterclockwise vertex list. Edge i runs r_i → r_{i+1}.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Polygon { verts: Vec<Point2<f64>> }
+
+impl Polygon {
+    /// The only constructor. Rejecting clockwise or nonconvex input here means no
+    /// function below ever has to re-check the winding it relies on.
+    pub fn new_ccw(verts: Vec<Point2<f64>>) -> Result<Self, NotConvexOrNotCcw> {
+        if verts.len() < 3 || signed_area(&verts) <= 0.0 || !is_convex(&verts) {
+            return Err(NotConvexOrNotCcw);
+        }
+        Ok(Polygon { verts })
+    }
+    pub fn len(&self) -> usize { self.verts.len() }
+    pub fn vertex(&self, i: usize) -> Point2<f64> { self.verts[i % self.verts.len()] }
+
+    /// Outward unit normal of edge i: the edge direction rotated clockwise by 90°.
+    /// Derived, never stored — a stored normal is stale after the next `transformed`.
+    pub fn edge_normal(&self, i: usize) -> Vector2<f64> {
+        let e = self.vertex(i + 1) - self.vertex(i);
+        Vector2::new(e.y, -e.x).normalize()
+    }
+
+    /// h_i(x, y) = n_i · ((x, y) − r_i): negative inside, by the F.1 convention.
+    pub fn half_plane(&self, i: usize, p: &Point2<f64>) -> f64 {
+        self.edge_normal(i).dot(&(p - self.vertex(i)))
+    }
+
+    /// r_i(x, y, θ) = R(θ) r_i + (x, y): the robot's vertices at configuration q.
+    pub fn transformed(&self, pose: &Pose2) -> Polygon {
+        Polygon { verts: self.verts.iter().map(|v| pose.act(v)).collect() }
+    }
+}
+```
+
+The contact test is written out so the reader sees the box's insides: applicability first (F.3, F.5),
+then one half-plane value per applicable pair (F.4, F.6). It is $O(n_R n_W)$ and makes no attempt to
+be fast; its job is to make `parry2d`'s answer a *verified* answer.
+
+```rust title="crates/cspace/src/contact.rs" {12-24,38-46}
+use super::polygon::Polygon;
+use geom::Pose2;
+
+/// The two ways convex bodies touch without overlapping (Choset F.2, figure F.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactKind {
+    /// Robot edge E^R_i contains obstacle vertex o_j.
+    TypeA { robot_edge: usize, obs_vertex: usize },
+    /// Obstacle edge E^W_j contains robot vertex r_i.
+    TypeB { obs_edge: usize, robot_vertex: usize },
+}
+
+/// Eqs. F.3 and F.5. Only θ enters: the robot's normals rotate with it, its position does not.
+pub fn applicable_contacts(robot: &Polygon, theta: f64, obs: &Polygon) -> Vec<ContactKind> {
+    let r = robot.transformed(&Pose2::new(0.0, 0.0, theta));
+    let mut out = Vec::new();
+    for i in 0..r.len() {
+        let n = r.edge_normal(i);
+        for j in 0..obs.len() {
+            let (o, prev, next) = (obs.vertex(j), obs.vertex(j + obs.len() - 1), obs.vertex(j + 1));
+            // Both obstacle edges leaving o_j point along or away from the robot normal:
+            // −n^R_i lies between the normals of the edges adjacent to o_j.
+            if (prev - o).dot(&n) >= 0.0 && (next - o).dot(&n) >= 0.0 {
+                out.push(ContactKind::TypeA { robot_edge: i, obs_vertex: j });
+            }
+        }
+    }
+    for j in 0..obs.len() {
+        let n = obs.edge_normal(j);
+        for i in 0..r.len() {
+            let (v, prev, next) = (r.vertex(i), r.vertex(i + r.len() - 1), r.vertex(i + 1));
+            if (prev - v).dot(&n) >= 0.0 && (next - v).dot(&n) >= 0.0 {
+                out.push(ContactKind::TypeB { obs_edge: j, robot_vertex: i });
+            }
+        }
+    }
+    out
+}
+
+/// f^R_ij(q) = n^R_i(θ) · (o_j − r_i(q))  or  f^W_ij(q) = n^W_j · (r_i(q) − o_j)   (F.4, F.6).
+pub fn contact_value(c: ContactKind, robot: &Polygon, q: &Pose2, obs: &Polygon) -> f64 {
+    let r = robot.transformed(q);
+    match c {
+        ContactKind::TypeA { robot_edge: i, obs_vertex: j } => r.edge_normal(i).dot(&(obs.vertex(j) - r.vertex(i))),
+        ContactKind::TypeB { obs_edge: j, robot_vertex: i } => obs.edge_normal(j).dot(&(r.vertex(i) - obs.vertex(j))),
+    }
+}
+
+/// App. F.2: q ∈ QO(θ) iff every applicable half-plane constraint holds. One violation
+/// is a certificate of separation — the supporting line that keeps the bodies apart.
+pub fn polygon_intersects(robot: &Polygon, q: &Pose2, obs: &Polygon) -> bool {
+    applicable_contacts(robot, q.theta, obs)
+        .into_iter()
+        .all(|c| contact_value(c, robot, q, obs) <= 0.0)
+}
+```
+
+### The star algorithm, and its oracle
+
+This is the chapter's owned artifact — Chapters 8 and 10 import it and never reimplement it — so it
+is written to be checked, not merely used. Every emitted vertex carries the contact that produced
+it, and the brute-force hull sits beside it in the same file.
+
+```rust title="crates/cspace/src/star.rs" {24-33,44-61}
+use nalgebra::{Point2, Vector2};
+use super::polygon::{convex_hull, Polygon};
+use geom::Pose2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source { Robot, Obstacle }
+
+/// One entry of the merged normal list: whose edge, which edge, at what angle in [0, 2π).
+#[derive(Debug, Clone, Copy)]
+struct Normal { source: Source, edge: usize, angle: f64 }
+
+fn angle_of(v: Vector2<f64>) -> f64 {
+    let a = v.y.atan2(v.x);
+    if a < 0.0 { a + std::f64::consts::TAU } else { a }
+}
+
+/// Cyclic rotation so a monotone-but-wrapped list starts at its smallest angle.
+fn start_at_min(mut list: Vec<Normal>) -> Vec<Normal> {
+    let k = (0..list.len()).min_by(|&a, &b| list[a].angle.total_cmp(&list[b].angle)).unwrap_or(0);
+    list.rotate_left(k);
+    list
+}
+
+/// QO(θ) = WO ⊖ R(0, 0, θ) by Choset's star algorithm (App. F.3).
+///
+/// WO ⊖ R = WO ⊕ (−R), and the boundary of a Minkowski sum of convex polygons is
+/// made of both bodies' edges in order of outward normal. −R's normals are R's
+/// negated, so: negate, merge by angle, walk the merged list. Consuming a robot
+/// entry slides E^R_i along the current obstacle vertex (Type A) and advances i;
+/// consuming an obstacle entry slides E^W_j along the current robot vertex (Type B)
+/// and advances j. Both lists are already sorted, so this is one merge: O(n_R + n_W).
+pub fn star_algorithm(robot: &Polygon, theta: f64, obs: &Polygon) -> Polygon {
+    let r = robot.transformed(&Pose2::new(0.0, 0.0, theta));
+    let rs = start_at_min((0..r.len()).map(|i| Normal { source: Source::Robot, edge: i, angle: angle_of(-r.edge_normal(i)) }).collect());
+    let os = start_at_min((0..obs.len()).map(|j| Normal { source: Source::Obstacle, edge: j, angle: angle_of(obs.edge_normal(j)) }).collect());
+
+    // The merge.
+    let mut merged = Vec::with_capacity(rs.len() + os.len());
+    let (mut a, mut b) = (0, 0);
+    while a < rs.len() || b < os.len() {
+        if b >= os.len() || (a < rs.len() && rs[a].angle <= os[b].angle) { merged.push(rs[a]); a += 1; }
+        else { merged.push(os[b]); b += 1; }
+    }
+
+    // The scan. (i, j) start at the vertex pair extreme in +x; o_j − r_i is a vertex of QO(θ).
+    let (mut i, mut j) = (rs[0].edge, os[0].edge);
+    let diff = |j: usize, i: usize| Point2::from(obs.vertex(j) - r.vertex(i).coords);
+    let mut verts = vec![diff(j, i)];
+    for e in &merged {
+        match e.source {
+            // Type A: E^R_i slides along o_j, from o_j − r_i to o_j − r_{i+1}.
+            Source::Robot => { i = (e.edge + 1) % r.len(); verts.push(diff(j, i)); }
+            // Type B: E^W_j slides along r_i, from o_j − r_i to o_{j+1} − r_i.
+            Source::Obstacle => { j = (e.edge + 1) % obs.len(); verts.push(diff(j, i)); }
+        }
+    }
+    verts.pop(); // the scan closes on its start
+    Polygon::new_ccw(remove_collinear(verts)).expect("the merge-scan of convex inputs is convex and CCW")
+}
+
+/// Eq. F.7 read literally: the convex hull of all n_R · n_W pairwise differences o_j − r_i.
+/// O(n_R n_W log) — wasteful in a planner, exactly right as the oracle `star_algorithm` must equal.
+pub fn minkowski_bruteforce(robot: &Polygon, theta: f64, obs: &Polygon) -> Polygon {
+    let r = robot.transformed(&Pose2::new(0.0, 0.0, theta));
+    let pts: Vec<Point2<f64>> = (0..obs.len()).flat_map(|j| (0..r.len()).map(move |i| (j, i)))
+        .map(|(j, i)| Point2::from(obs.vertex(j) - r.vertex(i).coords)).collect();
+    convex_hull(&pts)
+}
+
+/// §3.2.1: WO ⊕ B_r for a convex polygon — edges offset by r, vertices replaced by arcs.
+pub fn inflate_disc(obs: &Polygon, r: f64, arc_segments: usize) -> Polygon { /* as in the TypeScript port */ }
+
+/// App. F.4: QO ⊂ SE(2) as n_θ exact slices QO(θ_k). The stack is a picture; each slice is a theorem.
+pub fn se2_slices(robot: &Polygon, obs: &Polygon, n_theta: usize) -> Vec<(f64, Polygon)> {
+    (0..n_theta).map(|k| {
+        let theta = -std::f64::consts::PI + std::f64::consts::TAU * k as f64 / n_theta as f64;
+        (theta, star_algorithm(robot, theta, obs))
+    }).collect()
+}
+```
+
+### The rasterizer: any footprint, any chart
+
+Choset's pixel method, generic over the configuration type. The rasterizer never learns what an arm
+is; it asks a `Collision` checker one question per cell. `thicken` is his §3.2.2 footnote made a
+parameter — zero for the micro-example's exact segments, the capsule radius for the Workbench.
+
+```rust title="crates/cspace/src/raster.rs" {4-7,30-42}
+use collide::{Collision, Footprint};
+
+/// Any robot that can produce a footprint from a chart point. Reach<2> implements it
+/// over T2; a disc over R2; nothing in this file knows which.
+pub trait FootprintAt<Q> {
+    fn footprint_at(&self, q: &Q) -> Footprint;
+}
+
+/// Cells centered on a uniform grid of [−π, π)²: with n = 360 the centers sit at integer
+/// degrees, which is what makes "29 cells in the θ₁ = 0° row" a statement about this grid.
+pub struct TorusGrid { pub n1: usize, pub n2: usize }
+
+impl TorusGrid {
+    pub fn point(&self, i: usize, j: usize) -> T2 {
+        T2::new(-PI + i as f64 * TAU / self.n1 as f64, -PI + j as f64 * TAU / self.n2 as f64)
+    }
+}
+
+/// One bit per cell: set iff the cell's configuration is in QO.
+pub struct BitGrid { pub n1: usize, pub n2: usize, bits: Vec<u64> }
+
+impl BitGrid {
+    pub fn get(&self, i: usize, j: usize) -> bool { let k = i * self.n2 + j; self.bits[k / 64] >> (k % 64) & 1 == 1 }
+    pub fn row_count(&self, i: usize) -> usize { (0..self.n2).filter(|&j| self.get(i, j)).count() }
+    /// 4-connected components of the occupied (or free) cells with both seams identified:
+    /// connectivity *measured* before Chapter 5 states what the torus is.
+    pub fn components_torus(&self, occupied: bool) -> usize { /* flood fill, wrapping both axes */ }
+}
+
+/// Choset's pixel method. A free cell is a free *point*, not a free square: `thicken` > 0
+/// inflates the footprint so a free cell certifies a free neighborhood. Conservative —
+/// the planner is then resolution complete, never complete (his footnote 3, p. 47).
+pub fn rasterize_cobstacle<Q>(
+    robot: &dyn FootprintAt<Q>, scene: &dyn Collision, grid: &TorusGrid,
+    chart: impl Fn(usize, usize) -> Q, thicken: f64,
+) -> BitGrid {
+    let mut out = BitGrid::new(grid.n1, grid.n2);
+    for i in 0..grid.n1 {
+        for j in 0..grid.n2 {
+            let fp = robot.footprint_at(&chart(i, j)).thickened(thicken);
+            if scene.intersects(&fp) { out.set(i, j); }
+        }
+    }
+    out
+}
+```
+
+### The Jacobian
+
+```rust title="crates/cspace/src/jacobian.rs" {7-18}
+use nalgebra::{Matrix2, Matrix2x3, Vector2};
+use robots::{Reach, T2};
+
+/// J(q) = ∂φ/∂q for the 2R arm (Choset Example 3.8.1). Column i is the tip velocity when
+/// joint i alone turns at unit rate: every link beyond joint i swings about it, so the
+/// column is Σ_{k ≥ i} L_k · (heading of link k rotated by 90°).
+pub fn jacobian(reach: &Reach<2>, q: &T2) -> Matrix2<f64> {
+    let [l1, l2] = reach.lengths;
+    let (s1, c1) = q.th1().sin_cos();
+    let (s12, c12) = (q.th1() + q.th2()).sin_cos();
+    Matrix2::new(
+        -l1 * s1 - l2 * s12, -l2 * s12,
+         l1 * c1 + l2 * c12,  l2 * c12,
+    )
+}
+
+/// det J = L₁ L₂ sin θ₂ — computed from the matrix; the identity is a test, not an assumption.
+pub fn det_jacobian(reach: &Reach<2>, q: &T2) -> f64 { jacobian(reach, q).determinant() }
+
+/// Singular iff J loses rank: for 2R, sin θ₂ = 0 — arm straight or folded.
+pub fn is_singular(reach: &Reach<2>, q: &T2, tol: f64) -> bool { det_jacobian(reach, q).abs() <= tol }
+
+/// Example 3.8.2: a point r on a planar rigid body. Rank 2 always — never singular.
+pub fn body_point_jacobian(r: Vector2<f64>, q3: f64) -> Matrix2x3<f64> {
+    let (s, c) = q3.sin_cos();
+    Matrix2x3::new(1.0, 0.0, -r.x * s - r.y * c,
+                   0.0, 1.0,  r.x * c - r.y * s)
+}
+```
+
+### The worked example as a program
+
+```rust title="crates/cspace/examples/reach_square.rs"
+use collide::Scene;
+use cspace::{jacobian, rasterize_cobstacle, TorusGrid};
+use nalgebra::{Point2, Vector2};
+use robots::{Reach, T2};
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
+
+fn main() {
+    let arm = Reach::<2>::choset();                       // L₁ = L₂ = 1, link_radius = 0
+    let scene = Scene::empty().with_rect("the square", 1.4, -0.1, 1.6, 0.1);
+    let verdict = |q: T2| if scene.intersects(&arm.footprint_at(&q)) { "collision" } else { "free" };
+
+    let deg = |d: f64| d.to_radians();
+    println!("q=(0°,0°) {}   q=(0°,13°) {}   q=(0°,15°) {}", verdict(T2::new(0.0, 0.0)), verdict(T2::new(0.0, deg(13.0))), verdict(T2::new(0.0, deg(15.0))));
+    let tip = arm.fk(&T2::new(FRAC_PI_4, -FRAC_PI_2)).tip();
+    println!("q=(45°,-90°) {} (tip ({:.4}, {:.4}) inside)   q=(90°,*) {} (nearest {:.3} > L2)",
+        verdict(T2::new(FRAC_PI_4, -FRAC_PI_2)), tip.x, tip.y, verdict(T2::new(FRAC_PI_2, 1.0)), (1.4f64.powi(2) + 0.9f64.powi(2)).sqrt());
+
+    let grid = TorusGrid { n1: 360, n2: 360 };            // cells centered at integer degrees
+    let bits = rasterize_cobstacle(&arm, &scene, &grid, |i, j| grid.point(i, j), 0.0);
+    let half = (0.1f64 / 0.4).atan();
+    println!("slice θ1=0°: {} occupied cells; analytic half-width atan(1/4) = {:.4} rad = {:.2}°", bits.row_count(180), half, half.to_degrees());
+    let rows: Vec<i64> = (0..360).filter(|&i| bits.row_count(i) > 0).map(|i| i as i64 - 180).collect();
+    println!("θ1 extent: rows 0..±{}° occupied, ±{}° empty; analytic bound {:.3} rad = {:.1}°", rows.iter().max().unwrap(), rows.iter().max().unwrap() + 1, cspace::THETA1_EXTENT, cspace::THETA1_EXTENT.to_degrees());
+    println!("occupied: {} of {} cells ({:.2} %)", bits.count(), 360 * 360, 100.0 * bits.count() as f64 / 129_600.0);
+    println!("components on T²: {} ({})", bits.components_torus(true), if bits.touches_seam() { "wraps" } else { "does not wrap" });
+
+    let q = T2::new(FRAC_PI_4, FRAC_PI_2);
+    let j = jacobian(&arm, &q);
+    let xdot = j * Vector2::new(1.0, 0.0);
+    println!("Jacobian at (45°,90°): [[{:.4}, {:.4}],[{:.0}, {:.4}]]  det = {:.4}  J·(1,0) = ({:.4}, {:.0})", j[(0,0)], j[(0,1)], j[(1,0)], j[(1,1)], j.determinant(), xdot.x, xdot.y);
+}
+```
+
+```text title="cargo run -p cspace --example reach_square"
+q=(0°,0°) collision   q=(0°,13°) collision   q=(0°,15°) free
+q=(45°,-90°) collision (tip (1.4142, 0.0000) inside)   q=(90°,*) free (nearest 1.664 > L2)
+slice θ1=0°: 29 occupied cells; analytic half-width atan(1/4) = 0.2450 rad = 14.04°
+θ1 extent: rows 0..±49° occupied, ±50° empty; analytic bound 0.864 rad = 49.5°
+occupied: 2015 of 129600 cells (1.55 %)
+components on T²: 1 (does not wrap)
+Jacobian at (45°,90°): [[-1.4142, -0.7071],[0, -0.7071]]  det = 1.0000  J·(1,0) = (-1.4142, 0)
+```
+
+The tests beside the example are the chapter's contract. `reach_square_samples` asserts the five
+hand-checked cells; `slice_row_count_is_29` and `extent_rows` assert the raster counts;
+`slice_halfwidth_analytic` bisects the exact segment test along $\theta_1 = 0$ and asserts
+$\arctan\tfrac14$ to $10^{-9}$; `jacobian_matches_choset_example` asserts $J$, $\det J = 1$ and
+$\dot x = (-\sqrt2, 0)$ to $10^{-12}$; `jacobian_is_fk_derivative` checks central differences of
+`Reach::fk`; `jacobian_vs_k` loads `reach.urdf` through the `k` crate and asserts agreement at
+$1{,}000$ seeded $q$ to $10^{-9}$; `star_equals_bruteforce` is a `proptest` over $500$ seeded convex
+pairs and headings; `star_triangle_square` asserts the five vertices and area $1.42$; `inflate_area`
+asserts $3.7854$; `contact_table_f7` reproduces the two seven-row tables above; and
+`black_box_agrees` asserts `Scene::intersects` — `parry2d`'s GJK — equals `polygon_intersects` on
+$10{,}000$ seeded poses. The TypeScript port in `web/lib/cspace/` runs the same seventeen checks;
+every widget on this page is that port, and every number printed above was produced by it.
+
+<Callout type="info">
+The web port hand-rolls GJK (`gjk.ts`) because the browser has no `parry2d`; the Rust crate does
+not, because it has. Both are held to the same brute-force polygon distance. That is the division of
+labor this book keeps throughout: geometry engines are *delegated and explained*, planners are
+*written*. The `cspace` crate is the explanation.
+</Callout>
+
+## Putting it together: a Workbench whose free space is in two pieces
+
+The integration lab asks one question of the full Workbench: is Reach's free space connected? Load the
+*lab* preset of the C-Space Morph. It takes the Workbench of Chapter 2 — block, post, shelf — with the
+block slid toward the base to $(0.75, 0.35)$ so that link 1 can reach it, and adds a **clamp**, a
+$0.3$ m square at $(-0.55, 0.55)$ on the far side of the base. The arm has its $3$ cm capsule links,
+and the raster runs at $1°$ in the check (`workbenchLabRaster`) and $2°$ in the widget.
+
+Two things appear on the torus that the micro-example never showed. First, each near obstacle cuts a
+**vertical band**: link 1 collides with the block for $\theta_1 \in [8°, 47°]$ and with the clamp for
+$\theta_1 \in [118°, 152°]$, and a link-1 collision does not care about $\theta_2$, so those columns
+are forbidden in full. Second, the two bands together do what one band cannot: a single band removes
+an annulus from the torus and leaves a connected annulus behind, but two bands cut that annulus into
+two strips. The readout confirms it — $\QO$ has $3$ components ($33.5\%$ of the torus), and
+$\Qfree$ has **2**. Switch the lab obstacles off and $\Qfree$ is **1** again; the block's band alone,
+the post's and the shelf's blobs, all merge into one free component.
+
+The lab's query is $\qstart = (90°, 57°)$ and $\qgoal = (-90°, 57°)$, both free, both drawn, and
+in different components. No planner in this book will connect them. Not Chapter 6's A\*, which is
+complete and will say so after expanding every free cell; not Chapter 7's potential field, which
+will sit in a local minimum against a band; not Chapter 11's PRM, whose roadmap will have two
+components forever. The first thing a planner must respect is the connectivity of $\Qfree$, and this
+page has now *measured* it, on a raster, before Chapter 5 says what connectivity means on a torus. The
+check `lab` pins the band edges, the component counts with and without the clamp, the start and goal
+labels, and the occupancy.
+
+A last honesty item, because the lab makes it concrete. The Workbench as Chapter 2 ships it — block
+at $[0.5, 1.0] \times [1.0, 1.5]$, post, shelf — keeps every obstacle beyond link 1's reach: its
+nearest corner is $1.12$ m from the base and $L_1 + 0.03 = 1.03$. Its $\Qfree$ is **connected** (the
+default *Workbench* preset shows one free component), and a design that promised a disconnected
+Workbench would have been wrong by exactly the amount this chapter teaches: whether a C-space is in
+one piece is not visible from the workspace picture. You have to compute it.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Convexity, and why one checker serves a whole scene">
+    Prove that the C-obstacle of a convex robot translating in the plane against a convex obstacle is
+    convex (Choset problem 3.4), and that the union operator propagates from the workspace to the
+    configuration space, $\QO(\WO_i \cup \WO_j) = \QO_i \cup \QO_j$ (problem 3.5). Then say in one
+    sentence why the second fact lets `rasterize_cobstacle` take a whole `Scene` rather than one
+    obstacle at a time, and why the first fact does *not* extend to a rotating robot.
+    <Hints>
+      <>For convexity, write $\QO = \{q : (q + R) \cap \WO \ne \emptyset\} = \WO \oplus (-R)$ and show that a Minkowski sum of convex sets is convex: if $q = o + r$ and $q' = o' + r'$ then $\lambda q + (1-\lambda) q' = (\lambda o + (1-\lambda) o') + (\lambda r + (1-\lambda) r')$.</>
+      <>For the union, $\Rq$ meets $\WO_i \cup \WO_j$ iff it meets $\WO_i$ or meets $\WO_j$ — a statement about sets, with nothing geometric in it. The scene's `intersects` is that "or".</>
+      <>For rotation: $\QO \subset SE(2)$ is a union over $\theta$ of convex slices $\QO(\theta) \times \{\theta\}$, and a union of convex sets need not be convex. The Minkowski Studio's stack toggle shows slices whose shapes differ; take two configurations in different slices and find the midpoint.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Count the degrees of freedom">
+    Give $\dim \Q$ for (a) two planar rigid bodies tied together by a taut rope of fixed length;
+    (b) two planar rigid bodies connected rigidly by a bar; (c) a train on tracks, with and without
+    the wheel angles, where the wheels roll without slipping; (d) a sheet of paper (Choset problem
+    3.2, parts b, c, e, i). For (c), name the constraint that is nonholonomic and explain why it
+    removes no dimension.
+    <Hints>
+      <>Start from the unconstrained count — $3$ per planar body — and subtract one per independent holonomic constraint $g(q) = 0$. A taut rope fixes one distance; a rigid bar fixes a distance *and* two relative angles.</>
+      <>A train's position along a fixed track is one number. Adding $k$ wheel angles adds $k$ coordinates — but rolling without slipping ties each wheel's *rate* to the train's speed: $r\dot\phi_i = \dot s$. That is $g(q, \dot q) = 0$, a nonholonomic constraint. It happens to be integrable here, so it is really holonomic in disguise — $\phi_i = s / r + \text{const}$ — and the configuration space is still one-dimensional. Chapter 20 is about the constraints that do not integrate.</>
+      <>A sheet of paper can bend without stretching: its configuration space is infinite-dimensional. Choset's point is that "robot" is a modeling choice, and the count depends on what you let move.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Predict the band, then verify">
+    <Predict
+      id="ch04.e3"
+      question="In the C-Space Morph, load the micro-example preset (zero-thickness links, 1° raster) and drag the square to be centered at (0.95, 0). Before releasing: what appears on the torus, and how wide is it in θ₁?"
+      options={[
+        { label: 'The lens widens but stays a lens: no band', because: 'Link 1 has length 1 and the square now spans x ∈ [0.85, 1.05]: link 1 passes through it whenever |θ₁| is small enough, for every θ₂. A link-1 collision is a vertical band.' },
+        { label: 'A vertical band of half-width arctan(0.1/0.85) = 6.71°, i.e. the rows θ₁ = −6°, …, 6° fully occupied', correct: true, because: 'Right. Link 1 is the segment from the origin at heading θ₁; it crosses the square\'s left edge x = 0.85 at height 0.85 tan θ₁, which is inside the square iff |θ₁| ≤ arctan(0.1/0.85) = 6.71°. On the 1° raster that is 13 fully occupied rows, −6° to 6°; the check `exercise 3` pins it.' },
+        { label: 'A vertical band of half-width arcsin(0.1) = 5.74°', because: 'That is the condition for the link\'s *tip* (at radius 1) to be inside the square. But the link is a segment, not a point: it enters the square through its left edge before the tip does, so the band is wider.' },
+        { label: 'A band of half-width arctan(0.1/0.4) = 14.04°, as in the θ₁ = 0 slice', because: 'The 14.04° half-width was the angle the near corner subtends from the *elbow* at (1, 0), when the square was at x = 1.4. Now the square is near the base and link 1 does the colliding; the relevant vertex is the origin and the relevant corner is (0.85, 0.1).' },
+      ]}
+    >
+    Now set the link thickness to $0.03$ m. The band widens to the rows $-8°, \dots, 8°$ — $17$ rows.
+    Explain why the edge is not at $\arctan(0.1/0.85)$ any more: the capsule of radius $0.03$ touches
+    the corner $(0.85, 0.1)$ when the link's *axis* passes within $0.03$ of it, which adds
+    $\arcsin(0.03 / \sqrt{0.85^2 + 0.1^2}) = 2.01°$ to the half-width: $8.72°$, so $8°$ is in and $9°$
+    is out. This is Choset's "thickening" footnote in a single number, and the price of a conservative
+    raster: $17$ forbidden rows where $13$ are truly blocked.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="How flat is the ellipse?">
+    In the Jacobian Lens set $\theta_2 = 10°$ with $L_1 = L_2 = 1$. The velocity ellipse has
+    semi-axes $\sigma_1 \ge \sigma_2$, the singular values of $J$. Predict their ratio from two facts
+    you can compute by hand — $\sigma_1 \sigma_2 = |\det J| = \sin\theta_2$ and
+    $\sigma_1^2 + \sigma_2^2 = \|J\|_F^2 = L_1^2 + 2L_2^2 + 2L_1 L_2 \cos\theta_2$ — then read it off
+    the widget. Then switch on $J^{\mathsf T}$ and find a configuration where a unit tip force needs
+    the *largest* joint torque; explain why it is the same $q$ at which the ellipse is longest.
+    <CheckAnswer
+      id="ch04.e4"
+      prompt="σ₁ / σ₂ at θ₂ = 10°, L₁ = L₂ = 1 (any θ₁), to one decimal"
+      answer={28.6}
+      tolerance={0.6}
+    >
+    With $p = \sigma_1\sigma_2 = \sin 10° = 0.1736$ and $s = \sigma_1^2 + \sigma_2^2 = 3 + 2\cos 10°
+    = 4.9696$, the two values solve $\sigma^4 - s\sigma^2 + p^2 = 0$: $\sigma_1 = 2.228$,
+    $\sigma_2 = 0.078$, ratio $28.6$. The ratio does not depend on $\theta_1$ — rotating the whole arm
+    rotates the ellipse without reshaping it — and the check `jacobian` asserts both facts. For the
+    torque question: $\tau = J^{\mathsf T} f$ has the same singular values as $J$, so the largest
+    torque for a unit force is $\sigma_1$, attained when $f$ points along the ellipse's long axis;
+    $\sigma_1$ is largest when the arm is straight ($\theta_2 = 0$), where $\|J\|_F^2 = 5$ and
+    $\sigma_1 = \sqrt5 = 2.236$ — the longest lever.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="A three-dimensional raster">
+    Implement `rasterize_cobstacle` for `Reach<3>` on $T^3$ — a `BitGrid3` with `components_torus`
+    wrapping all three axes — and render three $\theta_3$-slices of the Workbench as images. Verify
+    with a test that setting $L_3 = 0$ and taking the $\theta_3 = 0$ slice reproduces the `Reach<2>`
+    grid of this chapter bit for bit. Then measure: how many collision queries does $1°$ on $T^3$
+    cost, and how long does `parry2d` take per query on your machine? That product is the reason
+    Part III exists.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Choset problem 3.18: translation paths at some headings, none at others">
+    Write a program that reads a convex robot (counterclockwise vertices, reference point at the
+    origin) and a set of convex obstacles from files, takes a heading $\theta$, computes
+    $\QO(\theta)$ for each obstacle with `star_algorithm`, unions the slices, and flood-fills the
+    complement to decide whether a translation path exists between two given points. Show one
+    heading at which the path exists and one at which it does not. Cross-check the union against
+    `rasterize_cobstacle` on $\mathbb{R}^2$ with a `FootprintChecker` at the same heading: every
+    occupied cell center must lie in some slice, and every cell center in a slice must be occupied.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="§3.1–3.3 for configuration, C-obstacles, the pixel method and the dimension count; §3.7 for Table 3.1; §3.8 for the Jacobian and Examples 3.8.1–3.8.2; Appendix F in full — half-planes, Type A/B contacts, the star algorithm, SE(2) slices and GJK as Algorithm 23."
+  />
+  <Reference
+    authors="Lozano-Pérez, T."
+    year={1983}
+    title="Spatial Planning: A Configuration Space Approach"
+    venue="IEEE Transactions on Computers C-32(2), 108–120"
+    doi="10.1109/TC.1983.1676196"
+    note="The paper that made configuration space the planner's space and computed polygonal C-obstacles from vertex–edge contacts; the star algorithm and the SE(2) slices descend from it."
+  />
+  <Reference
+    authors="Gilbert, E. G., Johnson, D. W., and Keerthi, S. S."
+    year={1988}
+    title="A fast procedure for computing the distance between complex objects in three-dimensional space"
+    venue="IEEE Journal on Robotics and Automation 4(2), 193–203"
+    doi="10.1109/56.2083"
+    note="GJK — Choset's Algorithm 23 and Derivation 5: distance as the distance from the Minkowski difference to the origin, computed from support functions alone. What parry2d runs inside every distance query."
+  />
+  <Reference
+    authors="Yoshikawa, T."
+    year={1985}
+    title="Manipulability of Robotic Mechanisms"
+    venue="International Journal of Robotics Research 4(2), 3–9"
+    doi="10.1177/027836498500400201"
+    note="The velocity ellipsoid and the manipulability measure |det J| = σ₁σ₂ the Jacobian Lens draws; singularities as the ellipsoid's collapse."
+  />
+  <Reference
+    authors="Latombe, J.-C."
+    year={1991}
+    title="Robot Motion Planning"
+    venue="Kluwer Academic Publishers"
+    doi="10.1007/978-1-4615-4022-9"
+    note="Chapter 3 is the fullest classical treatment of configuration space obstacles for translating and rotating polygons, including the contact-based boundary construction this chapter follows."
+  />
+  <Reference
+    authors="Lynch, K. M. and Park, F. C."
+    year={2017}
+    title="Modern Robotics: Mechanics, Planning, and Control"
+    venue="Cambridge University Press"
+    url="http://modernrobotics.org"
+    note="Chapters 2 and 5: degrees of freedom by Grübler's formula and the manipulator Jacobian, manipulability ellipsoids and singularities, by one of Choset's co-authors."
+  />
+  <Reference
+    authors="Montaut, L., Le Lidec, Q., Petrik, V., Sivic, J., and Carpentier, J."
+    year={2022}
+    title="Collision Detection Accelerated: An Optimization Perspective"
+    venue="Robotics: Science and Systems (RSS)"
+    url="https://arxiv.org/abs/2205.09663"
+    note="GJK re-read as a Frank–Wolfe method on the Minkowski difference, with Nesterov acceleration — the modern view of Algorithm 23, and why its support-function formulation is the right one."
+  />
+  <Reference
+    authors="Dimforge"
+    year={2024}
+    title="parry: 2D and 3D collision-detection library for the Rust programming language"
+    venue="Documentation and source"
+    url="https://parry.rs"
+    note="The engine behind crates/collide: GJK, EPA for penetration depth, a Qbvh broad phase and shape-casting — what this chapter's Appendix F explains and the black_box_agrees test verifies."
+  />
+</References>

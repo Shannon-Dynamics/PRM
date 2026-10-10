@@ -1,0 +1,1121 @@
+---
+title: Nonholonomic Systems I — Controllability
+description: A velocity constraint is not a configuration constraint. The Lie bracket is the exact bookkeeping of what wiggling buys, Chow's theorem says when the brackets span everything, Frobenius says when they never will, and the symmetric product carries the same test to Reach with a dead motor and Rusty with mass.
+chapter: 20
+part: PART V
+partTitle: Dynamics, Trajectories, and Constraints
+difficulty: Advanced
+readingTime: 70 min
+quote: We know by experience, however, that this velocity constraint does not imply a constraint on configurations; the car can reach any position and orientation in the obstacle-free plane. In fact, the prevented sideways translation can be approximated by parallel-parking maneuvers.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 12
+---
+
+import { WiggleHook } from '@/components/ch/ch20/wiggle-hook';
+import { LieBracketParker } from '@/components/ch/ch20/lie-bracket-parker';
+import { ReachableSetGrower } from '@/components/ch/ch20/reachable-set-grower';
+import { FoliationLeaves } from '@/components/ch/ch20/foliation-leaves';
+import { ControllabilityLadder } from '@/components/ch/ch20/controllability-ladder';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Write a robot\'s motion constraints as vector fields and a distribution, in both the positive (span) and negative (annihilated by a covector) forms, and say what makes a constraint nonholonomic',
+    'Derive the Lie bracket as the ε² residue of the four-flow loop, compute it by hand for the unicycle and Hitch, and verify it numerically to the O(ε³) remainder',
+    'Run the filtration D₁ ⊆ D₂ ⊆ ⋯ to its involutive closure, read Frobenius\' theorem off it, and know when a rank at one point says nothing about another',
+    'State the four controllability notions and their ladder, apply Chow\'s theorem (the LARC) and Sussmann\'s good-and-bad-bracket test, and name the system each counterexample lives on',
+    'For a simple mechanical control system, compute covariant derivatives and symmetric products from Chapter 17\'s Christoffel symbols and run the Lewis–Murray tests at rest, with and without Pfaffian constraints',
+    'Implement the nonholonomic module: VectorField, lieBracket, filtration, larc, sussmannStlc, symmetricProduct, lewisMurray, constrainedInputs — each pinned to a hand computation',
+  ]}
+  prerequisites={[
+    'Hitch\'s kinematic model and the Lot (Chapter 2); Reach\'s Jacobian (Chapter 4)',
+    'Manifolds, charts and tangent spaces, and why this chapter computes in local coordinates on purpose (Chapter 5)',
+    'The standard form M q̈ + C q̇ + g = u, Christoffel symbols and Pfaffian constraints with the projection P (Chapter 17)',
+    'Multivariable calculus: Jacobians, Taylor expansions to second order, rank of a matrix',
+  ]}
+>
+Hitch cannot slide sideways. Every reader also knows Hitch can end up half a metre to the left of where
+it started, parallel-parked, by wiggling. This chapter turns that folk knowledge into a theorem, and
+the theorem has a precise shape: **a velocity constraint is not a configuration constraint, and the Lie
+bracket is the exact bookkeeping of what wiggling buys.** Follow *drive* for a time $\epsilon$, then
+*steer* for $\epsilon$, then undo both in order. You do not return home. You are displaced by
+$\epsilon^2$ in a direction neither input produces directly — the bracket $[g_1, g_2]$ — plus a
+remainder of order $\epsilon^3$ that this chapter measures rather than waves away.
+
+Stack brackets until they span the tangent space and Chow's theorem says the system reaches everything
+nearby; stop short and Frobenius says it is trapped on a lower-dimensional leaf forever. That is the
+first half. The second half asks the same question of second-order systems — Reach with its third motor
+dead, Rusty with mass — where drift complicates the bookkeeping and the symmetric product of Lewis and
+Murray halves the work.
+
+Everything here is *analysis*. Nothing in this chapter produces a plan; the catalogue of steering methods
+that cash these verdicts in is [Chapter 21](/chapters/ch21-nonholonomic-ii). Three honesty items the
+prose keeps throughout: the Lie algebra rank condition is necessary only for analytic fields; Sussmann's
+condition is sufficient, not necessary; and STLC for a second-order system is always a statement *at
+rest*.
+</Overview>
+
+## The problem: sideways is forbidden, sideways is reachable
+
+Tell Hitch "half a metre to the left, same heading". A holonomic ghost — the free-flying rectangle of
+[Chapter 4](/chapters/ch04-configuration-space-i) — slides there in a second. Hitch has two inputs,
+a speed and a steering rate, and no combination of them has a sideways component. Yet Hitch gets
+there, by spinning a little, driving a little, unspinning, undriving, fourteen times over.
+
+<Figure caption="Hitch is asked for 0.5 m of pure sideways displacement. The purple ghost slides there in one second. Hitch repeats the loop spin → drive → unspin → undrive with ε = 0.19 rad: each loop buys ε sin ε ≈ ε² = 0.036 m sideways, so fourteen loops are needed — and each leaks ε(1 − cos ε) ≈ ε³/2 backward, the O(ε³) term the chapter keeps.">
+  <WiggleHook />
+</Figure>
+
+Two things in that picture are the whole chapter. The sideways gain per loop is *quadratic* in the
+wiggle amplitude, which is why parallel parking is slow and why a planner that only has the four-flow
+recipe would be a terrible planner. And the gain has a *direction* that neither input has — the
+Lie bracket of the two input fields, which is the one new mathematical object you need.
+
+## Building intuition
+
+### Wiggling has a direction
+
+The loop below is Choset's equation (12.3): from $x_0$, follow $g_1$ for $\epsilon$, then $g_2$ for
+$\epsilon$, then $-g_1$ for $\epsilon$, then $-g_2$ for $\epsilon$. For the unicycle's drive and spin
+fields the four legs are exact — two arcs of length $\epsilon$ and two spins of angle $\epsilon$ —
+so the residue can be written in closed form and compared to the prediction $\epsilon^2[g_1, g_2]$.
+
+<Deferred minHeight={620}>
+  <LieBracketParker />
+</Deferred>
+
+Three things to notice, each a theorem below.
+
+**There is no first-order term.** Halve $\epsilon$ and the residue drops by four, not two: the blue
+dot in the inset slides down a line of slope two. At $\epsilon = 0.1$ the loop from heading $\pi/6$
+moves Hitch by $[0.005424, -0.008396, 0]$ against the prediction $\epsilon^2[g_1, g_2] = [0.005,
+-0.00866, 0]$; the gap is $5.0 \times 10^{-4}$, the $O(\epsilon^3)$ remainder.
+
+**The direction is new.** $[g_1, g_2] = [\sin x_3, -\cos x_3, 0]^\top$ is perpendicular to the
+heading — exactly the direction the no-slip constraint forbids. Two fields that cannot move you
+sideways produce a loop that does.
+
+**Brackets stack.** Switch to the four-state car. Its inputs are speed and *steering rate*, and the
+first bracket $g_3 = [g_1, g_2]$ only buys heading change — a car that can set its steering angle but
+has not yet driven has turned nothing. Loop $g_1$ with $g_3$ and the residue is sideways: the
+second-degree bracket $g_4 = [g_1, g_3]$. Hitch needs two rungs of brackets for the same direction the
+unicycle needed one, and that number — the degree at which the brackets fill the tangent space — is
+what the filtration counts.
+
+### Four words for four sets
+
+"Controllable" is one word in linear systems theory and four in this chapter, because for a
+nonlinear system the *shape* of the reachable set matters: does it have interior, does it have
+interior without leaving a small ball, does it contain a neighbourhood of the start inside that ball?
+
+<Deferred minHeight={560}>
+  <ReachableSetGrower />
+</Deferred>
+
+With drive alone the reachable set is a curve — the integral curve of $g_1$ — and no controllability
+property holds. With drive and spin, controls in $[-1, 1]^2$, the sampled set fills a blob with the start
+in its interior: small-time locally controllable. Flip to the forward-only, left-only control set
+$U \in \mathcal{U}^+$ and the set keeps its interior but hugs the start's boundary — nothing is behind
+Hitch, because in small time the heading cannot swing past $\pi/2$. That system is *accessible*, *STLA*
+and (in the open plane) *controllable*, yet not STLC. The macro adds $[g_1, g_2]$ as if it were a third
+input, and sideways becomes first-order: the widget is pretending to be a system whose Lie algebra is
+spanned at degree one, which is what every steering method of Chapter 21 constructs by other means.
+
+### Rank is a property of the point
+
+Choset's Example 12.1.7 is two innocent-looking fields on $\mathbb{R}^3$, $g_1 = [x_1\cos x_3,\ x_2\sin x_3,\ 0]^\top$
+and $g_2 = \partial/\partial x_3$, whose bracket has determinant $x_1 x_2$ against them.
+
+<Deferred minHeight={560}>
+  <FoliationLeaves />
+</Deferred>
+
+Start anywhere off the coordinate planes and the system reaches a full three-dimensional neighbourhood.
+Start on the plane $x_1 = 0$ and $g_1$ loses its first component for good — the reachable set is a
+half-plane, and no sequence of controls ever leaves it. Start on the $x_3$-axis and it is a line. Nine
+leaves in all. A rank test at one configuration settles controllability *there*; the trailer's jackknife
+in Chapter 23 is the same lesson in a less innocent system.
+
+<KeyIdea title="The one-sentence version">
+Velocity constraints restrict the *directions* a system can move in at each instant; they restrict the
+*configurations* it can reach only if the constrained directions close under the Lie bracket. Count the
+dimension of the bracket closure at a point: if it equals the dimension of the state space the system is
+small-time locally accessible there (Chow); if the system is also symmetric it is small-time locally
+controllable; if the closure stops short, Frobenius confines the system to a leaf of that dimension.
+</KeyIdea>
+
+<NotationTable
+  rows={[
+    { sym: 'M,\\ x \\in M,\\ n', meaning: 'state manifold, state, its dimension', note: 'M = 𝒬 for a kinematic system; M = T𝒬, x = (q, q̇) for a second-order one' },
+    { sym: 'T_xM,\\ TM,\\ \\omega(x),\\ \\phi^g_t(x)', meaning: 'tangent space, tangent bundle, a covector (one-form), the flow of g for time t', note: 'ω(x)ẋ = 0 is the negative form of a constraint' },
+    { sym: '\\mathcal{D} = \\mathrm{span}(\\mathcal{G}),\\ \\mathcal{D}_k,\\ \\overline{\\mathcal{D}},\\ \\mathrm{Lie}(\\mathcal{G})', meaning: 'distribution, k-th step of the filtration, involutive closure, Lie algebra generated', note: 'Choset §12.1.2–12.1.3' },
+    { sym: '\\lie{g_1}{g_2} = \\tfrac{\\partial g_2}{\\partial x} g_1 - \\tfrac{\\partial g_1}{\\partial x} g_2', meaning: 'the Lie bracket (eq. 12.5)', note: 'the sign under which the four-flow loop moves by +ε²[g₁, g₂]' },
+    { sym: 'g_0,\\ g_i,\\ u \\in U \\subset \\R^m', meaning: 'drift field, control fields, control vector and set', note: 'ẋ = g₀ + Σ gᵢuᵢ (eq. 12.6)' },
+    { sym: '\\mathcal{U}^\\pm,\\ \\mathcal{U}^+', meaning: 'control sets with the origin interior to the convex hull / merely spanning ℝᵐ', note: '[−1, 1]ᵐ and its vertices / [0, 1]ᵐ' },
+    { sym: 'R^V(x, \\le T)', meaning: 'states reachable within time T without leaving the neighbourhood V', note: 'the set the four notions are about' },
+    { sym: '\\langle v_1, v_2 \\rangle = v_1\\T M(q) v_2,\\ \\nabla_{Y_1}Y_2,\\ \\langle Y_1 : Y_2 \\rangle', meaning: 'kinetic-energy metric, covariant derivative, symmetric product', note: 'Chapter 17\'s Christoffel symbols, Choset\'s convention (no M⁻¹ inside Γ)' },
+    { sym: 'Y_i(q),\\ \\mathrm{Sym}(\\mathcal{Y})', meaning: 'columns of M⁻¹(q)T(q); the symmetric closure', note: 'input fields on 𝒬, not on T𝒬' },
+    { sym: 'P = I - M^{-1}A\\T(AM^{-1}A\\T)^{-1}A,\\ \\tilde Y_i = PY_i,\\ \\tilde\\nabla', meaning: 'constraint projection, constrained inputs and connection', note: 'Chapter 17\'s projectionP' },
+    { sym: 'q = (x, y, \\phi, \\theta),\\ L,\\ \\gamma;\\ \\psi,\\ \\theta_1 = \\theta - \\psi,\\ d', meaning: 'Hitch: rear-axle position, steering angle, heading (Choset\'s ordering), wheelbase, steering limit; trailer heading, hitch angle, hitch length', note: 'Chapter 2 integrates ψ; Choset writes θ₁' },
+  ]}
+/>
+
+## The mathematics
+
+Following Choset, the state space is a vector space $M = \mathbb{R}^n$ throughout: every manifold in
+this book is locally diffeomorphic to $\mathbb{R}^n$, and the price — angles wrap, so a heading
+coordinate is only a chart — is one this chapter pays knowingly. The global structure returns in
+[Chapter 5](/chapters/ch05-configuration-space-ii)'s `Manifold`, which is where the planners of Part III
+live; here we differentiate, and differentiation is local.
+
+### Vector fields, flows, distributions
+
+A **vector field** is a smooth map $g : M \to TM$ with $g(x) \in T_xM$ — in coordinates, a column
+vector that depends on $x$. Its **flow** $\phi^g_t(x)$ solves $\dot x = g(x)$ from $x$ for time $t$,
+and the **integral curve** through $x$ is $\{\phi^g_t(x) : t \in \mathbb{R}\}$. A set $\mathcal{G}$ of
+fields generates the **distribution** $\mathcal{D} = \mathrm{span}(\mathcal{G})$, a linear subspace of
+$T_xM$ at each $x$; it is **regular** if that subspace has the same dimension everywhere.
+
+The unicycle's two fields, drive and spin, are the positive form of its distribution,
+
+<LinkedMath>
+$$
+\htmlClass{term-robot}{g_1(x) = \begin{bmatrix}\cos x_3\\ \sin x_3\\ 0\end{bmatrix}},\qquad
+\htmlClass{term-robot}{g_2(x) = \begin{bmatrix}0\\ 0\\ 1\end{bmatrix}},\qquad
+\mathcal{D}(x) = \{u_1 g_1(x) + u_2 g_2(x)\},
+$$
+</LinkedMath>
+
+and the no-slip constraint is its negative form: $\mathcal{D}(x) = \{\dot x : \omega(x)\dot x = 0\}$
+with the covector $\omega(x) = [-\sin x_3,\ \cos x_3,\ 0]$ (Choset eq. 12.1). A velocity constraint
+$f(q, \dot q) = 0$ that cannot be integrated to a configuration constraint is **nonholonomic**; the
+Pfaffian ones, $a(q)\dot q = 0$, are the kind [Chapter 17](/chapters/ch17-robot-dynamics) handled with
+the projection $P$, and the whole question of this chapter is whether they integrate.
+
+### The Lie bracket from the four-flow loop
+
+<KeyIdea title="Statement (Choset eq. 12.3–12.5)">
+From $x_0$, follow $g_1$ for $\epsilon$, $g_2$ for $\epsilon$, $-g_1$ for $\epsilon$, $-g_2$ for $\epsilon$.
+Then
+$$
+x(4\epsilon) = x_0 + \epsilon^2\,\htmlClass{term-graph}{\lie{g_1}{g_2}(x_0)} + O(\epsilon^3),\qquad
+\lie{g_1}{g_2} = \frac{\partial g_2}{\partial x}g_1 - \frac{\partial g_1}{\partial x}g_2,
+$$
+with no $O(\epsilon)$ term. If the bracket is not in $\mathrm{span}(\mathcal{G})$ it is a new direction,
+followable approximately, at the price of $O(\epsilon^2)$ motion for $O(\epsilon)$ time. If
+$[g_1, g_2] = 0$ the fields commute.
+</KeyIdea>
+
+<Derivation title="Expanding the four flows to second order" result="x(4\epsilon) - x_0 = \epsilon^2\,[g_1, g_2](x_0) + O(\epsilon^3)">
+**Step 1 — one flow.** Taylor-expand $\phi^g_\epsilon(x)$ in $\epsilon$: $\dot x = g(x)$ and
+$\ddot x = \frac{\partial g}{\partial x}\dot x = \frac{\partial g}{\partial x}g$, so
+$\phi^g_\epsilon(x) = x + \epsilon g(x) + \tfrac{\epsilon^2}{2}\frac{\partial g}{\partial x}(x)\,g(x) + O(\epsilon^3)$.
+
+**Step 2 — compose $g_2$ after $g_1$.** Write $x_1 = \phi^{g_1}_\epsilon(x_0)$. Then
+$\phi^{g_2}_\epsilon(x_1) = x_1 + \epsilon g_2(x_1) + \tfrac{\epsilon^2}{2}\frac{\partial g_2}{\partial x}g_2 + O(\epsilon^3)$,
+and re-expanding $g_2(x_1)$ at $x_0$ gives $g_2(x_1) = g_2(x_0) + \epsilon\frac{\partial g_2}{\partial x}g_1(x_0) + O(\epsilon^2)$.
+The cross term $\epsilon^2\frac{\partial g_2}{\partial x}g_1$ appears; the self terms
+$\tfrac{\epsilon^2}{2}\frac{\partial g_i}{\partial x}g_i$ are carried along.
+
+**Step 3 — compose $-g_1$.** The $\epsilon g_1$ term cancels the one from step 1. Re-expanding
+$-g_1$ at the current point produces $-\epsilon^2\frac{\partial g_1}{\partial x}(g_1 + g_2)$ from the
+first-order displacement $\epsilon(g_1 + g_2)$ accumulated so far, and the self term
+$+\tfrac{\epsilon^2}{2}\frac{\partial g_1}{\partial x}g_1$ from the flow of $-g_1$ itself (the sign of $g$
+enters twice). The two $g_1$-self contributions cancel: $\tfrac{\epsilon^2}{2} - \epsilon^2 + \tfrac{\epsilon^2}{2} = 0$.
+What survives from this leg is $-\epsilon^2\frac{\partial g_1}{\partial x}g_2$.
+
+**Step 4 — compose $-g_2$.** Likewise the $\epsilon g_2$ term cancels, the $g_2$-self terms cancel,
+and the re-expansion of $-g_2$ at a point displaced by $\epsilon g_2$ (the $g_1$ displacement is gone)
+gives $-\epsilon^2\frac{\partial g_2}{\partial x}g_2 + \tfrac{\epsilon^2}{2}\frac{\partial g_2}{\partial x}g_2$,
+which together with step 2's $\tfrac{\epsilon^2}{2}\frac{\partial g_2}{\partial x}g_2$ sums to zero.
+
+**Step 5 — collect.** Every first-order term and every self term is gone; the survivors are the two
+cross terms, $\epsilon^2\big(\frac{\partial g_2}{\partial x}g_1 - \frac{\partial g_1}{\partial x}g_2\big)$ — the bracket.
+
+**The unicycle in closed form.** Drive by $\epsilon$ at heading $x_3$, spin by $\epsilon$, drive back
+by $\epsilon$ at heading $x_3 + \epsilon$, spin back:
+$$
+x(4\epsilon) - x_0 = \epsilon\begin{bmatrix}\cos x_3 - \cos(x_3 + \epsilon)\\ \sin x_3 - \sin(x_3 + \epsilon)\\ 0\end{bmatrix}
+= \epsilon^2\begin{bmatrix}\sin x_3\\ -\cos x_3\\ 0\end{bmatrix} + \frac{\epsilon^3}{2}\begin{bmatrix}\cos x_3\\ \sin x_3\\ 0\end{bmatrix} + O(\epsilon^4).
+$$
+The $\epsilon^2$ term is $[g_1, g_2]$; the $\epsilon^3/2$ term points *along the heading*, so the loop
+also drifts forward by half a cube — the leak the hook measures and the number w20.1 plots.
+
+**The linear case and the sign** (Choset Problem 8). For $g_1 = Ax$, $g_2 = Bx$ equation (12.5)
+gives $[g_1, g_2] = BAx - ABx = (BA - AB)x$, the *negative* of the matrix commutator $AB - BA$ that the
+sister book's [Lie-group chapter](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch03-geometry-of-motion)
+uses. The sign is immaterial for spans and determinants' zero sets, and material for the direction
+of the loop residue; the library keeps Choset's and pins it in a check.
+</Derivation>
+
+The library computes the bracket by formula (12.5) from each field's Jacobian — analytic for every system
+of this chapter, a fourth-order central difference otherwise — and the check compares the finite-difference
+bracket with the hand formula to $10^{-9}$ at the micro-example's configuration. Two properties hold for
+every pair and triple of fields and are property-tested on seeded random polynomial fields:
+**skew-symmetry** $[g_1, g_2] = -[g_2, g_1]$ and the **Jacobi identity**
+$[g_1,[g_2,g_3]] + [g_3,[g_1,g_2]] + [g_2,[g_3,g_1]] = 0$.
+
+### Filtrations, the involutive closure, Frobenius
+
+A **Lie product of degree $k$** is a bracket expression in which the original fields appear $k$
+times. The **Lie algebra** $\mathrm{Lie}(\mathcal{G})$ is the span of all Lie products of all degrees,
+built by Choset's recursion
+
+$$
+\mathcal{G}_1 = \mathcal{G},\qquad
+\mathcal{G}_{i+1} = \mathcal{G}_i \cup \{\lie{g_j}{g_k} : g_j \in \mathcal{G}_1,\ g_k \in \mathcal{G}_i\},\qquad
+\mathcal{D}_i = \mathrm{span}(\mathcal{G}_i),
+$$
+
+whose span sequence $\mathcal{D}_1 \subseteq \mathcal{D}_2 \subseteq \cdots$ is the **filtration** of
+$\mathcal{D}_1$. If the filtration is regular, each step either raises the dimension or stops, so it
+terminates at a finite $k$ with $\mathcal{D}_k = \mathcal{D}_{k+1} = \cdots = \overline{\mathcal{D}}$,
+the **involutive closure**; $\mathcal{D}$ is **involutive** if $\mathcal{D} = \overline{\mathcal{D}}$.
+If all products vanish beyond some degree the algebra is **nilpotent**, which Chapter 21's chained
+forms exploit.
+
+<KeyIdea title="Statement (Frobenius; Choset §12.1.3)">
+A regular $m$-dimensional distribution has an $m$-dimensional **integral manifold** through every point
+— the set reachable along fields in $\mathcal{D}$, with $\mathcal{D}(x)$ its tangent space — if and only
+if it is involutive. When the integral manifolds are smaller than $M$ they are the **leaves** of a
+**foliation**, and a system confined to a leaf of dimension $k < n$ satisfies no controllability
+property at all.
+</KeyIdea>
+
+<Derivation title="Why involutive is exactly what integrates" result="\dim \overline{\mathcal{D}}(x) = \text{dimension of the leaf through } x">
+**Step 1 — necessity.** If the fields of $\mathcal{D}$ are tangent to a submanifold $N$, their flows
+stay in $N$, so the four-flow loop stays in $N$, so its residue $\epsilon^2[g_1, g_2] + O(\epsilon^3)$
+is tangent to $N$ in the limit: the bracket lies in $TN = \mathcal{D}$. Involutive is forced.
+
+**Step 2 — sufficiency, in one picture.** Choose $m$ independent fields of an involutive $\mathcal{D}$
+near $x$. Because their brackets stay in $\mathcal{D}$, the fields can be re-combined (pointwise, by an
+invertible $m \times m$ matrix) into $m$ *commuting* fields, and commuting flows can be straightened
+into coordinate flows $\partial/\partial y_1, \dots, \partial/\partial y_m$ by the inverse function
+theorem. The leaf through $x$ is then $\{y_{m+1} = \text{const}, \dots, y_n = \text{const}\}$.
+
+**Step 3 — regularity and termination.** If every $\mathcal{D}_i$ is regular, $\dim \mathcal{D}_i$ is
+constant in $x$ and non-decreasing in $i$, bounded by $n$; so it strictly increases or the recursion
+stops, after at most $n - \dim\mathcal{D}_1$ steps. Without regularity nothing bounds the degree
+a priori — the library runs to a stated maximum and reports a stall separately from a closure.
+
+**Step 4 — the planning consequence.** A system whose closure has dimension $k < n$ at $x$ never
+leaves a $k$-dimensional leaf: it is neither controllable nor accessible, and no amount of cleverness
+with the inputs changes that. The unicycle with drive only ($k = 1$) is the canonical case.
+
+**Example 12.1.7, by the numbers.** $g_1 = [x_1\cos x_3, x_2\sin x_3, 0]^\top$, $g_2 = \partial_3$,
+$[g_1, g_2] = [x_1\sin x_3, -x_2\cos x_3, 0]^\top$ and $\det[g_1\ g_2\ [g_1, g_2]] = x_1x_2$. The
+library's `larc` returns STLC at $(0.7, -1.1, 0.4)$, a two-dimensional leaf at $(0, 1.3, 0.4)$ — the
+ladder stays at $(2, 2, 2, 2, 2)$ through degree five — and a one-dimensional leaf on the $x_3$-axis.
+Nine leaves: a line, four half-planes, four quadrants (Choset Figure 12.9).
+
+**The Philip Hall basis.** Skew-symmetry and Jacobi mean most products in $\mathcal{G}_i$ are
+redundant; the Hall basis chooses the smallest set at each degree. The library prunes only the trivial
+redundancies ($[g, g] = 0$, $[g_j, g_k] = -[g_k, g_j]$ at degree two) and products that vanish
+identically near the test point, and never prunes a product merely because it is dependent *at* the
+point — Example 12.1.7 on a coordinate plane is exactly a field that is zero at $x$ with nonzero
+brackets. Exercise 6 asks for the Hall basis proper.
+</Derivation>
+
+### Control-affine systems and the four notions
+
+Choset's class is the **control-affine** system
+
+$$
+\dot x = \htmlClass{term-obstacle}{g_0(x)} + \sum_{i=1}^m \htmlClass{term-robot}{g_i(x)}\,u_i,\qquad u \in U \subset \R^m,
+$$
+
+with **drift** $g_0$ and independent control fields $g_i$; **driftless** if $g_0 = 0$. Kinematic
+systems may be driftless; second-order ones never are, because the state carries the velocity and the
+velocity carries the configuration whether or not any input acts. Two classes of control set matter:
+$\mathcal{U}^\pm$, whose convex hull contains the origin in its interior (positive combinations reach
+every direction — the cube $[-1, 1]^m$, or just its vertices), and the larger $\mathcal{U}^+$, which
+merely spans (the non-negative cube). A driftless system with $U \in \mathcal{U}^\pm$ is **symmetric**:
+every motion can be run backward.
+
+Let $R^V(x, \le T)$ be the states reachable within time $T$ by trajectories that never leave the
+neighbourhood $V$ of $x$. The system is, from $x$:
+
+- **controllable** if every $x_{goal} \in M$ is in $R^M(x, \le T)$ for some finite $T$;
+- **accessible** if $R^M(x, \le T)$ contains a full $n$-dimensional set for some $T$;
+- **small-time locally accessible (STLA)** if $R^V(x, \le T)$ contains a full $n$-dimensional set for *every* $V$ and *every* $T > 0$;
+- **small-time locally controllable (STLC)** if $R^V(x, \le T)$ contains a *neighbourhood of $x$* for every $V$ and $T$.
+
+STLC is the one planners want: a system STLC everywhere can follow any curve in $M$ arbitrarily closely,
+so it can thread any clutter a free-flying body can thread. The implications among the four, and the
+conditions on the ones that are only sometimes true, are Choset's Figure 12.12:
+
+<ControllabilityLadder />
+
+The linear double integrator is the warning. $\ddot q = u$ with $|u| \le 1$ is "controllable" in the
+Kalman sense, yet it is STLC only from rest: at $\dot q \ne 0$ reaching a point behind you requires the
+velocity to change sign, and the velocity coordinate must leave any small $V$ first. For second-order
+systems **STLC always means STLC at zero velocity**, and the linearizations of the nonholonomic systems of
+this chapter fail the Kalman rank test outright — their controllability is inherently nonlinear.
+
+### Chow's theorem and Sussmann's refinement
+
+<KeyIdea title="Statement (Choset Theorems 12.3.1 and 12.3.3)">
+**Chow / LARC.** The control-affine system is STLA from $x$ if — and, for analytic fields, only if —
+it satisfies the **Lie algebra rank condition** $\mathrm{Lie}\{g_0, \dots, g_m\}(x) = T_xM$, for any
+$U \in \mathcal{U}^+$. If the system is symmetric the LARC also gives STLC.
+
+**Sussmann.** With drift, the system is STLC at $x$ if (1) $g_0(x) = 0$, (2) $U \in \mathcal{U}^\pm$,
+(3) the LARC is satisfied by **good** brackets up to degree $k$, and (4) every **bad** bracket of degree
+$j \le k$ is a linear combination of good brackets of degree less than $j$. A bracket is bad if $g_0$
+appears an odd number of times and every $g_i$ an even number (zero counts); good otherwise.
+</KeyIdea>
+
+<Derivation title="Brackets as motions, and why bad ones are one-way" result="\text{LARC} \Rightarrow \text{STLA};\quad \text{LARC} + \text{symmetry} \Rightarrow \text{STLC};\quad \text{neutralized bad brackets} \Rightarrow \text{STLC at equilibria}">
+**Step 1 — every Lie product is a motion.** A degree-$k$ product is realized by nesting four-flow
+loops: $[g_1, [g_1, g_2]]$ is a loop whose second leg is itself a loop. The net motion is
+$O(\epsilon^k)$ in time $O(\epsilon)$ — slower by one power per degree, which is why parking into a
+space $\epsilon$ longer than the car costs $\Theta(1/\epsilon^2)$ reversals (Chapter 21).
+
+**Step 2 — full rank gives interior.** If the products span $T_xM$, there are $n$ independent
+motion directions available in arbitrarily small time inside arbitrarily small $V$, and small
+combinations of them sweep an open set: STLA. For analytic fields the converse holds because an
+analytic system's reachable set is determined by all derivatives at $x$, which is the Lie algebra.
+
+**Step 3 — symmetry gives both signs.** Reverse every leg of a loop and the residue flips sign;
+for a symmetric system the reversed controls are available, so each bracket direction comes with
+both signs and the open set of step 2 can be centred on $x$: STLC.
+
+**Step 4 — bad brackets.** Write the loop for a bracket with its control amplitudes $u_i$ explicit.
+A control appearing an even number of times contributes $u_i^2$ to the net motion, so flipping $u_i$
+changes nothing: the direction can be followed one way only, like a drift. A bad bracket is a
+one-way direction. It is harmless if a *faster* motion (a good bracket of lower degree) can cancel
+it — the bad bracket is **neutralized** — and fatal otherwise.
+
+**Step 5 — the degree-one bad bracket.** $g_0$ itself is bad (drift once, controls zero times) and
+there is nothing of lower degree to neutralize it, hence the hypothesis $g_0(x) = 0$: Sussmann's
+theorem speaks only at equilibria.
+
+**Step 6 — from local to global.** On a connected $M$, STLC everywhere gives controllability: chain
+neighbourhoods along any curve. The converse fails — the forward-only unicycle is controllable in
+the open plane and STLC nowhere.
+
+**Choset's four counterexamples, each in the library.** The one-way watch knob (accessible,
+controllable, STLA, not STLC). $g_0 = [x_2^2, 0]^\top$, $g_1 = \partial_2$: at the origin
+$[g_0, g_1] = 0$ and $[g_1, [g_0, g_1]] = [2, 0]^\top$ is bad — `sussmannStlc` reports the LARC
+satisfied at degree three and a neutralization residual of exactly $1$ (nothing of lower degree points
+along $x_1$), hence STLA only; indeed $x_1$ never decreases. The double integrator: STLC at
+$(0.5, 0)$, undecided at $(0.5, 0.3)$ because $g_0 \ne 0$. The unicycle with $U \in \mathcal{U}^+$:
+STLA by Chow, STLC unavailable because symmetry is unavailable.
+</Derivation>
+
+For Hitch the verdict is the one Choset promises in §12.5.6 and the micro-example below computes: the
+car is STLC at every configuration with $|\phi| < \pi/2$, whatever the steering limit $\gamma$. A car
+that can only turn left reaches every pose in the Lot that a normal car can — slowly.
+
+### Global controllability from recurrent drift
+
+<KeyIdea title="Statement (Choset Theorem 12.3.5, after Lian, Wang and Fu)">
+If the drift $g_0$ is **weakly positively Poisson stable** — every point is nonwandering: for every
+$T$ and neighbourhood $V$ of every $x$, $\phi^{g_0}_t(V) \cap V \ne \emptyset$ for some $t > T$ — and
+$U \in \mathcal{U}^\pm$, then the LARC implies controllability on $M$.
+</KeyIdea>
+
+<Derivation title="Recurrence supplies the backward motions symmetry would have" result="\text{WPPS drift} + \text{LARC} \Rightarrow \text{controllable}">
+**Step 1.** The LARC gives forward local reachability: an open set of states is reached from any $x$ in
+short time (STLA).
+
+**Step 2.** To move *against* the drift, wait: recurrence returns the unforced flow arbitrarily close to
+where it started, so a neighbourhood of any state is reached again later without controls, and
+forward-only motions plus waiting generate backward displacements too.
+
+**Step 3.** Chain neighbourhoods along any path, as in the connected-and-STLC argument.
+
+**The example.** $g_0 = \tfrac12[-x_2, x_1]^\top$ (circular orbits — WPPS), $g_1 = \partial_1$:
+$[g_0, g_1] = [0, -\tfrac12]^\top$ and $\det[g_1\ [g_0, g_1]] = -\tfrac12$ everywhere, so the system
+is controllable, though STLC only at the origin where $g_0$ vanishes. The library returns STLA by the
+LARC and $[0, -0.5]$ for the bracket. **The robotics case:** energy-conserving drift on a compact
+configuration space is WPPS by Poincaré recurrence — a frictionless Reach on the horizontal Workbench
+(Exercise 1), a satellite on $SO(3)$ with a single body-fixed torque.
+</Derivation>
+
+### Second-order systems: the symmetric product
+
+A **simple mechanical control system** is Chapter 17's standard form without potential terms,
+$M(q)\ddot q + C(q, \dot q)\dot q = T(q)u$, so that with $Y_i(q)$ the columns of $M^{-1}(q)T(q)$,
+
+$$
+\ddot q = -M^{-1}(q)C(q, \dot q)\dot q + \sum_{i=1}^m \htmlClass{term-robot}{Y_i(q)}\,u_i .
+$$
+
+One can lift this to $M = T\mathcal{Q}$ with $x = (q, \dot q)$, $g_0 = [\dot q;\ -M^{-1}C\dot q]$,
+$g_i = [0;\ Y_i]$ and bracket away — correct, and twice the dimension it needs to be. The acceleration
+$\ddot q$ is not intrinsic (a free particle in polar coordinates has $\ddot r \ne 0$); the intrinsic
+acceleration is $\nabla_{\dot q}\dot q = \ddot q + M^{-1}\dot q\T\Gamma\dot q \in T_q\mathcal{Q}$, the
+coordinate acceleration with the centripetal term projected out, and the object that does the
+projecting is the **covariant derivative** of the kinetic-energy metric,
+
+<LinkedMath>
+$$
+\nabla_{Y_1}Y_2 = \frac{\partial Y_2}{\partial q}\,Y_1 + M^{-1}(q)\,\htmlClass{term-cobstacle}{Y_1\T\,\Gamma(q)\,Y_2},
+\qquad
+\langle Y_1 : Y_2\rangle = \nabla_{Y_1}Y_2 + \nabla_{Y_2}Y_1 .
+$$
+</LinkedMath>
+
+$\Gamma$ are Chapter 17's Christoffel symbols in Choset's convention (no $M^{-1}$ folded in; the
+amber term is the velocity-product form $(Y_1\T\Gamma Y_2)_i = \sum_{jk}\Gamma^i_{jk}Y_{1,j}Y_{2,k}$).
+The equations of motion become $\nabla_{\dot q}\dot q = \sum Y_i u_i$ — Newton's $a = M^{-1}f$ with the
+right $a$ — and unforced motions are geodesics.
+
+<KeyIdea title="Statement (Lewis and Murray; Choset Theorems 12.4.1–12.4.2)">
+From an equilibrium $(q, 0)$, with $\mathrm{Sym}(\mathcal{Y})$ the closure of $\mathcal{Y}$ under
+iterated symmetric products and a product **bad** if every $Y_i$ appears an even number of times:
+
+1. STLA iff $\mathrm{Sym}(\mathcal{Y})(q) = T_q\mathcal{Q}$; STLC if also every bad symmetric product is a combination of good ones of lower degree.
+2. **STLCA** (configurations locally fill a neighbourhood, velocities ignored) iff $\mathrm{Lie}(\mathrm{Sym}(\mathcal{Y}))(q) = T_q\mathcal{Q}$; **STLCC** and **STLEC** (zero-velocity configurations fill a neighbourhood of $q$) under the same neutralization; equilibrium controllable if that holds at every $q$.
+</KeyIdea>
+
+<Derivation title="Why the symmetric product halves the computation" result="[g_i, g_j] = 0,\quad [g_0, g_i] = \begin{bmatrix}-Y_i\\ 0\end{bmatrix},\quad [g_i,[g_0, g_j]] = \begin{bmatrix}0\\ \langle Y_i : Y_j\rangle\end{bmatrix}\ \text{at rest}">
+**Step 1 — the intrinsic acceleration.** On $S^1 \subset \mathbb{R}^2$ a point mass at angle $\theta$
+has $\ddot q = \ddot\theta[-\sin\theta, \cos\theta]^\top + \dot\theta^2[-\cos\theta, -\sin\theta]^\top$.
+Only the $\ddot\theta$ term is visible to an observer confined to the circle; the $\dot\theta^2$ term
+keeps the mass on it. Subtracting the centripetal term is what $M^{-1}\dot q\T\Gamma\dot q$ does in
+general coordinates.
+
+**Step 2 — the connection in coordinates.** For a metric $\langle v_1, v_2\rangle = v_1\T M v_2$ the
+Levi-Civita connection is $\nabla_{Y_1}Y_2 = \frac{\partial Y_2}{\partial q}Y_1 + M^{-1}Y_1\T\Gamma Y_2$,
+with the Christoffel symbols of Chapter 17's equation (10.9). Euclidean metric: $\Gamma = 0$ and
+$\nabla_{Y_1}Y_2$ is the directional derivative.
+
+**Step 3 — block-differentiate on $T\mathcal{Q}$.** With $g_0 = [\dot q;\ -M^{-1}\dot q\T\Gamma\dot q]$
+and $g_i = [0;\ Y_i(q)]$, the Jacobian of $g_i$ has only a lower-left block $\partial Y_i/\partial q$,
+acting on the upper half of its argument — which is zero for every $g_j$, so $[g_i, g_j] = 0$. For
+$[g_0, g_i]$ the upper-right block of $\partial g_0/\partial x$ (the identity) hits $Y_i$ and gives the
+$-Y_i$ in the configuration slot; the velocity slot is linear in $\dot q$ and vanishes at rest. For
+$[g_i, [g_0, g_j]]$ the velocity-product's second derivative in $\dot q$ survives at rest and is exactly
+$M^{-1}(Y_i\T\Gamma Y_j + Y_j\T\Gamma Y_i)$, while the two $\partial Y/\partial q$ terms assemble the
+rest of $\langle Y_i : Y_j\rangle$.
+
+**Step 4 — the reading.** $\mathrm{Sym}(\mathcal{Y})(q)$ is the set of velocity directions reachable
+from rest; $\mathrm{Lie}(\mathrm{Sym}(\mathcal{Y}))(q)$ the set of configuration directions. Sussmann's
+good/bad bookkeeping carries over verbatim because the lift makes $g_0$ appear once in every symmetric
+product.
+
+**Step 5 — in the library.** `liftToStateSpace` builds the six-dimensional fields for the planar body
+with thrusters, and a check confirms the three identities numerically to $10^{-12}$ against
+`symmetricProduct` on $\mathcal{Q}$.
+
+**The planar body with thrusters (Choset Example 12.4.3) — and Reach's free third link.** Unit mass and
+inertia, $\Gamma = 0$, $Y_1 = [\cos q_3, \sin q_3, 0]^\top$ (thrust through the centre of mass),
+$Y_2 = [-\sin q_3, \cos q_3, -d]^\top$ (the offset thruster). Then $\langle Y_1 : Y_2\rangle =
+[d\sin q_3, -d\cos q_3, 0]^\top$, rank 3: STLA from rest. The bad products are $\langle Y_1 : Y_1\rangle = 0$
+and $\langle Y_2 : Y_2\rangle = 2\nabla_{Y_2}Y_2 = 2d\,Y_1$ — Choset prints $dY_1$; the factor is
+immaterial — neutralized by $Y_1$: STLC at rest, confirming the Lie-bracket computation of Example
+12.3.4, where $\det[g_1 \cdots g_6] = d^4$. A single offset thruster gives rank$(Y_2\ \langle Y_2 : Y_2\rangle\
+\langle Y_2 : \langle Y_2 : Y_2\rangle\rangle) = 3$, STLA, with nothing to neutralize the bad products:
+Sussmann is silent, and the system is in fact controllable but not STLC (Choset Figure 12.14).
+Section "Putting it together" asks whether this body *is* Reach's third link when the third motor is
+dead; the honest answer is "kinematically, yes; dynamically, not quite".
+
+**The hopper (Example 12.4.4).** $M = \mathrm{diag}(I, mq_3^2, m)$, $\Gamma^2_{23} = \Gamma^2_{32} = mq_3$,
+$\Gamma^3_{22} = -mq_3$, $Y_1 = [1/I, -1/(mq_3^2), 0]^\top$, $Y_2 = [0, 0, 1/m]^\top$. Angular
+momentum is conserved, so velocities fill at most two dimensions: $\langle Y_1 : Y_1\rangle =
+[0, 0, -2/(m^2q_3^3)]^\top \in \mathrm{span}(Y_2)$, the other products vanish, and $\mathrm{Sym}$ is
+two-dimensional (not STLA) while $[Y_1, Y_2] = [0, -2/(m^2q_3^3), 0]^\top$ completes $\mathrm{Lie}(\mathrm{Sym})$:
+STLEC and equilibrium controllable. The library reports exactly this, and that $\mathrm{Sym}(\mathcal{Y}) = \mathrm{span}(\mathcal{Y})$ —
+the hopper is *maximally reducible* to a kinematic system, Chapter 21's Theorem 12.4.5.
+</Derivation>
+
+### Nonholonomic constraints through the projection
+
+<KeyIdea title="Statement (Choset §12.4.3)">
+For $M\ddot q + \dot q\T\Gamma\dot q = Tu + A\T\lambda$ with $A\dot q = 0$ ($k$ Pfaffian constraints),
+eliminate $\lambda$ with Chapter 17's $P = I - M^{-1}A\T(AM^{-1}A\T)^{-1}A$ to get
+$\tilde\nabla_{\dot q}\dot q = \sum \tilde Y_i u_i$, $\tilde Y_i = PY_i$, with the **constrained
+connection** $\tilde\nabla_{\tilde Y_1}\tilde Y_2 = P\nabla_{\tilde Y_1}\tilde Y_2$. Theorems
+12.4.1–12.4.2 apply unchanged, but velocities live in the $(n_\mathcal{Q} - k)$-dimensional
+distribution $\mathcal{D} = \ker A$, so the most one can hope for is $\mathrm{Sym}(\tilde{\mathcal{Y}}) = \mathcal{D}$
+and STLEC.
+</KeyIdea>
+
+<Derivation title="The knife-edge: Rusty with mass, force and torque" result="\langle\tilde Y_1 : \tilde Y_2\rangle = -\tfrac{\tan q_3}{I}\tilde Y_1,\quad \det_2 = \tfrac{\cos^2 q_3}{m^2I^2},\quad \det_3 = \tfrac{2}{m^2I^4}">
+**Step 1 — the projection.** $M = \mathrm{diag}(m, m, I)$, $A = [\sin q_3, -\cos q_3, 0]$ (no
+sideways velocity), so $P$ has the upper block $\begin{bmatrix}\cos^2 q_3 & \sin q_3\cos q_3\\ \sin q_3\cos q_3 & \sin^2 q_3\end{bmatrix}$
+and a $1$ in the corner: it projects planar velocity onto the heading.
+
+**Step 2 — the inputs.** A force along $q_1$ and a torque about $q_3$: $Y_1 = e_1/m$, $Y_2 = e_3/I$,
+hence $\tilde Y_1 = [\cos^2 q_3, \sin q_3\cos q_3, 0]^\top/m$ — the forward force projected onto the
+heading — and $\tilde Y_2 = e_3/I$.
+
+**Step 3 — the connection.** $\Gamma = 0$, so $\nabla_{\tilde Y_2}\tilde Y_1 = \frac{\partial\tilde Y_1}{\partial q_3}\cdot\frac1I = \frac{1}{mI}[-\sin 2q_3, \cos 2q_3, 0]^\top$
+and $\nabla_{\tilde Y_1}\tilde Y_2 = 0$; projecting with $P$ gives
+$\langle\tilde Y_1 : \tilde Y_2\rangle = \frac{1}{mI}[-\sin q_3\cos q_3, -\sin^2 q_3, 0]^\top = -\frac{\tan q_3}{I}\tilde Y_1$.
+Both self products vanish. So $\mathrm{Sym}(\tilde{\mathcal{Y}}) = \mathrm{span}(\tilde{\mathcal{Y}}) = \mathcal{D}$:
+the knife-edge is maximally reducible — it is "secretly kinematic", the unicycle with velocity inputs,
+which is why Chapter 21 can steer it with Chapter 20's kinematic tools.
+
+**Step 4 — configurations.** $[\tilde Y_1, \tilde Y_2] = \frac{1}{mI}[\sin 2q_3, -\cos 2q_3, 0]^\top$
+and $\det[\tilde Y_1\ \tilde Y_2\ [\tilde Y_1, \tilde Y_2]] = \cos^2 q_3/(m^2I^2)$, which vanishes at
+$q_3 = \pm\pi/2$ — there the projected force $\tilde Y_1$ itself vanishes, and the distribution is not
+regular. One more bracket, $[\tilde Y_2, [\tilde Y_1, \tilde Y_2]] = \frac{2}{mI^2}[\cos 2q_3, \sin 2q_3, 0]^\top$,
+gives $\det[\tilde Y_2\ [\tilde Y_1, \tilde Y_2]\ [\tilde Y_2, [\tilde Y_1, \tilde Y_2]]] = 2/(m^2I^4)$: STLCA
+and STLEC everywhere by Theorem 12.4.2.
+
+**In the library** (with $m = 2$, $I = 0.5$ so the numbers are not all ones): every field above
+matches Choset's closed form to $10^{-9}$, $\det_2 = 0.584984$ at $q_3 = 0.7$ against the formula's
+$0.584984$, $\det_3 = 8.000000$; `larc` on the reduction $\{\tilde Y_1, \tilde Y_2\}$ at $q_3 = \pi/2$
+returns rank 2 and "undecided" at degree two and STLC at degree three — the LARC refusing to
+certify the constrained system until it has the bracket that actually moves it.
+</Derivation>
+
+### The micro-example, by hand
+
+**Unicycle at $x_3 = \pi/6$.** $g_1 = [\cos x_3, \sin x_3, 0]^\top = [0.8660, 0.5, 0]^\top$,
+$g_2 = e_3$. $\partial g_2/\partial x = 0$, and $\partial g_1/\partial x$ has one nonzero column,
+$\partial g_1/\partial x_3 = [-\sin x_3, \cos x_3, 0]^\top$, so
+
+$$
+\lie{g_1}{g_2} = -\frac{\partial g_1}{\partial x}g_2 = \begin{bmatrix}\sin x_3\\ -\cos x_3\\ 0\end{bmatrix} = \begin{bmatrix}0.5\\ -0.866025\\ 0\end{bmatrix},
+\qquad \det[g_1\ g_2\ \lie{g_1}{g_2}] = \det\begin{bmatrix}\cos x_3 & 0 & \sin x_3\\ \sin x_3 & 0 & -\cos x_3\\ 0 & 1 & 0\end{bmatrix} = 1 .
+$$
+
+The exact loop with $\epsilon = 0.1$ moves $[0.005424, -0.008396, 0]$ against $\epsilon^2[g_1, g_2] = [0.005, -0.008660, 0]$;
+the gap, $5.0 \times 10^{-4}$, is $O(\epsilon^3)$ — half a cube is $5 \times 10^{-4}$ exactly.
+
+**Hitch's car (Choset eq. 12.34), $q = (x, y, \phi, \theta)$, $L = 1$.** $g_1 = [\cos\theta, \sin\theta, 0, \tfrac1L\tan\phi]^\top$,
+$g_2 = e_3$. Then $g_3 = [g_1, g_2] = -\partial g_1/\partial\phi = [0, 0, 0, -\sec^2\phi/L]^\top$,
+and $g_4 = [g_1, g_3] = -\frac{\partial g_1}{\partial\theta}\,g_{3,\theta} = \frac{\sec^2\phi}{L}[-\sin\theta, \cos\theta, 0, 0]^\top$,
+with $\det[g_1\ g_2\ g_3\ g_4] = -\sec^4\phi/L^2$. At $q = 0$ the columns are $e_1, e_3, -e_4, e_2$ and the
+determinant is $-1$; the filtration climbs $(2, 3, 4)$ and the car is STLC by symmetry. At a generic
+configuration with $L = 2.6$ the finite-difference $g_3, g_4$ agree with these formulas to $10^{-14}$.
+
+**With the trailer**, state $(x, y, \phi, \theta, \psi)$ and $\dot\psi = (v/d)\sin(\theta - \psi)$,
+the ladder is $(2, 3, 4, 5)$: one more degree for one more coordinate, STLC again. The library finds
+the same ladder at hitch angle $\theta - \psi = \pi/2$ — the trailer's Lie algebra is full rank
+everywhere, as Laumond proved; the jackknife of Chapter 23 is not a loss of controllability, and the
+chart that *does* go singular at $\pm\pi/2$ is Chapter 21's chained form.
+
+## The algorithm
+
+Choset numbers none of these; the names match the Rust module.
+
+<Algorithm
+  name="lie_bracket(g₁, g₂, x)"
+  inputs="two vector fields with Jacobians (analytic, or fourth-order central differences at h = 10⁻³), a point x"
+  outputs="[g₁, g₂](x) = (∂g₂/∂x) g₁ − (∂g₁/∂x) g₂"
+  complexity="O(n²) with analytic Jacobians; O(n²) field evaluations by differences"
+>
+1. $J_1 \leftarrow \partial g_1/\partial x\,(x)$, $J_2 \leftarrow \partial g_2/\partial x\,(x)$ — analytic if the field has one, else $\frac{1}{12h}[f(x - 2h) - 8f(x - h) + 8f(x + h) - f(x + 2h)]$ per column
+2. return $J_2\,g_1(x) - J_1\,g_2(x)$
+3. as a *field*: the closure $x \mapsto$ step 2, whose own Jacobian falls back to differences of an exactly evaluated bracket — one difference level per nesting depth
+</Algorithm>
+
+<Algorithm
+  name="filtration(𝒢, x, max_deg, tol) — Chow's test"
+  inputs="generators g₀ (if drift), g₁ … g_m; the test point; the highest degree; a relative rank tolerance"
+  outputs="dims = (dim 𝒟₁, dim 𝒟₂, …), every product with its generator counts and good/bad tag, a greedy basis, terminated / stalled flags"
+  complexity="(m+1)^k products at degree k before pruning; rank by modified Gram–Schmidt"
+>
+1. $\mathcal{G}_1 \leftarrow \{g_0, g_1, \dots, g_m\}$ with counts $e_i$; $\mathrm{dims} \leftarrow [\mathrm{rank}\{g(x) : g \in \mathcal{G}_1\}]$
+2. for $\deg = 2, \dots, \text{max\_deg}$: for each $g_j \in \mathcal{G}_1$ and each $h$ new at the previous degree, form $[g_j, h]$ (at degree 2 only $j < k$); drop it if it vanishes at $x$ *and* at four probe points nearby; record counts $= \mathrm{counts}(h) + e_j$ and bad $\iff$ $\mathrm{counts}_0$ odd and all other counts even
+3. append $\mathrm{rank}$ of all values so far to dims; stop early if the rank is $n$ or nothing new was formed (closure certain); otherwise continue — a stall is *not* a stop for a non-regular filtration
+4. return dims, products, a greedy independent subset, and stalled = trailing degrees without growth
+</Algorithm>
+
+<Algorithm
+  name="larc(sys, x, max_deg) / sussmann_stlc(sys, x, max_deg)"
+  inputs="a control-affine system (drift or null, controls, control-set class), a point, a degree budget"
+  outputs="Verdict ∈ { stlc-symmetric, stlc-sussmann, stla, confined(dim), undecided } with the filtration and, for Sussmann, every bad bracket's neutralization residual"
+  complexity="one filtration, plus one least-squares projection per bad bracket"
+>
+1. $F \leftarrow$ filtration$(\{g_0, g_1, \dots\}, x)$
+2. **larc:** if $\mathrm{rank}\,F = n$: driftless and $U \in \mathcal{U}^\pm$ ⇒ stlc-symmetric, else stla; if $F$ terminated below $n$ or stalled two degrees ⇒ confined(rank); else undecided
+3. **sussmann:** require $g_0(x) = 0$ and $U \in \mathcal{U}^\pm$, else undecided
+4. $k \leftarrow$ the least degree at which the *good* products alone have rank $n$ (none ⇒ stla if the LARC holds)
+5. for every bad product of degree $j \le k$: residual $\leftarrow$ relative least-squares residual against the good products of degree $< j$; neutralized iff residual $< 10^{-6}$
+6. all neutralized ⇒ stlc-sussmann at degree $k$; else stla with the offending brackets named
+</Algorithm>
+
+<Algorithm
+  name="lewis_murray(∇, 𝒴, q, max_deg, lie_deg, target)"
+  inputs="a connection (kinetic, or constrained P∇), input fields Y₁ … Y_m on 𝒬, a configuration, degree budgets, the velocity dimension to fill (n_𝒬, or n_𝒬 − k under constraints)"
+  outputs="MechVerdict ∈ { stlc, stla, stlec, stlca, confined, undecided }, dim Sym, dim Lie(Sym), maximally-reducible flag, bad products with residuals"
+  complexity="each symmetric product is one Jacobian–vector product and one Christoffel form, O(n_𝒬³); then one Lie filtration of a basis of Sym"
+>
+1. $\mathrm{Sym} \leftarrow$ the recursion $S_1 = \mathcal{Y}$, $S_{i+1} = S_i \cup \{\langle Y_j : h\rangle : Y_j \in S_1,\ h \text{ new in } S_i\}$ with $j \le k$ at degree 2, counts added, bad iff all counts even; dims recorded at $q$
+2. maximally reducible $\iff$ $\dim\mathrm{Sym}(q) = \dim\mathrm{span}(\mathcal{Y})(q)$ (Theorem 12.4.5, for Chapter 21)
+3. neutralized $\iff$ every bad product's residual against lower-degree good ones is $< 10^{-6}$
+4. if target $= n_\mathcal{Q}$ and $\dim\mathrm{Sym} = n_\mathcal{Q}$: neutralized ⇒ stlc, else stla (Theorem 12.4.1)
+5. else $L \leftarrow$ filtration of a basis of Sym (as fields) to lie_deg; $\dim L = n_\mathcal{Q}$ and neutralized ⇒ stlec (and STLCC); $\dim L = n_\mathcal{Q}$ alone ⇒ stlca; closed below ⇒ confined; else undecided (Theorem 12.4.2)
+</Algorithm>
+
+## Implementation in Rust
+
+The `nonholonomic` crate is introduced here; Chapter 21 adds `steer/`, `lattice/`, `reduction/` and
+`car_grid.rs` to it. Brackets, filtrations and symmetric products are hand-rolled per the book's policy;
+`nalgebra` supplies the fixed-size vectors and the rank. The TypeScript port in `web/lib/nonholonomic/`
+is the code behind every widget on this page.
+
+```rust title="crates/nonholonomic/src/field.rs"
+use nalgebra::{SMatrix, SVector};
+
+/// A smooth vector field on a chart of an N-dimensional state manifold.
+///
+/// Brackets need Jacobians, so the trait carries one. The default is a
+/// fourth-order central difference with a deliberately *large* step: a nested
+/// bracket differentiates a bracket, and a difference of a difference loses
+/// half its digits per level if h is tiny. Concrete systems override it with
+/// the analytic Jacobian, which is what makes degree-4 products trustworthy.
+pub trait VectorField<const N: usize> {
+    fn eval(&self, x: &SVector<f64, N>) -> SVector<f64, N>;
+
+    fn jacobian(&self, x: &SVector<f64, N>) -> SMatrix<f64, N, N> {
+        central_difference(|y| self.eval(y), x, 1e-3)
+    }
+}
+
+/// ∂f/∂x by the 5-point stencil (f(x−2h) − 8f(x−h) + 8f(x+h) − f(x+2h)) / 12h, per column.
+pub fn central_difference<const N: usize>(
+    f: impl Fn(&SVector<f64, N>) -> SVector<f64, N>,
+    x: &SVector<f64, N>,
+    h: f64,
+) -> SMatrix<f64, N, N> {
+    let mut j = SMatrix::<f64, N, N>::zeros();
+    for k in 0..N {
+        let mut e = SVector::<f64, N>::zeros();
+        e[k] = h;
+        let col = (f(&(x - 2.0 * e)) - 8.0 * f(&(x - e)) + 8.0 * f(&(x + e)) - f(&(x + 2.0 * e))) / (12.0 * h);
+        j.set_column(k, &col);
+    }
+    j
+}
+
+/// [g1, g2] = (∂g2/∂x) g1 − (∂g1/∂x) g2 — Choset eq. (12.5), same sign convention,
+/// so the loop g1 → g2 → −g1 → −g2 moves by +ε²[g1, g2]. A `Bracket` is itself a
+/// `VectorField`, so brackets nest: `Bracket(g1, Bracket(g1, g2))` is the car's g4.
+pub struct Bracket<F, G>(pub F, pub G);
+
+impl<const N: usize, F: VectorField<N>, G: VectorField<N>> VectorField<N> for Bracket<F, G> {
+    fn eval(&self, x: &SVector<f64, N>) -> SVector<f64, N> {
+        self.1.jacobian(x) * self.0.eval(x) - self.0.jacobian(x) * self.1.eval(x)
+    }
+}
+
+/// Choset's unicycle (Example 12.1.3): drive and spin, with analytic Jacobians.
+pub struct Drive;
+pub struct Spin;
+
+impl VectorField<3> for Drive {
+    fn eval(&self, x: &SVector<f64, 3>) -> SVector<f64, 3> {
+        SVector::<f64, 3>::new(x[2].cos(), x[2].sin(), 0.0)
+    }
+    fn jacobian(&self, x: &SVector<f64, 3>) -> SMatrix<f64, 3, 3> {
+        let mut j = SMatrix::<f64, 3, 3>::zeros();
+        j[(0, 2)] = -x[2].sin();
+        j[(1, 2)] = x[2].cos();
+        j
+    }
+}
+
+impl VectorField<3> for Spin {
+    fn eval(&self, _x: &SVector<f64, 3>) -> SVector<f64, 3> {
+        SVector::<f64, 3>::new(0.0, 0.0, 1.0)
+    }
+    fn jacobian(&self, _x: &SVector<f64, 3>) -> SMatrix<f64, 3, 3> {
+        SMatrix::<f64, 3, 3>::zeros()
+    }
+}
+
+/// The four-flow loop of eq. (12.3) by RK4, returning x(4ε) − x₀ and the
+/// prediction ε²[g1, g2](x₀); their difference is the O(ε³) remainder.
+pub fn four_flow_loop<const N: usize>(
+    g1: &impl VectorField<N>,
+    g2: &impl VectorField<N>,
+    x0: &SVector<f64, N>,
+    eps: f64,
+) -> (SVector<f64, N>, SVector<f64, N>) {
+    let mut x = *x0;
+    x = flow(g1, &x, eps);
+    x = flow(g2, &x, eps);
+    x = flow(g1, &x, -eps);
+    x = flow(g2, &x, -eps);
+    (x - x0, eps * eps * Bracket(g1, g2).eval(x0))
+}
+```
+
+The filtration follows Choset's recursion literally, with the generator counts that make Sussmann's
+tagging a counting exercise.
+
+```rust title="crates/nonholonomic/src/filtration.rs"
+use nalgebra::SVector;
+
+/// A Lie product with its provenance: which generators, how many times.
+pub struct LieProduct<const N: usize> {
+    pub field: Box<dyn VectorField<N>>,
+    pub degree: usize,
+    /// counts[i] = occurrences of generator i; index 0 is the drift when there is one.
+    pub counts: Vec<usize>,
+    pub value: SVector<f64, N>,
+    /// Sussmann: bad iff the drift appears an odd number of times and every control an even number.
+    pub bad: bool,
+}
+
+pub struct Filtration<const N: usize> {
+    /// dim D₁, dim D₂, … — (2, 3, 4) for the car, (2, 3, 4, 5) with the trailer.
+    pub dims: Vec<usize>,
+    pub products: Vec<LieProduct<N>>,
+    /// Full rank, or nothing left to bracket: the closure is certain.
+    pub terminated: bool,
+    /// Trailing degrees that added no dimension. A stall is reported, never used to stop:
+    /// a non-regular filtration may pause and grow again (the knife-edge at q₃ = ±π/2).
+    pub stalled: usize,
+}
+
+pub fn filtration<const N: usize>(
+    fields: &[Box<dyn VectorField<N>>],
+    x: &SVector<f64, N>,
+    max_deg: usize,
+    drift_index: Option<usize>,
+    tol: f64,
+) -> Filtration<N> {
+    let m = fields.len();
+    let mut products: Vec<LieProduct<N>> = (0..m)
+        .map(|i| {
+            let mut counts = vec![0; m];
+            counts[i] = 1;
+            LieProduct { field: fields[i].clone_box(), degree: 1, counts: counts.clone(),
+                         value: fields[i].eval(x), bad: tag_bad(&counts, drift_index) }
+        })
+        .collect();
+    let mut dims = vec![rank(products.iter().map(|p| p.value), tol)];
+    let mut frontier: Vec<usize> = (0..m).collect();
+    let mut terminated = false;
+
+    for deg in 2..=max_deg {
+        let mut fresh = Vec::new();
+        for j in 0..m {
+            for &h in &frontier {
+                // Degree 2: [g_j, g_k] with j < k only — [g, g] = 0 and antisymmetry.
+                if deg == 2 && j >= products[h].counts.iter().position(|&c| c == 1).unwrap() { continue; }
+                let g = Bracket(fields[j].clone_box(), products[h].field.clone_box());
+                if vanishes_near(&g, x) { continue; }          // identically zero, not merely at x
+                let mut counts = products[h].counts.clone();
+                counts[j] += 1;
+                let bad = tag_bad(&counts, drift_index);
+                fresh.push(LieProduct { value: g.eval(x), field: Box::new(g), degree: deg, counts, bad });
+            }
+        }
+        let start = products.len();
+        products.extend(fresh);
+        frontier = (start..products.len()).collect();
+        dims.push(rank(products.iter().map(|p| p.value), tol));
+        if *dims.last().unwrap() == N || frontier.is_empty() { terminated = true; break; }
+    }
+    let stalled = dims.windows(2).rev().take_while(|w| w[0] == w[1]).count();
+    Filtration { dims, products, terminated, stalled }
+}
+
+pub enum Verdict { StlcSymmetric { degree: usize }, StlcSussmann { degree: usize, neutralized: Vec<String> },
+                   Stla { degree: usize }, Confined { dim: usize }, Undecided(String) }
+
+/// Chow / LARC (Theorem 12.3.1) with the symmetry shortcut.
+pub fn larc<const N: usize>(sys: &ControlAffine<N>, x: &SVector<f64, N>, max_deg: usize) -> Verdict {
+    let f = filtration(&sys.generators(), x, max_deg, sys.drift_index(), 1e-7);
+    let rank = *f.dims.last().unwrap();
+    let degree = f.dims.iter().position(|&d| d == N).map_or(0, |i| i + 1);
+    match (rank == N, sys.drift.is_none() && sys.control_set == ControlSet::PlusMinus) {
+        (true, true) => Verdict::StlcSymmetric { degree },
+        (true, false) => Verdict::Stla { degree },
+        (false, _) if f.terminated || f.stalled >= 2 => Verdict::Confined { dim: rank },
+        _ => Verdict::Undecided(format!("rank {rank} < {N} after degree {max_deg}")),
+    }
+}
+
+/// Sussmann (Theorem 12.3.3) at an equilibrium: good brackets span, bad ones are
+/// neutralized by lower-degree good ones (relative least-squares residual < 1e-6).
+pub fn sussmann_stlc<const N: usize>(sys: &ControlAffine<N>, x: &SVector<f64, N>, max_deg: usize) -> Verdict {
+    let Some(g0) = &sys.drift else { return larc(sys, x, max_deg) };
+    if g0.eval(x).norm() > 1e-8 { return Verdict::Undecided("g0(x) ≠ 0: only equilibria".into()); }
+    let f = filtration(&sys.generators(), x, max_deg, Some(0), 1e-7);
+    let good_rank_at = |deg| rank(f.products.iter().filter(|p| !p.bad && p.degree <= deg).map(|p| p.value), 1e-7);
+    let Some(k) = (1..=f.dims.len()).find(|&d| good_rank_at(d) == N) else {
+        return Verdict::Stla { degree: f.dims.len() };
+    };
+    let mut neutralized = Vec::new();
+    for p in f.products.iter().filter(|p| p.bad && p.degree <= k) {
+        let lower: Vec<_> = f.products.iter().filter(|q| !q.bad && q.degree < p.degree).map(|q| q.value).collect();
+        if relative_residual(&p.value, &lower) > 1e-6 { return Verdict::Stla { degree: k }; }
+        neutralized.push(p.label());
+    }
+    Verdict::StlcSussmann { degree: k, neutralized }
+}
+```
+
+The mechanical half imports Chapter 17's `Model` for $M$, $\Gamma$ and the projection $P$, and
+differentiates only the input fields.
+
+```rust title="crates/nonholonomic/src/mechanical.rs"
+use dynamics::{Model, Pfaffian};
+use nalgebra::{SMatrix, SVector};
+
+/// ∇_{Y1} Y2 = (∂Y2/∂q) Y1 + M⁻¹ Y1ᵀ Γ Y2, Choset's convention for Γ (no M⁻¹ inside).
+pub fn covariant<const Q: usize>(
+    y1: &dyn VectorField<Q>, y2: &dyn VectorField<Q>, model: &Model<Q>, q: &SVector<f64, Q>,
+) -> SVector<f64, Q> {
+    let gamma = model.christoffel(q);                       // Q slices of Q×Q
+    let (v1, v2) = (y1.eval(q), y2.eval(q));
+    let mut form = SVector::<f64, Q>::zeros();
+    for i in 0..Q { form[i] = (v1.transpose() * gamma[i] * v2)[(0, 0)]; }
+    y2.jacobian(q) * v1 + model.inertia(q).try_inverse().unwrap() * form
+}
+
+/// ⟨Y1 : Y2⟩ = ∇_{Y1}Y2 + ∇_{Y2}Y1; with a Pfaffian constraint, P ∇ in place of ∇ (eq. 12.22).
+pub fn symmetric_product<const Q: usize>(
+    y1: &dyn VectorField<Q>, y2: &dyn VectorField<Q>, model: &Model<Q>,
+    constraint: Option<&Pfaffian<Q>>, q: &SVector<f64, Q>,
+) -> SVector<f64, Q> {
+    let s = covariant(y1, y2, model, q) + covariant(y2, y1, model, q);
+    match constraint {
+        None => s,
+        Some(c) => dynamics::projection_p(&model.inertia(q), &c.a(q)) * s,
+    }
+}
+
+/// Ỹ_i = P Y_i — the constrained inputs of §12.4.3.
+pub fn constrained_inputs<const Q: usize>(
+    inputs: &[Box<dyn VectorField<Q>>], constraint: &Pfaffian<Q>, model: &Model<Q>,
+) -> Vec<Box<dyn VectorField<Q>>> {
+    inputs.iter().map(|y| Box::new(Projected { y: y.clone_box(), constraint: constraint.clone(), model: model.clone() })
+                       as Box<dyn VectorField<Q>>).collect()
+}
+
+pub enum MechVerdict { Stlc, Stla, Stlec, Stlca, Confined { dim: usize }, Undecided }
+
+/// Theorems 12.4.1–12.4.2 from rest. `target` is n_Q, or n_Q − k under k constraints.
+pub fn lewis_murray<const Q: usize>(
+    inputs: &[Box<dyn VectorField<Q>>], model: &Model<Q>, constraint: Option<&Pfaffian<Q>>,
+    q: &SVector<f64, Q>, max_deg: usize, lie_deg: usize, target: usize,
+) -> MechVerdict {
+    let sym = sym_closure(inputs, model, constraint, q, max_deg);  // same recursion, ⟨:⟩ for [,], j ≤ k at degree 2
+    let neutralized = sym.products.iter().filter(|p| p.bad).all(|p| {
+        let lower: Vec<_> = sym.products.iter().filter(|s| !s.bad && s.degree < p.degree).map(|s| s.value).collect();
+        relative_residual(&p.value, &lower) < 1e-6
+    });
+    if target == Q && sym.rank == Q {
+        return if neutralized { MechVerdict::Stlc } else { MechVerdict::Stla };
+    }
+    let lie = filtration(&sym.basis_fields(), q, lie_deg, None, 1e-7);
+    match (*lie.dims.last().unwrap() == Q, neutralized, lie.terminated) {
+        (true, true, _) => MechVerdict::Stlec,
+        (true, false, _) => MechVerdict::Stlca,
+        (false, _, true) => MechVerdict::Confined { dim: *lie.dims.last().unwrap() },
+        _ => MechVerdict::Undecided,
+    }
+}
+```
+
+### The worked example, printed
+
+`cargo run --example chow_car -p nonholonomic` prints the micro-example and the lab's verdicts. Every
+line is reproduced by the TypeScript checks (`npm run check`, the `nonholonomic:` block) to the digits shown.
+
+```text
+unicycle at x3 = pi/6:
+  [g1, g2]               = [0.500000, -0.866025, 0.000000]      (hand formula: identical)
+  loop residue, eps = 0.1 = [0.005424, -0.008396, 0.000000]
+  eps^2 [g1, g2]          = [0.005000, -0.008660, 0.000000]      gap 5.00e-4 = O(eps^3)
+  det[g1 g2 [g1,g2]]      = 1.000000
+  log-log slope of |residue| over eps = 0.4 ... 0.025:  1.993  1.998  2.000  2.000
+
+Hitch (eq. 12.34), L = 1, q = 0:
+  columns  e1, e3, -e4, e2      det = -1.000000      dims = [2, 3, 4]      Verdict::StlcSymmetric
+  generic q, L = 2.6:  |g3 - hand| = 0.0e+0   |g4 - hand| = 2.3e-15   det = -0.189977 = -sec^4(phi)/L^2
+  with trailer (L = d = 1):  dims = [2, 3, 4, 5] at q = 0 and at hitch angle pi/2 — regular everywhere
+
+Example 12.1.7:  interior StlcSymmetric;  half-plane Confined { dim: 2 } dims [2,2,2,2,2];  axis Confined { dim: 1 }
+
+PBWT, d = 1.3, a_g = 0:  det[g1..g6] = 2.856100 = d^4;  at rest StlcSussmann, [g2,[g0,g2]] = 2d g1 neutralized (1.4e-15)
+  u1 only: rank 2 (Confined);  u2 only: rank 6 at degree 6, det of Choset's six columns = -130.5169 = -16 d^8, Stla
+  symmetric product: <Y1:Y2> = [d sin q3, -d cos q3, 0];  <Y2:Y2> = 2d Y1;  Lewis-Murray Stlc
+
+knife-edge, m = 2, I = 0.5:  <Y~1:Y~2> = -(tan q3 / I) Y~1;  Sym = span (maximally reducible)
+  det2 = 0.584984 = cos^2(q3)/(m^2 I^2) at q3 = 0.7;  det3 = 8.000000 = 2/(m^2 I^4);  Stlec
+  reduction LARC at q3 = pi/2:  degree 2 rank 2 (undecided),  degree 3 StlcSymmetric dims [1,2,3]
+
+Reach 3R, u3 = 0, a_g = 0, q = (0.3, 1.1, -0.5):  Sym dims 2 -> 3 (Stla);  bad <Y1:Y1> residual 0.105, <Y2:Y2> 0.048
+  -> Lewis-Murray cannot certify STLC; STLKC does the planner's job in Chapter 21
+```
+
+## Putting it together
+
+The Integration lab drops the chapter's tests on the lab's three systems.
+
+**Hitch, with and without the trailer.** `larc(carSystem(2.6), q)` at every configuration with
+$|\phi| < \gamma = 0.6$ returns STLC with the ladder $(2, 3, 4)$ — including $\phi = 0.58$ rad, hard
+against the steering stop, where Choset's remark that a car which can only turn one way reaches every
+pose becomes a number. With the trailer the ladder is $(2, 3, 4, 5)$ at hitch angle $0$, at $0.8$, and
+at $\pi/2$. **This is a deviation from the design brief**, which expected the ladder to stall at
+$\pm\pi/2$; the computation does not stall and the literature agrees (the one-trailer system is STLC
+everywhere). What *is* singular at $\theta_1 = \pm\pi/2$ is the trailer's velocity $v\cos\theta_1$ and
+with it the chained-form coordinate change and the flat-output lift of Chapter 21 — the jackknife is a
+planning and dynamics failure, not a controllability one, and Chapter 23 will say so.
+
+**Reach's 3R with the third motor dead**, horizontal Workbench. Choset's §12.5.7 says the free third
+link "is equivalent to the PBWT in zero gravity, except the thruster forces at the third joint are
+generated by the actuators at the first two joints". Kinematically that is right, and Chapter 21 drives
+the link like a car along its two decoupling fields. Dynamically the arm is not the free body: its two
+input fields $Y_i = (M^{-1}[e_1\ e_2])_{\cdot i}$ carry the arm's inertia, and the Lewis–Murray test at
+$q = (0.3, 1.1, -0.5)$ returns $\dim\mathrm{Sym} = 3$ (STLA from rest) with the bad products
+$\langle Y_1 : Y_1\rangle$ and $\langle Y_2 : Y_2\rangle$ *outside* $\mathrm{span}(\mathcal{Y})$ —
+relative residuals $0.105$ and $0.048$. Sussmann's condition is sufficient, not necessary, so the arm
+may well be STLC; the test cannot say, and the chapter does not claim it. The design brief's expectation
+of a printed `Stlc` is therefore not met, and the honest line in its place is: *STLA, with STLKC — hence
+STLEC — supplied by the kinematic reduction of the next chapter*, which is exactly the property the
+switch-minimizing planner needs.
+
+**Rusty with mass**, the knife-edge: maximally reducible, so everything Part III did with Rusty's
+kinematic model was legitimate for the dynamic one too, and STLEC everywhere once the degree-three
+bracket is admitted.
+
+Which leaves the question this chapter cannot answer and the next one is about: *controllable — with
+what controls?* The four-flow loop is a proof, not a plan. Chapter 21 spends the controllability
+established here six different ways.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Reach's 2R with one motor, on the horizontal Workbench">
+    Write Reach's 2R dynamics (Chapter 17, $a_g = 0$) in the control-affine form on $T(T^2)$ with
+    $u_2 = 0$: $g_0 = [\dot q;\ -M^{-1}C\dot q]$, $g_1 = [0;\ M^{-1}e_1]$. Argue that $g_0$ is WPPS from
+    energy conservation on the compact $T^2$, attempt the LARC for Theorem 12.3.5 (the library's
+    `liftToStateSpace` and `larc` will do the brackets), and explain why the arm is *not* controllable
+    with $u_2 \in \mathbb{R}$ but $u_1 = 0$.
+    <Hints>
+      <>Energy-conserving drift on a compact space is WPPS by Poincaré recurrence (Choset, after Theorem 12.3.5); the arm's state space $T(T^2)$ is not compact, but the energy level sets are.</>
+      <>With $u_1 = 0$ the shoulder is free: the total angular momentum about the shoulder is conserved, a velocity constraint that integrates the acceleration constraint away — the arm lives on a 3-dimensional leaf of the 4-dimensional state space. Compare the hopper.</>
+      <>With $u_2 = 0$ no such conservation law exists (the elbow torque is internal), and $[g_0, g_1]$, $[g_1, [g_0, g_1]]$, $[g_0, [g_0, g_1]]$ generically complete the rank: the LARC holds, and Theorem 12.3.5 gives controllability.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="The car's ladder, symbolically, and the trailer's extra rung">
+    Prove Choset's Problem 13 — the car (12.34) is STLC — by exhibiting the ladder $(2, 3, 4)$:
+    compute $g_3 = [g_1, g_2]$ and $g_4 = [g_1, g_3]$ by hand and show
+    $\det[g_1\ g_2\ g_3\ g_4] = -\sec^4\phi/L^2$. Then add the trailer with
+    $\dot\theta_1 = \tfrac{u_1}{L}\tan\phi - \tfrac{u_1}{d_1}\sin\theta_1$ for the hitch angle
+    $\theta_1 = \theta - \psi$, show one more degree is needed, and locate the configurations where
+    $g_5 = [g_1, g_4]$ loses its $\theta_1$-component.
+    <CheckAnswer id="ch20.e2" prompt="det[g₁ g₂ g₃ g₄] for L = 1 at φ = π/4" answer={-4} tolerance={0.01}>
+    $\sec^2(\pi/4) = 2$, so $-\sec^4\phi/L^2 = -4$. At $\phi = 0$ the fifth field is
+    $[g_1, g_4] = e_5/(Ld_1^2)$ (in the chart with the trailer's absolute heading): pure trailer motion,
+    and the ladder reads $(2, 3, 4, 5)$. Nowhere does it stall — the one-trailer system is STLC at every
+    configuration — but the $\theta_1$-component of $g_4$, $(\sec^2\phi/L)\cos\theta_1/d_1$, vanishes at
+    $\theta_1 = \pm\pi/2$: the hitch angle stops responding to steering at first order there, which is
+    the first symptom of the jackknife.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Predict the residue, then its error">
+    <Predict
+      id="ch20.e3"
+      question="In the Parallel-Parker at ε = 0.2 with the unicycle pair, from heading π/6, the sideways (second) component of the exact residue is compared with ε²[g₁, g₂]₂ = −0.0346. Which is it?"
+      options={[
+        { label: 'Exactly −0.0346: the prediction is exact for the unicycle', because: 'The ε² term is only the leading term. The closed form ε[cos x₃ − cos(x₃ + ε), sin x₃ − sin(x₃ + ε), 0] has an ε³/2 term along the heading, which has a nonzero second component at x₃ = π/6.' },
+        { label: 'About −0.0324: the loop under-delivers sideways by ≈ +0.0022', correct: true, because: 'The exact residue is [0.02332, −0.03242, 0]; the O(ε³) term is (ε³/2)[cos x₃, sin x₃, 0] = 0.004 × [0.866, 0.5, 0], whose second component +0.002 pushes the residue toward zero. Finite differences of the loop confirm the sign.' },
+        { label: 'About −0.0368: the loop over-delivers', because: 'That would need the ε³ correction to point against the bracket. It points along the heading, g₁, and at x₃ = π/6 the heading has a positive y-component — the correction is +, the bracket component is −.' },
+      ]}
+    >
+    Now switch to the car pair $(g_1, g_3)$. The residue is $\epsilon^2 g_4$, sideways — but the
+    *original* inputs are speed and steering rate, and $g_3$ is itself a bracket. Realized with speed
+    and steering-rate loops, the sideways motion needs a loop whose one leg is a loop: $O(\epsilon^3)$
+    in the original inputs for $O(\epsilon)$ time. That extra power is the price of putting the steering
+    angle in the state, and the reason the four-state car's filtration is one rung taller than the
+    reduced car's.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="How far behind, how soon">
+    In the Reachable Set Grower switch to the forward-only control set $\mathcal{U}^+$ with both inputs.
+    Find the smallest horizon $T$ for which a sampled state lies *behind* the start ($x < 0$), and relate
+    it to the turning radius ($\rho = 1$ at unit speed and unit turn rate) and to the "controllable, not
+    STLC" rung of the ladder.
+    <Hints>
+      <>With $v \le 1$ and $0 \le \omega \le 1$ the heading can grow at most at rate 1, so $\dot x = v\cos\theta \ge 0$ for all $t \le \pi/2$: nothing is behind the start before $T = \pi/2$ whatever the controls.</>
+      <>To actually get behind, the trajectory must also stay inside $V$ — a half-turn of radius 1 needs a ball of radius about 1. Below that radius no $T$ suffices: the property fails for *small* neighbourhoods, which is the definition of "not STLC".</>
+      <>In the open plane with $V = M$ a full loop returns Hitch to any point behind: controllable. The ladder's dashed arrow STLA → STLC is what the forward-only set breaks; the solid STLA → accessible and controllable → accessible both still hold.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="Reach's free third link as VectorField<6>">
+    Implement `impl VectorField<6>` for the planar body with thrusters of mass $m$ and inertia $I$
+    (Choset Problems 14–16) with the analytic Jacobians, build Choset's $g_3 \dots g_6$ with `Bracket`,
+    and reproduce $\det[g_1 \cdots g_6] = d^4$ for $m = I = 1$ in a test. Then show that `sussmann_stlc`
+    returns `StlcSussmann` at rest only when $a_g = 0$.
+    <Hints>
+      <>Only $g_1$, $g_2$ depend on the state, through $x_3$; their Jacobians have two nonzero entries each. $g_0$'s Jacobian is the constant shift matrix with the identity in the upper-right block.</>
+      <>With $a_g \ne 0$, $g_0(x) = [0, 0, 0, 0, -a_g, 0]^\top \ne 0$ at every state: the degree-one bad bracket cannot be neutralized and the theorem does not apply. The TypeScript `pbwt(d, 9.81)` check returns `undecided` for exactly this reason.</>
+      <>For general $m, I$ the thrust fields scale by $1/m$ and the torque entry by $1/I$; the determinant becomes $d^4/(m^4 I^2)$ — check it against the library's `pbwt(d, 0, m, I)`.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="A Philip Hall basis, and a symbolic determinant (stretch)">
+    Replace Choset's recursion in `filtration` by a Philip Hall basis so that only the independent
+    products of each degree are formed; benchmark bracket evaluations for the car-with-trailer to degree
+    five against the current implementation. Then add a small symbolic backend (polynomials in
+    $\cos, \sin, \tan, \sec$ of the state) so that the car's $\det[g_1\ g_2\ g_3\ g_4] = -\sec^4\phi/L^2$
+    is produced as an expression rather than a number.
+    <Hints>
+      <>Hall words: generators are Hall elements; $[u, v]$ is a Hall element iff $u, v$ are, $u > v$ in the ordering, and if $u = [u', u'']$ then $u'' \le v$. The count at degree $k$ is Witt's formula $\frac1k\sum_{e \mid k}\mu(e)m^{k/e}$: for $m = 2$ that is $2, 1, 2, 3, 6$ at degrees $1 \dots 5$, against $2, 1, 2, 4, 8$ for the current recursion.</>
+      <>A symbolic field is a vector of expressions; the bracket needs symbolic partial derivatives of $\cos, \sin, \tan$ only — the chain rule on four function kinds.</>
+    </Hints>
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 12, §12.1–12.4: the vector-field preliminaries, the four-flow derivation (eq. 12.3–12.5), Examples 12.1.1–12.1.8 and 12.4.3–12.4.4, 12.4.9, Theorems 12.3.1, 12.3.3, 12.3.5, 12.4.1–12.4.2, and Problems 1–29, which this chapter follows section by section. Chow's 1939 paper and the Lian–Wang–Fu recurrence theorem are cited there as refs. 112 and 289."
+  />
+  <Reference
+    authors="Sussmann, H. J."
+    year={1987}
+    title="A General Theorem on Local Controllability"
+    venue="SIAM Journal on Control and Optimization 25(1)"
+    doi="10.1137/0325011"
+    note="The good-and-bad-bracket sufficient condition for small-time local controllability at an equilibrium, stated here as Theorem 12.3.3 and implemented as sussmannStlc with explicit neutralization residuals."
+  />
+  <Reference
+    authors="Lewis, A. D. and Murray, R. M."
+    year={1997}
+    title="Configuration Controllability of Simple Mechanical Control Systems"
+    venue="SIAM Journal on Control and Optimization 35(3)"
+    doi="10.1137/S0363012995287155"
+    note="The symmetric product, the symmetric closure and the tests for STLA, STLC, STLCA, STLCC and equilibrium controllability from rest (Theorems 12.4.1–12.4.2), implemented as lewisMurray."
+  />
+  <Reference
+    authors="Murray, R. M., Li, Z., and Sastry, S. S."
+    year={1994}
+    title="A Mathematical Introduction to Robotic Manipulation"
+    venue="CRC Press"
+    url="https://www.cds.caltech.edu/~murray/mlswiki/"
+    note="Chapter 7's treatment of nonholonomic systems — distributions, Frobenius, Chow, the Philip Hall basis and chained forms — is the standard long-form companion to Choset's §12.1–12.3 and the source of Exercise 6."
+  />
+  <Reference
+    authors="Bullo, F. and Lewis, A. D."
+    year={2005}
+    title="Geometric Control of Mechanical Systems: Modeling, Analysis, and Design for Simple Mechanical Control Systems"
+    venue="Springer, Texts in Applied Mathematics 49"
+    doi="10.1007/978-1-4899-7276-7"
+    note="The affine-connection formulation of mechanical control systems in full: covariant derivatives, the symmetric product, constrained connections, and the kinematic reductions Chapter 21 uses."
+  />
+  <Reference
+    authors="Solà, J., Deray, J., and Atchuthan, D."
+    year={2018}
+    title="A micro Lie theory for state estimation in robotics"
+    venue="arXiv:1812.01537"
+    url="https://arxiv.org/abs/1812.01537"
+    note="The bridge from this chapter's vector-field brackets to the sister book's matrix Lie groups: the Lie bracket of left-invariant fields on SE(2) is the matrix commutator (up to Choset's sign), which is why the four-flow residue of Hitch's drive and spin is the se(2) bracket of their generators."
+  />
+</References>

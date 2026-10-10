@@ -1,0 +1,787 @@
+---
+title: "Robots That Plan: The Piano Mover's Problem"
+description: Why motion planning is a discipline with theorems rather than a bag of heuristics — the piano mover, Choset's taxonomy of planners, a complete planner in forty lines, and the one idea the whole book rests on, that a robot is a point in the right space.
+chapter: 1
+part: PART I
+partTitle: Foundations — Robots, Worlds, and Configuration Space
+difficulty: Foundational
+readingTime: 40 min
+quote: The prototypical task is to find a path for a robot, whether it is a robot arm, a mobile robot, or a magically free-flying piano, from one configuration to another while avoiding obstacles.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 1
+---
+
+import { BugPreview } from '@/components/ch/ch01/bug-preview';
+import { PianoMover } from '@/components/ch/ch01/piano-mover';
+import { PlannersTaxonomy } from '@/components/ch/ch01/planners-taxonomy';
+import { HowToRead } from '@/components/ch/ch01/how-to-read';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'State the path-planning problem as Choset writes it — a curve c : [0,1] → Q_free — and say what each symbol means',
+    'Explain why planning for a body is planning for a point in a different space, and what that reduction costs',
+    'Place any planner on Choset\'s three-axis board: task, robot, algorithm, including the three kinds of completeness',
+    'Run Bug1 by hand on a text world, reproduce the 28-step answer, and check it against the bound d + 1.5 Σ pᵢ',
+    'Build and run the book\'s first Rust program, and know what the next twenty-two chapters will build on top of it',
+  ]}
+  prerequisites={[
+    'Fluency in some programming language (Rust not yet required — Appendix A is the on-ramp)',
+    'Vectors and matrices at the "seen them before" level',
+    'Comfort with the idea of a function',
+  ]}
+>
+You already know how to make a robot move. This book is about making it decide *where* to move, and
+its thesis is that this is a discipline with theorems, not a bag of heuristics. The discipline rests
+on one idea that Choset and his co-authors put in their first paragraph and never let go of: a
+robot, however many joints it has, is a **point** in the right space. Motion planning does not
+happen in the room; it happens in configuration space, where the piano is a point and the walls have
+become shapes the point must avoid. Everything else in the book — bugs, potentials, roadmaps,
+samplers, trajectories, Lie brackets — is a way of finding a curve for that point.
+
+This chapter sets the voice for the other twenty-two: hook first, playful when it helps, and every
+playful claim backed immediately by a figure you can drag, a number you can check, or a `cargo run`
+that prints that number. It is the one chapter where intuition outweighs mathematics, but nothing
+stated here is retracted later.
+</Overview>
+
+## The problem
+
+Below, a point robot with nothing but a contact sensor is crawling toward a goal it cannot see
+past. Its entire strategy is two sentences long: walk toward the goal; if you bump into something,
+go around it. Watch it arrive.
+
+<Deferred minHeight={460}>
+  <BugPreview />
+</Deferred>
+
+This is a provably complete planner, and it fits in forty lines.
+
+"Complete" is a technical word and the whole book is careful about it: the planner finds a path
+whenever one exists and reports failure in finite time when none does. It needs no map. It never
+plans ahead. It has a *theorem* — the counter under the canvas never exceeds the bound printed
+beside it, and the bound is a formula, not a measurement. Drag the goal behind the larger obstacle:
+the walk around it gets longer and the bound grows with it, exactly as the formula says it must.
+Switch to Bug2, the greedy sibling that leaves an obstacle the first time it can, and the two totals
+tell you something that is true of search in general: greed is usually faster and sometimes
+disastrous. The "comb" preset is a world built so that greed loses.
+
+Everything in this chapter is a first look at something a later chapter proves. The Bugs are
+Chapter 3's. The deeper claim — that the robot's shape can be made to disappear — is Chapter 4's,
+and it comes next.
+
+## Building intuition
+
+### The piano is a point
+
+Choset's opening problem is the **piano mover's problem**: a rigid body, a known set of stationary
+obstacles, a start and a goal; find a collision-free path. In the plane it becomes the sofa mover's
+problem, and a sofa is enough to make the point.
+
+<Deferred minHeight={520}>
+  <PianoMover />
+</Deferred>
+
+On the left is the room: a wall with a doorway, and a sofa you can drag and turn. On the right is
+something you have probably never looked at before. It is the *same* sofa, drawn as a single dot,
+in a space whose axes are the sofa's position — and the amber shapes around the dot are the sofa's
+*configurations* that would put it through a wall, at the heading it currently has.
+
+Drag the sofa into the wall. The dot touches amber at the same instant. Not before, not after:
+the two pictures are the same fact drawn twice. Now turn the sofa and watch the amber reshape
+itself. The walls did not move. The *robot* changed, and the obstacle the planner fights changed
+with it. At one heading the doorway is a wide channel between two amber blobs; turn the sofa
+broadside and the channel closes. A sofa that only fits diagonally has a channel that exists at some
+headings and not at others — your first sighting of a narrow passage, the thing that makes
+Part III hard.
+
+<KeyIdea title="The one sentence version">
+Planning for a body among walls is planning for a point among *C-obstacles* — the configurations
+whose footprint touches a wall — and the C-obstacle depends on the robot as much as on the wall.
+</KeyIdea>
+
+Three vocabulary words have just been used informally, and the Foundation section pins them down.
+A **configuration** is a complete description of where every point of the robot is: for the sofa,
+its position and heading, $(x, y, \theta)$. The **configuration space** $\Q$ is the set of all of
+them. A **C-obstacle** is the set of configurations at which the robot overlaps a workspace obstacle.
+The right-hand pane shows one slice of $\Q$ — fixed $\theta$ — because $\Q$ is three-dimensional
+and the screen is not. Toggle "stack all θ-slices" to see the slices pile into the translucent block
+of Choset's figure F.8, and notice the channel twisting as it climbs.
+
+### Choset's gallery
+
+Choset's Chapter 1 opens with a gallery of problems, and each one carries a definition this book
+will need. The **piano mover** is the pure geometric problem: obstacles known and stationary,
+execution exact, planning finished before the robot moves — *offline* planning. NASA's **Mini
+AERCam**, a free-flying inspection camera with twelve cold-gas thrusters, is the same problem with
+one word changed: because it moves by applying forces, it needs not just a path but the speed along
+the path — a *trajectory*, and with it dynamics (Part V). The **CyCab** and the **Segway**, small
+vehicles that must parallel park, look like the sofa mover's problem until you notice that a car
+cannot slide sideways; that velocity constraint is called *nonholonomic*, the car is called
+nonholonomic too, and Chapters 20 and 21 are about it. **Demining** — passing a sensor over every
+point of a field — is the first time *completeness* is the whole point: a planner that might miss a
+mine is not a planner. The **painting arm** wants its coverage to be *time-optimal*, because robots
+in factories cost money by the second. **Snake robots** have more joints than their task needs —
+*redundant*, or hyper-redundant — and non-Euclidean configuration spaces of high dimension. The
+surgical robots, the digital actors, and the protein-folding problem each get a paragraph in
+Choset and a pointer here: Chapter 14 picks up the molecule as an articulated linkage.
+
+Two of Choset's examples are handed to the sister book, which tells them properly. **RHINO**, the
+museum tour guide, is a localization story — a robot comparing its sensors against a stored map
+because exact execution is a fiction — and **Sojourner** on Mars is a mapping story. *Probabilistic
+Robotics via Rust* owns both; this book borrows their estimation only as far as a planner needs it,
+in Part IV.
+
+### The cast
+
+Choset's protagonists were the robots of 2005. This book's are built in [Chapter 2](/chapters/ch02-the-lab)
+and used until the end. **Rusty** is a disc-shaped differential-drive rover, shared with the sister
+book, whose home is **the Apartment** — five rooms off a long corridor. Its configuration is a planar
+pose, and for collision purposes a point of $\R^2$. **Reach** is a planar two-link arm, with a
+three-link variant for redundancy, bolted to **the Workbench**; its configuration is two angles, a
+point on a torus. **Hitch** is a car that may pull one trailer, living in **the Lot**; its
+configuration is a pose in $\SEtwo$, plus one more circle for the trailer. Three robots, three
+configuration spaces of three different shapes, so that when the book says "a point in $\Q$" it can
+mean three concretely different things.
+
+### The planner's taxonomy
+
+What kind of thing is a planner? Choset's Table 1.1 answers with three axes, and the board below is
+that table with the chapters of this book placed on it.
+
+<Deferred minHeight={520}>
+  <PlannersTaxonomy />
+</Deferred>
+
+The **task** comes first: navigate (one configuration to another), cover (a tool over every point),
+localize (a map and sensors to a configuration), map (an unknown environment to a representation).
+Then the **robot**: how many degrees of freedom and what the configuration space looks like; whether
+it can move instantaneously in any direction of $\Q$ (*omnidirectional*) or is subject to velocity
+constraints (*nonholonomic*); whether velocities are its controls (*kinematic*) or forces are
+(*dynamic*). Then the **algorithm**: optimal or merely feasible; its computational complexity; which
+of three kinds of completeness it has; online or offline; sensor-based or working from a model.
+
+Hover "Optimal" and count. Most of this book — most of the field — is not about shortest paths.
+It is about finding *a* path, with a guarantee about when you will find one, for a robot whose
+shape and constraints make "a path" hard to define. Hover "Complete" and notice that two of its
+chapters, 3 and 9, are *sensor-based* planners with no map at all. A planner without a map is not a
+heuristic. The hook above was one.
+
+## The mathematics
+
+This chapter's mathematics is deliberately light, and nothing in it is retracted later. The
+symbols below are the book's global notation, making their first appearance; each is formalized in
+the chapter named.
+
+<NotationTable
+  rows={[
+    { sym: '\\W \\subset \\R^2 \\text{ or } \\R^3', meaning: 'Workspace: the ambient space the robot\'s body lives in.', note: 'Chapter 2' },
+    { sym: '\\WO_i,\\quad \\Wfree = \\W \\setminus \\textstyle\\bigcup_i \\WO_i', meaning: 'The i-th workspace obstacle; the free workspace.', note: 'Chapter 2' },
+    { sym: '\\Q,\\; q', meaning: 'Configuration space; one configuration — a point the planner imagines.', note: 'Chapters 4–5' },
+    { sym: '\\Rq \\subset \\W', meaning: 'Footprint: the set of workspace points the robot occupies at q.', note: 'Chapter 2' },
+    { sym: '\\QO_i,\\; \\Qfree', meaning: 'C-obstacle, the configurations whose footprint meets WO_i; free configuration space.', note: 'Chapter 4' },
+    { sym: 'c : [0,1] \\to \\Qfree', meaning: 'A path; a trajectory when the parameter is time.', note: 'Chapter 18' },
+    { sym: '\\qstart,\\; \\qgoal', meaning: 'The query.', note: 'Chapter 3' },
+    { sym: 'd(x, y)', meaning: 'Euclidean distance in the plane (the Bug algorithms); a metric in general.', note: 'Chapter 5' },
+    { sym: 'p_i', meaning: 'Perimeter of workspace obstacle i (the Bug bounds).', note: 'Chapter 3' },
+  ]}
+/>
+
+### Definitions
+
+<KeyIdea title="Definition: configuration">
+A **configuration** is a complete specification of the position of every point of the robot. The
+configuration space $\Q$ is the set of all configurations, and $\dim \Q$ — the number of independent
+parameters — is the robot's number of **degrees of freedom**. The piano has six: three for position,
+three for orientation.
+</KeyIdea>
+
+<KeyIdea title="Definition: the path-planning problem (Choset eq. 1.1)">
+Find a continuous map
+<LinkedMath>
+$$
+\htmlClass{term-path}{c} : [0, 1] \to \Q
+\quad\text{with}\quad
+\htmlClass{term-start}{c(0) = \qstart},\qquad
+\htmlClass{term-goal}{c(1) = \qgoal},\qquad
+c(s) \in \Qfree \;\; \forall s \in [0, 1].
+$$
+</LinkedMath>
+The unit interval is a convention; any parameterization serves.
+</KeyIdea>
+
+<KeyIdea title="Definition: path and trajectory">
+A **path** is a continuous curve in $\Q$ — a $C^0$ function. A **trajectory** is a path parameterized
+by time, and to have velocities and accelerations it must be at least $C^2$. Finding a path is *path
+planning*; finding a feasible trajectory is *trajectory planning*, which Choset also calls motion
+planning. This book keeps his distinction: Parts I–IV plan paths; Part V plans trajectories.
+</KeyIdea>
+
+<KeyIdea title="Definition: offline, online, sensor-based">
+An **offline** planner constructs the plan in advance from a known model and hands it to an
+executor. An **online** planner builds the plan incrementally while the robot executes; it can then be
+**sensor-based**, interleaving sensing, computation, and action. Choset calls the boundary "murky":
+an offline planner fast enough to re-run in a feedback loop *is* an online planner, and the primary
+distinction is computation time. This book keeps that remark because it anticipates model
+predictive control in Chapter 19.
+</KeyIdea>
+
+<KeyIdea title="Definition: omnidirectional and nonholonomic; kinematic and dynamic">
+A robot free to move instantaneously in any direction of $\Q$ (obstacles aside) is
+**omnidirectional** — the sofa. One subject to velocity constraints, like a car that cannot slide
+sideways, is **nonholonomic**, and so is the constraint — Hitch. A **kinematic** model takes
+velocities as controls; a **dynamic** model takes forces, and velocities become part of the state.
+</KeyIdea>
+
+<KeyIdea title="Definition: three kinds of completeness">
+A planner is **complete** if it finds a solution whenever one exists and otherwise reports failure in
+finite time. It is **resolution complete** if it finds a solution whenever one exists at the chosen
+discretization. It is **probabilistically complete** if the probability of finding a solution, when
+one exists, tends to one as running time grows. Optimality, completeness, and computational
+complexity trade off against one another; this book states which of the three a planner has, every
+time it introduces one.
+</KeyIdea>
+
+### The robot is a point
+
+<Derivation title="The configuration-space reduction" result="c \text{ is collision-free} \iff c([0,1]) \subset \Qfree">
+**Statement.** For any robot and any workspace obstacles, a curve $c$ in $\Q$ is a collision-free
+motion of the robot's body if and only if it is a curve in $\Qfree$. Planning for a body is planning
+for a point in a different space.
+
+**Step 1 — the footprint is a function of $q$.** By the definition of configuration, $q$ fixes the
+position of every point of the robot, so the occupied set $\Rq$ is a function of $q$ alone.
+
+**Step 2 — collision is membership.** The robot at $q$ collides with obstacle $\WO_i$ iff $\Rq \cap
+\WO_i \ne \emptyset$, which by definition is $q \in \QO_i$:
+
+<LinkedMath>
+$$
+\htmlClass{term-cobstacle}{\QO_i} = \{\, q \in \Q : \htmlClass{term-robot}{\Rq} \cap \htmlClass{term-obstacle}{\WO_i} \ne \emptyset \,\}.
+$$
+</LinkedMath>
+
+**Step 3 — along a curve.** A motion $c$ avoids every collision iff $c(s) \notin \QO_i$ for every $s$
+and every $i$, i.e. iff $c$ avoids $\bigcup_i \QO_i$.
+
+**Step 4 — the complement.** $\Qfree = \Q \setminus \bigcup_i \QO_i$, so "avoids every C-obstacle" is
+exactly "lies in $\Qfree$", which is the last clause of eq. (1.1). $\blacksquare$
+
+**Why the reduction is not free.** Three things are hidden in the word "different". The C-obstacles
+are usually not computable in closed form — Chapter 4 does the cases that are, a disc and a polygon
+that translates, and the Piano Mover widget above computes its amber by brute force, asking the
+collision checker at every cell. The space $\Q$ is usually not $\R^n$: the sofa's $\theta$ wraps,
+Reach's two angles make a torus, and Chapter 5 is about what that costs. And the dimension is the
+enemy: the volume of $\Q$ grows exponentially with the number of joints, which is why Part III exists
+and why Appendix D says "PSPACE-hard".
+</Derivation>
+
+<Derivation title="Dimension counting for the piano" result="\dim \Q = 6 \text{ in } \R^3,\quad 3 \text{ in the plane}">
+**Statement.** A free rigid body in $\R^3$ has six degrees of freedom; in the plane, three.
+
+**Step 1 — one point.** Pick a reference point on the body. Placing it takes three coordinates in
+$\R^3$, two in the plane.
+
+**Step 2 — orientation.** With one point fixed, the body can still rotate about it: three
+parameters in $\R^3$ (roll, pitch, yaw, or any chart of $SO(3)$), one in the plane.
+
+**Step 3 — rigidity.** Once the reference point and the orientation are fixed, rigidity fixes every
+other point. $3 + 3 = 6$; $2 + 1 = 3$. $\blacksquare$
+
+**The warning.** Six *coordinates* do not make $\Q$ equal to $\R^6$. Yaw by $2\pi$ returns the piano
+to where it was, so the orientation coordinates wrap, and some charts of $SO(3)$ become singular
+(the gimbal lock of Chapter 5's Rotation Zoo). Chapter 4 does the counting argument with holonomic
+constraints the way Choset's §3.3 does — points, then constraints, then the dimension that remains.
+</Derivation>
+
+<Derivation title="Bug1 is complete and its path is bounded (quoted, not yet proved)" result="L_{\mathrm{Bug1}} \le d(\qstart, \qgoal) + 1.5 \sum_i p_i">
+**Statement (Choset eq. 2.1).** For a point robot with a contact sensor in a bounded planar
+workspace, the length of Bug1's path satisfies
+
+$$
+L_{\mathrm{Bug1}} \;\le\; d(\qstart, \qgoal) + 1.5 \sum_i p_i,
+$$
+
+and Bug1 reports failure in finite time when no path exists.
+
+**Step 1 — straight segments.** Between obstacles the robot moves straight toward the goal from a
+point that is strictly closer than its previous hit point; those segments total at most $d(\qstart,
+\qgoal)$.
+
+**Step 2 — each obstacle.** Meeting obstacle $i$ costs one full circumnavigation ($p_i$) to survey
+the perimeter, plus the walk to the perimeter point nearest the goal — at most half the perimeter
+the shorter way round ($p_i / 2$).
+
+**Step 3 — finitely many.** A bounded workspace with finitely many obstacles is met finitely often;
+sum. $\blacksquare$
+
+**What is deferred.** The proof that the leave point is well defined, the test that detects an
+unreachable goal, and Bug2's weaker bound $d + \tfrac12 \sum_i n_i p_i$ are Chapter 3's. Here the
+inequality is *checked*, numerically, on the text world below — with one grid-specific footnote
+stated where it arises.
+</Derivation>
+
+<Derivation title="Why 'just drive toward the goal' is not a planner" result="\text{greedy descent on } d(\cdot, \qgoal) \text{ has local minima}">
+**Statement.** A controller that always moves to reduce $d(\cdot, \qgoal)$ gets stuck in any
+workspace with a concave obstacle facing the start.
+
+**Step 1 — build the trap.** Put a U-shaped obstacle between the start and the goal, open toward
+the start.
+
+**Step 2 — enter it.** Driving toward the goal takes the robot into the U, because every step into
+the mouth reduces $d$.
+
+**Step 3 — the bottom.** At the bottom of the U every admissible direction *increases* $d$. The
+controller stops. It has reached a local minimum of the function it descends, and by its own
+definition of success it has succeeded. $\blacksquare$
+
+This is Choset's warning that "purely reactive gradient-following potential field approaches
+always run the risk of getting stuck in local minima", and the book's first instance of the
+local-minimum disease that Chapter 7 names and cures. Bug1 escapes the U because boundary
+following is a *second behavior* that does not descend $d$ at all — it deliberately walks away from
+the goal, and a rule that only ever descends can never decide to do that.
+</Derivation>
+
+## The algorithm
+
+Bug1 is stated informally here and formally as Choset's Algorithm 1 in Chapter 3. Two behaviors,
+one memory, one test.
+
+<Algorithm
+  name="Bug1(W, q_start, q_goal) — Choset Algorithm 1, informally"
+  inputs="a bounded planar workspace W seen only through a contact sensor; the robot measures d(x, y) and its own position exactly"
+  outputs="a path to q_goal, or the conclusion that q_goal is unreachable"
+  complexity="path length ≤ d + 1.5 Σ pᵢ; each step is O(1) sensing"
+>
+1. $i \leftarrow 1$, $q^L_0 \leftarrow \qstart$
+2. repeat
+3. &nbsp;&nbsp;&nbsp;&nbsp;**motion-to-goal:** from $q^L_{i-1}$ move toward $\qgoal$ until it is reached or an obstacle is hit at $q^H_i$
+4. &nbsp;&nbsp;&nbsp;&nbsp;if $\qgoal$ is reached, exit
+5. &nbsp;&nbsp;&nbsp;&nbsp;**boundary-following:** follow the obstacle's boundary until $q^H_i$ is re-encountered, recording the perimeter point $q^L_i$ closest to $\qgoal$
+6. &nbsp;&nbsp;&nbsp;&nbsp;go to $q^L_i$ the shorter way round
+7. &nbsp;&nbsp;&nbsp;&nbsp;if moving toward $\qgoal$ from $q^L_i$ would re-enter the obstacle, conclude $\qgoal$ is unreachable and exit
+8. &nbsp;&nbsp;&nbsp;&nbsp;$i \leftarrow i + 1$
+</Algorithm>
+
+Line 5 is the exhaustive search: Bug1 walks the *whole* perimeter before committing to a leave
+point, which is why its leave point is optimal and its cost is a full $p_i$. Bug2, Choset's
+Algorithm 2, replaces lines 5–6 with a greedy exit: fix the **m-line** from $\qstart$ to $\qgoal$ once,
+and leave the boundary the first time the robot is back on the m-line, closer to the goal than the
+hit point, and able to step toward the goal. Bug2 is quick when obstacles are simple and can be
+arbitrarily worse than Bug1 when they are not.
+
+### The worked example, by hand
+
+The book's first "numeric example equals unit test". A text world, nine columns by five rows, origin
+at the top left, 4-connected unit moves, a point robot that occupies one cell and whose contact
+sensor reports whether the next cell is `#`:
+
+```text
+.........
+...###...
+S..###..G
+...###...
+.........
+```
+
+$\qstart = (0, 2)$, $\qgoal = (8, 2)$, one $3 \times 3$ obstacle in columns 3–5, rows 1–3. Its
+perimeter, measured as the ring of free cells the robot walks when going round it, is $p_1 = 16$.
+
+1. *Motion-to-goal* along row 2: $(1, 2)$, $(2, 2)$ — 2 steps. The next cell $(3, 2)$ is `#`, so
+   $q^H_1 = (2, 2)$.
+2. *Circumnavigate* the ring back to $(2, 2)$ with the obstacle on the right hand: 16 steps,
+   recording $d(\cdot, \qgoal)$ at every cell. The unique minimum is $(6, 2)$, at distance 2.
+3. *Walk to the leave point* $q^L_1 = (6, 2)$ the shorter way round. The ring is symmetric about
+   row 2, so both ways are 8 steps; the code breaks the tie clockwise. 8 steps.
+4. *Motion-to-goal*: $(7, 2)$, $(8, 2)$ — 2 steps.
+
+Total $L_{\mathrm{Bug1}} = 2 + 16 + 8 + 2 = \mathbf{28}$ steps. The bound: $d + 1.5\, p_1 = 8 + 24 =
+32 \ge 28$. For contrast, Bug2 on the same world leaves the ring the first time it is back on row 2
+and closer to the goal — at $(6, 2)$, after 8 steps of boundary following — for $2 + 8 + 2 =
+\mathbf{12}$, which here is also the shortest 4-connected path.
+
+The grid-specific footnote promised above. On a 4-connected grid "move straight toward the goal"
+is a staircase whose length is $|\Delta x| + |\Delta y|$, not the Euclidean $d$. The bound the Bug
+Preview prints, and the one the library checks on random worlds, is Choset's inequality with that
+grid distance $d_1$ in place of $d$; on the worked example the m-line is a row, so $d_1 = d = 8$ and
+the two bounds coincide. Chapter 3 does the continuous version, where the footnote disappears.
+
+<CheckAnswer
+  id="ch01.worked"
+  prompt="Make the obstacle 4 × 4 (columns 3–6, rows 1–4) in a 10 × 6 world with S at (0, 2) and G at (9, 2). How many steps does Bug1 take?"
+  answer={33}
+  tolerance={0}
+>
+The ring around a $4 \times 4$ block is $6 \times 6 - 4 \times 4 = 20$ cells. The hit point is
+$(2, 2)$ again and the leave point is $(7, 2)$; but the block is no longer symmetric about row 2 —
+it extends two rows above and three below — so the shorter way round, over the top, is 9 steps, not
+10. Total $2 + 20 + 9 + 2 = 33$, against a bound of $9 + 30 = 39$. The library check `integration lab`
+pins all three numbers. If you predicted 34, you assumed symmetry; the code did not.
+</CheckAnswer>
+
+## Implementation in Rust
+
+The first program is a dependency-free Rust binary, edition 2024, by design: your first build must
+finish in seconds and cannot fail on a native dependency. The workspace `Cargo.toml` already pins the
+book's stack (`nalgebra` 0.35, `parry2d` 0.30, `rand` 0.9, `petgraph` 0.8, `pathfinding` 4.15), but
+nothing in this chapter touches it.
+
+**Setup** (CI-tested on Linux, macOS, Windows): install `rustup` and the stable toolchain (edition
+2024 needs 1.85 or later); clone the book's repository; then
+
+```text
+cargo run -p ch01_hello
+cargo test -p ch01_hello
+```
+
+Optional, and deferred to Chapter 2: `rustup target add wasm32-unknown-unknown` for the browser
+cross-check, and Node 20.9 or later for the site in `web/`.
+
+### The world and the sensor
+
+```rust title="crates/ch01_hello/src/main.rs — the world" {12-17}
+//! Bug1 on a text world. Zero dependencies, edition 2024.
+
+/// '#' is obstacle, everything else is free. 4-connected unit moves.
+struct TextWorld { rows: Vec<Vec<u8>> }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Cell { x: i32, y: i32 }
+
+/// Headings in screen coordinates (y grows downward): E, S, W, N. Turning right adds one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dir { E, S, W, N }
+
+impl TextWorld {
+    /// The contact sensor: is the cell blocked — or outside the bounded workspace?
+    /// Choset assumes W is bounded; here the border is simply a wall the sensor feels.
+    fn blocked(&self, c: Cell) -> bool {
+        if c.y < 0 || c.x < 0 { return true; }
+        match self.rows.get(c.y as usize).and_then(|r| r.get(c.x as usize)) {
+            Some(b'#') => true,
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Parse a map; S and G are the query.
+    fn parse(s: &str) -> (Self, Cell, Cell) {
+        let rows: Vec<Vec<u8>> = s.lines().filter(|l| !l.is_empty()).map(|l| l.bytes().collect()).collect();
+        let find = |ch: u8| rows.iter().enumerate()
+            .find_map(|(y, r)| r.iter().position(|&b| b == ch).map(|x| Cell { x: x as i32, y: y as i32 }))
+            .expect("the map marks S and G");
+        let (s, g) = (find(b'S'), find(b'G'));
+        (TextWorld { rows }, s, g)
+    }
+}
+
+/// Euclidean distance d(x, y) — Bug1 may measure it, by assumption (Choset §2.1).
+fn dist(a: Cell, b: Cell) -> f64 {
+    (((a.x - b.x).pow(2) + (a.y - b.y).pow(2)) as f64).sqrt()
+}
+```
+
+### The two behaviors
+
+```rust title="crates/ch01_hello/src/main.rs — motion-to-goal and boundary following" {4-14,21-30}
+const STEP: [(i32, i32); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)]; // E, S, W, N
+
+/// One step of motion-to-goal: the 4-neighbor that most reduces d(·, goal).
+/// `Err(dir)` when that neighbor is blocked — the robot has hit the obstacle,
+/// pushing in direction `dir`.
+fn motion_to_goal(w: &TextWorld, x: Cell, goal: Cell) -> Result<Cell, Dir> {
+    let (best, dir) = (0..4)
+        .map(|d| (Cell { x: x.x + STEP[d].0, y: x.y + STEP[d].1 }, d))
+        .min_by(|a, b| dist(a.0, goal).total_cmp(&dist(b.0, goal)))
+        .expect("four neighbors");
+    if w.blocked(best) { Err(Dir::from(dir)) } else { Ok(best) }
+}
+
+/// One step of boundary following with the obstacle on the robot's right hand —
+/// the grid analogue of the surface-normal rule of Choset §2.3.1. O(1) sensing.
+///
+/// Try to turn toward the wall (it may have turned away), else go straight,
+/// else turn away, else reverse. On the ring around a block this traces the
+/// 8-neighborhood of the obstacle, which is the perimeter the bound counts.
+fn follow_boundary(w: &TextWorld, x: Cell, heading: Dir) -> (Cell, Dir) {
+    for h in [heading.right(), heading, heading.left(), heading.back()] {
+        let n = x.step(h);
+        if !w.blocked(n) { return (n, h); }
+    }
+    (x, heading) // boxed in on all four sides: cannot happen from a free start
+}
+
+/// Walk the whole boundary from the hit point until it is re-encountered.
+/// Returns the cells visited after the hit, ending with the hit itself —
+/// so the length is the perimeter p_i as the robot measures it.
+fn circumnavigate(w: &TextWorld, hit: Cell, toward: Dir) -> Vec<Cell> {
+    let (mut cell, mut heading, mut ring) = (hit, toward.left(), Vec::new());
+    loop {
+        (cell, heading) = follow_boundary(w, cell, heading);
+        ring.push(cell);
+        if cell == hit { return ring; }
+    }
+}
+```
+
+### Bug1 and the program
+
+```rust title="crates/ch01_hello/src/main.rs — Bug1 and main" {8-33}
+enum Outcome { Reached(Vec<Cell>), Unreachable { at: Cell } }
+
+/// Bug1, Choset Algorithm 1: motion-to-goal; on contact circumnavigate fully,
+/// remembering the perimeter point closest to the goal; return to it the shorter
+/// way; repeat. If leaving the leave point toward the goal would re-enter the
+/// obstacle, the goal is unreachable.
+fn bug1(w: &TextWorld, start: Cell, goal: Cell) -> (Outcome, Vec<usize>) {
+    let (mut path, mut perimeters, mut x) = (vec![start], Vec::new(), start);
+    while x != goal {
+        match motion_to_goal(w, x, goal) {
+            Ok(next) => { x = next; path.push(x); }
+            Err(dir) => {
+                let hit = x;
+                let ring = circumnavigate(w, hit, dir);
+                perimeters.push(ring.len());
+                path.extend(&ring);
+                // The leave point: closest to the goal; the first wins a tie.
+                let (i, _) = ring.iter().enumerate()
+                    .min_by(|a, b| dist(*a.1, goal).total_cmp(&dist(*b.1, goal))).unwrap();
+                // The shorter way round; a tie goes forward (clockwise).
+                if i + 1 <= ring.len() - 1 - i { path.extend(&ring[..=i]); }
+                else { path.extend(ring[i..ring.len() - 1].iter().rev()); }
+                x = ring[i];
+                if motion_to_goal(w, x, goal).is_err() {
+                    return (Outcome::Unreachable { at: x }, perimeters);
+                }
+            }
+        }
+    }
+    (Outcome::Reached(path), perimeters)
+}
+
+const WORLD: &str = "\
+.........
+...###...
+S..###..G
+...###...
+.........
+";
+
+fn main() {
+    let (w, s, g) = TextWorld::parse(WORLD);
+    match bug1(&w, s, g) {
+        (Outcome::Reached(path), perimeters) => {
+            let steps = path.len() - 1;
+            let p: usize = perimeters.iter().sum();
+            println!("{}", render(&w, s, g, &path));
+            println!("steps: {steps}  straight-line: {}  bound d + 1.5·Σp: {}", dist(s, g), dist(s, g) + 1.5 * p as f64);
+        }
+        (Outcome::Unreachable { at }, _) => println!("goal unreachable; detected at {at:?}"),
+    }
+}
+```
+
+```text
+·········
+··#·###··
+S··###··G
+···###···
+·········
+steps: 28  straight-line: 8  bound d + 1.5·Σp: 32
+```
+
+(The rendering marks the executed path with `·`; the full program also marks `H` at $(2, 2)$ and `L`
+at $(6, 2)$.) The tests lock the number, and lock the failure mode:
+
+```rust title="crates/ch01_hello/tests/worked_example.rs"
+#[test]
+fn worked_example_ch01() {
+    let (w, s, g) = TextWorld::parse(WORLD);
+    let (Outcome::Reached(path), perimeters) = bug1(&w, s, g) else { panic!("reachable") };
+    assert_eq!(path.len() - 1, 28);
+    assert_eq!(perimeters, vec![16]);
+    assert!(28.0 <= 8.0 + 1.5 * 16.0);
+}
+
+#[test]
+fn unreachable_is_detected() {
+    let (w, s, g) = TextWorld::parse(".........\n.....###.\nS....#G#.\n.....###.\n.........\n");
+    let (outcome, perimeters) = bug1(&w, s, g);
+    assert!(matches!(outcome, Outcome::Unreachable { .. }));
+    assert_eq!(perimeters.len(), 1, "one circumnavigation, then give up");
+}
+
+#[test]
+fn bug2_text_world() {
+    // Chapter 3 fills in bug2; the expected count on this world is 12.
+    let (w, s, g) = TextWorld::parse(WORLD);
+    assert_eq!(bug2(&w, s, g).len() - 1, 12);
+}
+```
+
+<Callout type="info">
+The Bug Preview at the top of this chapter runs `web/lib/robots/bug-preview.ts`, a line-for-line
+port of this program onto a rasterized board, and the book's self-checks assert the same 28, the
+same 16, the same 12, and the same unreachable verdict on the same text worlds. The animation you
+watched and the number you printed are one computation.
+</Callout>
+
+## Putting it together
+
+The integration lab is your own machine. Clone the workspace, build, reproduce the 28. Then edit
+`WORLD` to the $4 \times 4$ block of the exercise above, *predict* the new length and the new bound
+before running, run, and check. The point is not the number; it is that you have just watched a
+guarantee stay true while the world changed under it, and that a test will tell you if a future edit
+ever breaks it.
+
+Two conventions begin here and never change. **Every worked number in this book is reproduced by a
+test**: a Rust test in the crate and an invariant in the browser library, so that the prose, the
+program, and the animation cannot drift apart without the build going red. And **every chapter runs
+the same rhythm**, in the same colors.
+
+<Deferred minHeight={380}>
+  <HowToRead />
+</Deferred>
+
+The color code is not decoration. Hover a tinted term in an equation on any page — try the
+$\htmlClass{term-cobstacle}{\QO_i}$ in the first derivation above — and every figure on the page
+fades every other role. The amber in the Piano Mover, the amber `term-cobstacle` in the definition
+of $\QO_i$, and a `// --rm-cobstacle` comment in a Rust listing are the same object seen three ways.
+Green is where you start, red is where you are going (and, in Chapter 2's simulator, the flash of a
+collision — a collision is where a plan ends), slate is a wall, amber hatched is a wall seen from
+configuration space, blue is a roadmap or tree, purple is the path a planner found, orange is the
+robot and the path it actually drove.
+
+A map of what comes next, by cell of the taxonomy board. [Chapter 2](/chapters/ch02-the-lab) builds
+the cast and the collision checker that every planner asks its four questions of.
+[Chapter 3](/chapters/ch03-bug-algorithms) proves what this chapter only checked: Bug1, Bug2, and
+Tangent Bug, with their bounds. [Chapters 4](/chapters/ch04-configuration-space-i) and
+[5](/chapters/ch05-configuration-space-ii) are configuration space done properly — the amber
+computed exactly, the torus and $\SEtwo$ as manifolds. Part II is the classical planners for a point
+in $\Qfree$: search, potentials, roadmaps, cells. Part III trades completeness for speed and gets
+*probabilistic* completeness back. Part IV is what a planner must know about not knowing where it
+is. Part V puts time, dynamics, and Hitch's constraint back in. Part VI closes the loop the hook
+above opened: three robots, one planning stack, running live.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={1} title="Classify the gallery">
+    Classify each of Choset's motivating examples — the piano mover, the Mini AERCam, the CyCab and
+    Segway, RHINO, Sojourner, demining, the painting arm, snake robots, surgical robots, digital
+    actors, protein folding — on all three axes of the taxonomy board. Which cells of Table 1.1
+    does the gallery leave empty? Name one robot deployed since 2020 that fills each empty cell.
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Count the degrees of freedom">
+    The sofa in the Piano Mover has $\dim \Q = 3$. Count the degrees of freedom of (a) two sofas in
+    the same room, (b) two sofas tied by a rope of fixed length pulled taut, (c) one sofa on casters
+    that cannot roll sideways. For each, say whether the constraint changes $\dim \Q$, and why — this
+    is the holonomic versus nonholonomic distinction of Choset §3.3, met early.
+    <Hints>
+      <>Independent bodies add: (a) is $3 + 3$.</>
+      <>A taut rope is one equation on the six coordinates — an equation on <em>positions</em>. Such a constraint removes a dimension.</>
+      <>Casters that cannot slide constrain the sofa's <em>velocity</em>, not its position: every configuration in $\SEtwo$ is still reachable (a car can be parked anywhere), so $\dim \Q$ is unchanged. That is what nonholonomic means, and Chapter 20 proves the "still reachable".</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the leave side">
+    In the Bug Preview, set the goal directly behind the larger of the two obstacles.
+    <Predict
+      id="ch01.e3"
+      question="Before pressing play: which side will Bug1 leave the obstacle from, and will the counter land closer to d or to the bound?"
+      options={[
+        { label: 'The side it hits on; closer to d', because: 'Bug1 never leaves from the hit side unless the hit point is itself the perimeter point nearest the goal, which a goal behind the obstacle rules out.' },
+        { label: 'The far side, nearest the goal; closer to the bound', correct: true, because: 'The leave point is the perimeter point closest to the goal — on the far side — and reaching it costs a full circumnavigation plus up to half a perimeter, which is most of the 1.5 pᵢ term.' },
+        { label: 'Whichever side is shorter to walk; closer to d', because: 'Bug1 chooses the leave point by distance to the goal, not by walking cost. Only the final approach to the chosen point uses the shorter way round.' },
+      ]}
+    >
+    Now switch to Bug2 and explain in one sentence why its counter differs: Bug2 commits to the first
+    m-line crossing that is closer than the hit point, so it never pays for the survey — and on the
+    comb preset, where the m-line crosses the obstacle many times, it pays for the lack of one.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="The widest channel">
+    In the Piano Mover, shorten the sofa until it fits the doorway nose-first. Predict how the amber
+    slice changes as you rotate the sofa by $90°$, then verify. Which heading gives the widest
+    channel through the doorway, and why is that heading *not* $\theta = 0$ when the doorway is in
+    a side wall?
+    <Hints>
+      <>The channel's width at a heading is the doorway's width minus the sofa's extent <em>across</em> the doorway at that heading.</>
+      <>For a doorway in a vertical wall, the extent across it is the sofa's projection onto the $y$-axis: $L|\sin\theta| + W|\cos\theta|$ for length $L$ and width $W$.</>
+      <>That projection is smallest when the long axis points through the door — along $x$, so $\theta = 0$ for this room. Rotate the room's wall and the best heading rotates with it; "nose-first" is a statement about the doorway, not about the axes.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="A C-shaped obstacle and a lying sensor">
+    Modify `ch01_hello` so the obstacle is a `C` shape opening toward the start. Predict the path
+    length and the bound before running. Then make the contact sensor *lie* with probability $0.05$,
+    using a fixed seed and a tiny hand-rolled linear congruential generator — still zero
+    dependencies — and report what breaks: the length, the guarantee, or both.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Bug2, and a world where it loses">
+    Implement Bug2 in `ch01_hello` by changing only the exit condition of boundary following: leave
+    when back on the fixed m-line, closer to the goal than the hit point, and able to step toward
+    it. Make `bug2_text_world` pass with 12. Then construct a text world where Bug2's count exceeds
+    Bug1's. The comb preset in the Bug Preview is one answer — a hook whose nearest-to-goal point
+    sits high above the m-line, so that Bug1 leaves from there on a fresh line over a row of teeth
+    that Bug2, welded to the m-line, must climb one by one. You have just drawn Choset's figure 2.4.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 1 is the source of the gallery, Table 1.1, eq. (1.1), and the notation this book adopts; §2.1 is the source of Bug1, Bug2, and the bound checked here. Lumelsky and Stepanov's 1987 Algorithmica paper, 'Path-planning strategies for a point mobile automaton moving amidst unknown obstacles of arbitrary shape', is the Bug algorithms' original, cited there as [301]."
+  />
+  <Reference
+    authors="Lozano-Pérez, T."
+    year={1983}
+    title="Spatial Planning: A Configuration Space Approach"
+    venue="IEEE Transactions on Computers C-32(2), 108–120"
+    doi="10.1109/TC.1983.1676196"
+    note="The paper that made 'the robot is a point' an algorithm: C-obstacles computed for polygons, the ancestor of the Piano Mover's amber."
+  />
+  <Reference
+    authors="Latombe, J.-C."
+    year={1991}
+    title="Robot Motion Planning"
+    venue="Kluwer Academic Publishers (The Springer International Series in Engineering and Computer Science, vol. 124)"
+    doi="10.1007/978-1-4615-4022-9"
+    note="The reference text for the decade before Choset, and the source of the piano-mover framing of configuration space that Chapter 1 inherits; its author wrote Choset's foreword."
+  />
+  <Reference
+    authors="Kavraki, L. E., Švestka, P., Latombe, J.-C., and Overmars, M. H."
+    year={1996}
+    title="Probabilistic roadmaps for path planning in high-dimensional configuration spaces"
+    venue="IEEE Transactions on Robotics and Automation 12(4), 566–580"
+    doi="10.1109/70.508439"
+    note="Where 'probabilistically complete' — the third kind of completeness on the taxonomy board — enters the field. Chapter 11."
+  />
+  <Reference
+    authors="Karaman, S. and Frazzoli, E."
+    year={2011}
+    title="Sampling-based Algorithms for Optimal Motion Planning"
+    venue="International Journal of Robotics Research 30(7), 846–894"
+    doi="10.1177/0278364911406761"
+    note="The modern occupant of the board's 'Optimal' cell: asymptotic optimality for sampling-based planners. Chapter 13."
+  />
+  <Reference
+    authors="Şucan, I. A., Moll, M., and Kavraki, L. E."
+    year={2012}
+    title="The Open Motion Planning Library"
+    venue="IEEE Robotics & Automation Magazine 19(4), 72–82"
+    doi="10.1109/MRA.2012.2205651"
+    note="What a planner is today: infrastructure, not a research artifact. The systems framing behind the taxonomy board's chapter links."
+  />
+</References>

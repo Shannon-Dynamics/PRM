@@ -1,0 +1,984 @@
+---
+title: "The Lab: Three Robots, Three Worlds, One Simulator"
+description: Rusty, Reach, and Hitch; the Apartment, the Workbench, and the Lot; configurations as typed values, Reach's forward kinematics, the four questions a collision checker answers, and the deterministic simulator every chapter of this book runs in.
+chapter: 2
+part: PART I
+partTitle: Foundations — Robots, Worlds, and Configuration Space
+difficulty: Intermediate
+readingTime: 55 min
+quote: For the translating mobile robot described above, the workspace and the configuration space are both two-dimensional Euclidean spaces, but it is important to keep in mind that these are different spaces.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §3.1
+---
+
+import { ThreeRobotDashboard } from '@/components/ch/ch02/three-robot-dashboard';
+import { QueryAnatomy } from '@/components/ch/ch02/query-anatomy';
+import { WorldAtlas } from '@/components/ch/ch02/world-atlas';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Name the three robots and three worlds of this book and state the configuration space of each as a type',
+    'Write the forward kinematics of a planar revolute arm as a chain of rigid motions, and reproduce Choset\'s worked number',
+    'State the four questions a planner may ask of geometry — intersects, distance, witness, swept — and nothing else',
+    'Explain why a disc\'s collision query is a point query minus a radius, and why an arm\'s is not',
+    'Reproduce one 60 s run of all three robots bit for bit from a seed, and say why that matters',
+  ]}
+  prerequisites={[
+    'Chapter 1: the cast, W, R(q), QO_i',
+    'Rust basics (Appendix A); a cargo workspace that builds',
+    'SE(2) poses as (x, y, θ) — the sister book\'s Chapter 3, used here as an API',
+  ]}
+>
+Every later chapter of this book plans *for* somebody, *somewhere*. This chapter builds the somebody
+and the somewhere: three robots — Rusty the disc-shaped rover, Reach the two-link arm, Hitch the car
+that may pull a trailer — and three worlds — the Apartment, the Workbench, the Lot. It gives each
+robot a configuration whose *type* says which space it lives in, a footprint $\Rq$ that is a
+function of that configuration, and one collision checker that answers exactly four questions.
+
+Two ideas carry the chapter. The pedagogical one: **a configuration is a typed value, and $\Rq$ is
+a function.** The compiler will not let you hand a point on a torus to a function that wants a
+rigid-body pose, and that refusal is the first theorem of Chapter 5, enforced by `rustc` three
+chapters early. The engineering one, inherited from the sister book: **determinism is a feature.**
+A seed and an input script determine a run to the last bit, natively and in the browser, and the
+book holds itself to that with a test.
+
+Nothing here is a planner. Everything here is what a planner is made of.
+</Overview>
+
+## The problem
+
+Three cockpits, one engine. Below, Rusty is circling the Apartment's corridor, Reach is sweeping the
+Workbench, and Hitch is backing through the Lot. Each robot follows a scripted tour drawn from the
+seed in the transport bar, and each flashes red for a few frames when it touches something.
+
+<Deferred minHeight={520}>
+  <ThreeRobotDashboard />
+</Deferred>
+
+Take over. Click a pane, then drive. Rusty takes a forward speed and a turn rate from the arrow keys;
+Hitch takes a speed and a steering angle; Reach has no keys at all — you drag its elbow and its tip.
+Three things will happen to you, and each is a sentence of this chapter.
+
+**You will try to drive Reach's tip and fail.** Drag the elbow handle and the tip traces a circle,
+whether you wanted a circle or not. Reach does not have a tip you can command; it has two angles,
+and the tip is where the angles put it. That is the forward kinematics map $\varphi$, and it is
+the first piece of mathematics below.
+
+**You will try to slide Hitch sideways into a bay and fail.** No combination of arrow keys produces a
+lateral motion. The car's model has no input that does that — not a missing feature, a constraint,
+and the subject of Chapter 20. For now it is physics the simulator enforces.
+
+**You will drive Rusty into a wall and stop short of it.** Rusty halts a body radius before contact,
+not at contact. A disc at $(x, y)$ collides when the wall is within $r$ of its center, and the
+collision checker says so. The red flash is the only place in this book where red means "bad"; it
+borrows the goal's color because a collision is where a plan ends.
+
+The readouts under the panes print each configuration *as its type*: `Pose2 { x, y, theta }` for
+Rusty, `T2 { th1, th2 }` for Reach, `HitchCfg { body, trailer }` for Hitch. Those are not display
+strings. They are the names of three different Rust types, and the rest of the book is written
+against them.
+
+<KeyIdea title="The one sentence version">
+A robot is a function $\Rq$ from a typed configuration $q$ to a set of workspace points, a world is a
+list of named segments and polygons, and a collision checker is the only thing allowed to put the
+two together — through four queries, and no others.
+</KeyIdea>
+
+## Building intuition
+
+### Three configurations, three types
+
+Choset writes "we use $q$" and leaves the reader to remember what kind of thing $q$ is. This book
+does not leave it to the reader. Rusty, considered as a disc for collision purposes, is a point of
+$\R^2$. Reach is a point of the torus $\Torus{2} = \Sone \times \Sone$: two angles, each wrapped to
+$(-\pi, \pi]$, with no joint limits so the links may pass over each other. Hitch's body is a pose in
+$\SEtwo$, and with a trailer the configuration picks up one more circle for the trailer's heading,
+$\SEtwo \times \Sone$.
+
+Those are four different spaces with four different shapes. $\Torus{2}$ is compact and has finite
+area; $\R^2$ is flat and infinite; $\SEtwo$ is three-dimensional and not compact; a circle wraps and a
+line does not. Chapter 5 makes these differences theorems. Chapter 2 makes them types, which is the
+version a compiler can check:
+
+```rust title="crates/robots/src/lib.rs — the configuration types"
+/// A point of R²: the disc's center. Rusty, as the planner sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct R2(pub Point2<f64>);
+
+/// A point of T²: two joint angles, each wrapped to (−π, π]. Reach.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct T2 { pub th1: f64, pub th2: f64 }
+
+/// A point of SE(2) × S¹ — or SE(2) alone when there is no trailer. Hitch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitchCfg { pub body: Pose2, pub trailer: Option<f64> }
+```
+
+Try to hand the wrong one to the arm and the compiler answers before the program runs:
+
+```text
+error[E0308]: mismatched types
+  --> examples/lab_tour.rs:31:20
+   |
+31 |     let tip = reach.fk(&HitchCfg { body, trailer: None });
+   |                     -- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `&Tn<2>`, found `&HitchCfg`
+```
+
+The compiler just told you that $\Torus{2} \ne \SEtwo \times \Sone$. Chapter 5 tells you why.
+
+### What a collision checker returns
+
+The second thing to unlearn is that a collision checker returns a boolean. Freeze one scene and ask
+it the four questions a planner is allowed to ask.
+
+<Deferred>
+  <QueryAnatomy />
+</Deferred>
+
+The default scene is the Workbench with Choset's own arm — link lengths $L_1 = L_2 = 1$, zero
+thickness — at his own configuration $q = (\pi/4, \pi/2)$ from Example 3.8.1. The numbers on the
+canvas are the chapter's worked numbers: the distance tab reads $0.0607$ m to the block, and the
+witness tab puts $b^*$ at the block's corner $(0.5, 1.0)$. Slide $\theta_2$ and watch the distance
+fall to exactly zero at the instant the body turns red; keep sliding and it stays at zero while the
+footprint is inside. The distance query is not a smoothed boolean. It is a boolean *and* a number,
+and when the number is zero the boolean is what you have.
+
+The witness pair is what Chapters 7 and 8 run on. Drag the tip around the block and watch $b^*$
+jump from the corner to an edge the moment the nearest feature changes; the potential field of
+Chapter 7 pushes along exactly that segment, and the Voronoi diagram of Chapter 8 is the set of
+configurations where two witnesses tie.
+
+The swept tab is the one planners cannot live without. It ghosts a second configuration one chart
+step away and asks whether the *motion* between the two is free — not the endpoints, the motion.
+Set the step large and you will find pairs of perfectly free endpoints with a red ghost between
+them: the arm passes through the post on its way from one to the other. Every edge of every roadmap
+in Part II and Part III is checked with this query, and no planner in this book ever checks only
+the endpoints of anything.
+
+### A world is not a bitmap
+
+The third thing to unlearn is that a map is a picture. The three worlds are lists of named
+geometry: wall segments with endpoints, obstacle polygons with vertices, and places with names.
+
+<Deferred>
+  <WorldAtlas />
+</Deferred>
+
+The Apartment is the sister book's floor plan, ported unchanged: five rooms off a long corridor,
+with rooms A and C mirror images of each other so that a range sensor cannot tell them apart. The
+Workbench is a 4.8 m square table with Reach bolted to its center and three obstacles inside the
+arm's reach: *the block*, which is the square $[0.5, 1.0] \times [1.0, 1.5]$ of the worked example,
+*the post*, a column in the arm's left-hand half, and *the shelf*, a bar along the near edge. The Lot
+is 16 m by 10 m, curbed, with four bays along the north side and two pillars Hitch must back around.
+
+Because every wall is a segment and every obstacle a polygon, the distance from a point to the
+nearest wall is an exact number, a ray cast is an exact intersection, and the collision queries of
+the previous section are exact too. When Chapter 7 needs a grid it rasterizes these worlds at a
+chosen resolution; the grid is derived from the world, never the other way round. Click anywhere in
+the atlas to teleport the resident robot and the checker will refuse a configuration whose footprint
+overlaps anything — the same refusal, from the same function, that stops the dashboard's robots.
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: 'r', meaning: 'Rusty\'s body radius, 0.11 m, inherited from the sister book.' },
+    { sym: '\\theta_1, \\theta_2\\;(\\theta_3)', meaning: 'Reach\'s joint angles, each in S¹; q = (θ₁, θ₂) ∈ T².' },
+    { sym: 'L_1, L_2\\;(L_3)', meaning: 'Reach\'s link lengths. L₁ = L₂ = 1 m for every worked number.' },
+    { sym: '\\varphi : T^2 \\to \\R^2', meaning: 'Reach\'s forward kinematics: joint angles to tip position.' },
+    { sym: '(x, y, \\theta),\\; \\psi', meaning: 'Hitch\'s rear-axle pose in SE(2); the trailer heading in S¹.' },
+    { sym: '\\ell,\\; \\phi,\\; d_h', meaning: 'Hitch\'s wheelbase; its steering angle (a control); the hitch length to the trailer axle.' },
+    { sym: '\\rho_R(x, s_k)', meaning: 'The range sensor\'s k-th ray from x, saturated at R. Full treatment in Chapter 3.' },
+    { sym: '\\operatorname{dist}(A, B),\\; (a^*, b^*)', meaning: 'Distance between two shapes, and a pair of points attaining it: the witnesses.' },
+  ]}
+/>
+
+### Definitions
+
+<KeyIdea title="Definition: configuration type">
+A **configuration type** is a value type that *is* a chart of $\Q$: `R2` for a translating disc, `T2`
+for Reach (angles wrapped to $(-\pi, \pi]$), `Pose2` for a planar rigid body, `HitchCfg = (Pose2, S¹)`
+for a car and trailer. Mixing them is a compile error, not a runtime check.
+</KeyIdea>
+
+<KeyIdea title="Definition: footprint">
+The **footprint** $\Rq \subset \W$ is the compound shape the robot occupies at $q$. For Rusty it is
+Choset's disc (§3.1),
+$$
+\htmlClass{term-robot}{R(x, y)} = \{\, (x', y') : (x - x')^2 + (y - y')^2 \le r^2 \,\},
+$$
+for Reach it is two (or three) segments — or thin capsules of radius $\rho$ — and for Hitch a
+rectangle for the body and one for the trailer. In every case the footprint is a *function* of $q$
+and nothing else.
+</KeyIdea>
+
+<KeyIdea title="Definition: forward kinematics (Choset §3.8)">
+A **forward kinematics map** $\varphi : \Q \to M$ takes one representation of the configuration to
+another — here joint angles to the tip's position. It is in general not a homeomorphism even when
+$\dim \Q = \dim M$: for Reach the inverse is two-valued, elbow-up and elbow-down.
+</KeyIdea>
+
+<KeyIdea title="Definition: the collision query contract">
+For a footprint $F$ and a scene $S$, a collision checker answers exactly four questions.
+*Intersects:* $F \cap S \ne \emptyset$. *Distance:* $\min_{a \in F,\, b \in S} \norm{a - b}$, which
+is zero when they intersect. *Witness:* a minimizing pair $(a^*, b^*)$. *Swept:* whether $F$, moving
+rigidly from $q_a$ to $q_b$ along a straight line in the chart, intersects $S$ anywhere on the way.
+These four, and no others, are what a planner may ask.
+</KeyIdea>
+
+<KeyIdea title="Definition: planner-side range sensor">
+$\rho_R(x, s_k)$ for $n$ equally spaced bearings $s_k$, by exact ray casting with *no noise*, reporting
+$\infty$ beyond the saturation range $R$. This is not the sister book's LiDAR, which adds Gaussian
+range noise and dropouts. Choset's Bug guarantees assume an ideal sensor, and the text of Chapter 3
+says so where it uses them.
+</KeyIdea>
+
+<KeyIdea title="Definition: reproducible run">
+A run is a pure function $(\text{seed}, \text{input script}) \mapsto \text{trajectory}$. Each
+stochastic subsystem owns one random stream split from the seed, so adding a noisy sensor to a
+simulation never perturbs the trajectory of a robot that does not use it.
+</KeyIdea>
+
+### Reach's forward kinematics
+
+Reach's base is pinned at the origin. Joint 1 rotates the whole arm by $\theta_1$; joint 2, which
+rides at the end of link 1, rotates link 2 by a further $\theta_2$ *relative to link 1*. That
+relativity is the whole derivation.
+
+<Derivation title="Reach's forward kinematics (Choset Example 3.8.1)" result="\varphi(\theta_1, \theta_2) = (L_1\cos\theta_1 + L_2\cos(\theta_1+\theta_2),\; L_1\sin\theta_1 + L_2\sin(\theta_1+\theta_2))">
+**Statement.** The tip of the 2R arm is at
+
+<LinkedMath>
+$$
+\htmlClass{term-robot}{\varphi(\theta_1, \theta_2)} =
+\begin{pmatrix}
+L_1 \cos\theta_1 + L_2 \cos(\theta_1 + \theta_2) \\
+L_1 \sin\theta_1 + L_2 \sin(\theta_1 + \theta_2)
+\end{pmatrix}.
+$$
+</LinkedMath>
+
+**Step 1 — the elbow.** Link 1 leaves the origin at absolute angle $\theta_1$ and has length $L_1$,
+so the elbow is at $L_1 (\cos\theta_1, \sin\theta_1)$.
+
+**Step 2 — link 2's absolute heading.** Joint angles are *relative*: $\theta_2$ is measured from
+link 1's direction, so link 2 leaves the elbow at absolute heading $\theta_1 + \theta_2$.
+
+**Step 3 — add link 2.** The tip is the elbow plus $L_2$ along that heading, which is the statement.
+
+**Step 4 — the 3R variant.** A third link appends $L_3(\cos(\theta_1 + \theta_2 + \theta_3),\,
+\sin(\theta_1 + \theta_2 + \theta_3))$ to the tip, and the tip's heading is $\theta_1 + \theta_2 +
+\theta_3$ — the position-and-orientation map of Choset's problem 21. $\blacksquare$
+
+**The same map as a product of rigid motions.** Write $T(\theta, L) \in \SEtwo$ for "rotate by
+$\theta$, then translate $L$ along the new $x$-axis". Then
+
+$$
+\varphi(q) = \big[\, T(\theta_1, L_1)\, T(\theta_2, L_2)\, \big] \cdot \mathbf{0},
+$$
+
+and for $N$ links the product has $N$ factors. This is how `robots::Reach::fk` computes it — one
+running heading and one running position, accumulated link by link — and it is why the same code
+serves the 2R arm, the 3R arm, and any `Reach<N>`.
+
+**Choset's number.** With $L_1 = L_2 = 1$ and $q = (\pi/4, \pi/2)$: the elbow is $(\cos 45°, \sin
+45°) = (0.7071, 0.7071)$; link 2 heads at $135°$; so the tip is $(0.7071 + \cos 135°,\; 0.7071 +
+\sin 135°) = (0, \sqrt 2) \approx (0, 1.4142)$. The library reproduces this to $10^{-12}$, and the
+dashboard's Reach readout shows it when you drag the joints there.
+</Derivation>
+
+### The workspace is an annulus, not a configuration space
+
+Choset's §3.1 makes a point that is easy to nod along to and hard to internalize: the set of
+positions the tip can reach is not the arm's configuration space, because knowing where the tip is
+does not tell you where the elbow is.
+
+<Derivation title="Reach's workspace is an annulus with a two-valued inverse" result="\{x : |L_1 - L_2| \le \|x\| \le L_1 + L_2\}">
+**Statement.** The reachable tip positions are the annulus $|L_1 - L_2| \le \norm{x} \le L_1 + L_2$,
+and every interior point is reached by exactly two configurations.
+
+**Step 1 — the triangle inequality.** The origin, the elbow, and the tip form a triangle with sides
+$L_1$, $L_2$, and $\norm{x}$. A triangle exists iff $|L_1 - L_2| \le \norm{x} \le L_1 + L_2$.
+
+**Step 2 — the law of cosines.** In that triangle the angle at the elbow is $\pi - \theta_2$, so
+
+$$
+\norm{x}^2 = L_1^2 + L_2^2 - 2 L_1 L_2 \cos(\pi - \theta_2) = L_1^2 + L_2^2 + 2 L_1 L_2 \cos\theta_2,
+$$
+
+which determines $\cos\theta_2$ from $\norm{x}$ alone — and therefore $\theta_2$ up to sign.
+
+**Step 3 — two arms.** The two signs are the elbow-down and elbow-up solutions; $\theta_1$ then
+follows from $\operatorname{atan2}$ of the tip minus the direction of link 1 within the triangle.
+Two configurations, one tip position: the tip is *not* a complete description of the robot, so the
+annulus is not $\Q$. $\blacksquare$
+
+**Closed-form inverse kinematics** (Choset problem 20), as `Reach::ik` computes it:
+
+$$
+\cos\theta_2 = \frac{\norm{x}^2 - L_1^2 - L_2^2}{2 L_1 L_2},
+\qquad
+\theta_2 = \operatorname{atan2}\!\big(\pm\sqrt{1 - \cos^2\theta_2},\, \cos\theta_2\big),
+\qquad
+\theta_1 = \operatorname{atan2}(x_2, x_1) - \operatorname{atan2}\!\big(L_2 \sin\theta_2,\; L_1 + L_2 \cos\theta_2\big).
+$$
+
+On the annulus boundary the two solutions coincide; outside it there are none. The library check
+`ik_roundtrip` pushes 1,000 random configurations through $\varphi$, both inverses, and $\varphi$
+again, and requires the tip to return to within $10^{-9}$.
+</Derivation>
+
+### A disc's collision is a point query
+
+<Derivation title="Collision of a disc is a point query" result="\text{collides} \iff D(x,y) < r,\quad \text{distance} = D - r">
+**Statement.** Rusty at $(x, y)$ collides iff $D(x, y) < r$, where $D$ is the distance from the
+center to the nearest wall; the distance query returns $D - r$ and the witness on the obstacle is
+the same nearest point, with the witness on the robot shifted $r$ toward it.
+
+**Step 1.** A disc meets a set iff some point of the set is within $r$ of the center.
+
+**Step 2.** "Some point within $r$" is the statement $D < r$. (Touching, $D = r$, counts as collision
+in this book's closed-set convention, so the free test is the strict $D > r$.)
+
+**Step 3.** The nearest wall point $b^*$ realizes $D$; the disc point nearest to it is the center
+moved $r$ along the direction to $b^*$, at distance $D - r$. $\blacksquare$
+
+**What this is.** This is the Minkowski inflation of Choset §3.2.1 written in one line: growing the
+obstacles by $r$ and shrinking the robot to a point are the same operation. It is also why
+`collide::DiscChecker` uses exact point-to-segment distance rather than a general convex-distance
+routine: for a disc the general machinery buys nothing. The general case — a polygon that rotates,
+an arm whose links sweep — is where the black box earns its keep, and Chapter 4 opens it.
+
+**The worked number.** Rusty's center at $(2, 1)$, one wall from $(3, 0)$ to $(3, 3)$: the point
+distance is $1.0$, so the distance query is $1.0 - 0.11 = 0.89$ with witness $(3, 1)$ on the wall.
+</Derivation>
+
+### Hitch's model is a definition, not yet a theorem
+
+<Derivation title="Hitch's kinematic car with a trailer" result="\dot\theta = (v/\ell)\tan\phi,\quad \dot\psi = (v/d_h)\sin(\theta - \psi)">
+**Statement.** The simulator integrates
+
+$$
+\dot x = v \cos\theta,\qquad \dot y = v \sin\theta,\qquad \dot\theta = \frac{v}{\ell}\tan\phi,
+\qquad \dot\psi = \frac{v}{d_h}\sin(\theta - \psi),
+$$
+
+with $(x, y)$ the rear-axle midpoint, $\theta$ the heading, $\phi$ the steering angle, $\psi$ the
+trailer heading, $\ell$ the wheelbase, and $d_h$ the hitch length from the rear axle to the trailer
+axle.
+
+**Step 1 — rear-axle no-slip.** The rear wheels roll without sliding, so the rear axle's velocity
+points along the heading: the first two equations, and no equation at all for a sideways velocity.
+
+**Step 2 — the front wheel sets the radius.** The front axle is $\ell$ ahead and turned by $\phi$;
+the instantaneous center of rotation lies where the two axle lines meet, at distance $\ell / \tan\phi$
+from the rear axle, so $\dot\theta = v / (\ell / \tan\phi)$.
+
+**Step 3 — the hitch drags the trailer.** The trailer axle is $d_h$ behind the hitch point along
+$\psi$ and also rolls without sliding, so only the component of the hitch's velocity perpendicular
+to the trailer turns it: $\dot\psi = (v / d_h) \sin(\theta - \psi)$. $\blacksquare$
+
+**How the code integrates it.** For constant $(v, \phi)$ over one tick the body moves on an arc of
+constant curvature $\kappa = \tan\phi / \ell$, so the ported `boxplus` with the tangent vector
+$(v\,\Delta t,\, 0,\, \kappa v\,\Delta t)$ integrates the body *exactly*. The trailer does not move on
+a circle, so $\psi$ is integrated by a fixed-step RK4 inside the tick. Both are pure functions of
+$(q, u, \Delta t)$, which is what the replay test needs.
+
+**What this is not yet.** Each of these equations is a Pfaffian constraint $\omega(q)\dot q = 0$ —
+"no sideways velocity" written as a one-form. Chapter 20 derives that view, proves that sideways
+*displacement* is nonetheless reachable by a Lie bracket of the two inputs, and Chapter 21 turns the
+bracket into a parking maneuver. Here it is the simulator's physics, stated.
+</Derivation>
+
+### The worked example, assembled
+
+Put the pieces together on the Workbench. Reach with $L_1 = L_2 = 1$ and zero-thickness links at
+$q = (\pi/4, \pi/2)$; the block $[0.5, 1.0] \times [1.0, 1.5]$.
+
+The elbow is at $(0.7071, 0.7071)$ and the tip at $(0, 1.4142)$. Link 2 runs from the elbow to the
+tip along the line $x + y = \sqrt 2 \approx 1.4142$. Every point of the block has $x + y \ge 1.5$, so
+the block lies entirely on one side of that line and the nearest pair is the block's corner closest
+to the line against the foot of its perpendicular:
+
+<LinkedMath>
+$$
+\htmlClass{term-obstacle}{b^*} = (0.5, 1.0),\qquad
+\operatorname{dist} = \frac{1.5 - \sqrt 2}{\sqrt 2} = \frac{1.5}{\sqrt 2} - 1 \approx 0.0607,\qquad
+\htmlClass{term-robot}{a^*} = b^* - 0.0607\,(0.7071, 0.7071) \approx (0.4571, 0.9571).
+$$
+</LinkedMath>
+
+The foot $a^*$ lies between elbow and tip, so it is on the link and not clipped to an endpoint;
+*intersects* is false. These are the numbers the Query Anatomy widget shows at its default pose, and
+the library check `reach_distance_to_square` holds them to $10^{-9}$ for the distance and $10^{-6}$
+for the witnesses.
+
+One honest footnote. Zero-thickness links make the number exact and the arm unrealistic. The
+default Workbench arm wears 3 cm capsules, and the same query then reads $0.0607 - 0.03 = 0.0307$ m.
+Toggle "3 cm capsule links" in the widget and watch the number drop by exactly the radius.
+
+<CheckAnswer
+  id="ch02.capsule"
+  prompt="With 3 cm capsule links, what distance does the same query return (in metres)?"
+  answer={0.0307}
+  tolerance={0.0005}
+  unit="m"
+>
+The capsule's surface is $0.03$ closer to everything than its axis is, so every distance drops by
+exactly the radius: $0.0607 - 0.03 = 0.0307$. The witness $b^*$ does not move; $a^*$ slides $0.03$
+toward it. The check `capsule links` in the library pins this.
+</CheckAnswer>
+
+## The algorithm
+
+What a collision checker *computes* is stated here as a contract and left sealed. The Rust crate
+delegates every geometric primitive to `parry2d`; the TypeScript port that runs the widgets
+hand-rolls them. Chapter 4 opens the box for polygons, Appendix C documents what the engine does,
+and Appendix F.5 of Choset — the GJK algorithm of Gilbert, Johnson, and Keerthi — is the name of the
+idea inside.
+
+<Algorithm
+  name="Collision::{intersects, distance, witness, swept}(fp)"
+  inputs="a footprint fp = R(q) as a list of (pose, shape) parts; a scene of n obstacles behind a bounding-volume tree"
+  outputs="a boolean; a distance ≥ 0; a witness pair or None; a boolean for the sweep"
+  complexity="O(k log n) per query for k footprint parts, plus the engine's iterations (GJK, shape-cast)"
+>
+1. `intersects(fp)`: for each part of `fp`, ask the tree for candidate obstacles; return true on the first part–obstacle pair whose shapes intersect
+2. `distance(fp)`: for each part and each candidate, take the engine's distance; return the minimum (0 if any pair intersects)
+3. `witness(fp)`: as `distance`, but keep the pair $(a^*, b^*)$ attaining the minimum
+4. `swept(fp_a, fp_b)`: for each part, cast its shape from the pose in `fp_a` to the pose in `fp_b` against the candidates; return true if any cast reports a time of impact in $[0, 1]$
+</Algorithm>
+
+The browser port has no shape-cast, so it marches:
+
+<Algorithm
+  name="edge_free(a, b) — conservative sphere marching"
+  inputs="configurations a, b; distance(q); a Lipschitz bound L on how far any footprint point moves over the whole chart line a → b"
+  outputs="true iff every configuration on the straight chart line from a to b is free"
+  complexity="O(log(1/clearance)) distance queries on a clear edge; O(L / step_min) at worst"
+>
+1. if not `is_free(a)` or not `is_free(b)`: return false
+2. $s \leftarrow 0$
+3. while $s < 1$:
+4. &nbsp;&nbsp;&nbsp;&nbsp;$d \leftarrow$ `distance(interpolate(a, b, s))`; if $d \le 0$ return false
+5. &nbsp;&nbsp;&nbsp;&nbsp;$s \leftarrow s + \max(d / L,\ \text{step}_{\min})$ — nothing within $d$ of the footprint is occupied, and no point of it moves faster than $L$ per unit $s$, so no collision can begin before $s + d/L$
+6. return true
+</Algorithm>
+
+The bound $L$ is what makes the march *conservative* rather than hopeful. For a disc it is the
+Euclidean length of the edge. For Reach, a point on any link moves at most $(L_1 + L_2)$ per radian
+of either joint, so $L = (L_1 + L_2)(|\Delta\theta_1| + |\Delta\theta_2|)$ with the differences taken
+the short way round the circle. For Hitch it is the translation plus the body's circumscribed
+radius times the rotation. The library check `swept` compares the march against dense sampling at
+2 mm chart spacing on 264 random edges across all three robots and finds no disagreement.
+
+The remaining named routines of the chapter are small enough to state in a line each:
+
+| Name | Signature | Cost |
+|---|---|---|
+| `Reach::fk` | `(&self, q: &Tn<N>) -> [Point2; N + 1]` — base, joints, tip | $O(N)$ |
+| `Hitch::step` | `(&self, q: &HitchCfg, u: &CarCmd, dt: f64) -> HitchCfg` | $O(1)$ |
+| `RangeSensor::scan` | `(&self, scene: &Scene, x: Point2) -> Vec<f64>`, $\infty$ beyond $R$ | $O(n_{\text{rays}} \log n_{\text{seg}})$ |
+| `Run::record` / `Run::replay` | `(cfg, script) -> Log` / `(&Log) -> Vec<Frame>` | $O(\text{ticks})$ |
+
+The sensor is worth one remark now and a chapter later. Its scan is Choset's saturated raw distance
+function $\rho_R$ sampled at $n$ bearings, and $\min_k \rho_R(x, s_k)$ is a sensor's estimate of
+$D(x)$, the distance to the nearest obstacle. It can never be *smaller* than $D(x)$ — a ray cannot
+hit something closer than the closest thing — and it equals $D(x)$ exactly when a ray happens to
+point at the nearest point. From Rusty's $(2, 1)$ with the wall at $x = 3$, ray 0 does, and the
+library check `scan_is_rho_R` sees $1.000000$.
+
+## Implementation in Rust
+
+This section is the book's architectural contract. Later chapters add crates; none restructures what
+is fixed here.
+
+**Crates.** `nalgebra` 0.35 for `Point2` and `Isometry2`; `parry2d` 0.30 as `parry2d-f64` for
+shapes, the `Qbvh` broad phase, and `query::{distance, closest_points, intersection_test,
+cast_shapes}` — WASM-clean, no `rayon`; `rand` 0.9 with `SmallRng` for seeded streams; `serde` for
+the replay log. Geometry is the one thing this book does not hand-roll.
+
+```text
+crates/
+  core/          # PORTED: prob (Rng = seeded SmallRng wrapper), geom (Pose2 = SE(2)), edt
+  sim/           # PORTED: World (Apartment), Rusty (diff-drive step, encoders), ray cast
+  robots/        # THIS CHAPTER: Reach<N> (FK, IK), Hitch (car + trailer), Workbench, Lot
+  collide/       # THIS CHAPTER: trait Collision over parry2d; Footprint; Scene; RangeSensor
+  widget-kit/    # THIS CHAPTER: Role enum (the only place a color is named), capture, replay
+  ch01_hello/    # Chapter 1 (std-only)
+  bugs/ cspace/ manifold/ search/ …                    # added by their chapters
+web/lib/
+  prob/ geom/ sim/ mapping/edt                         # ported unchanged
+  robots/ collide/                                     # this chapter's TypeScript mirrors
+```
+
+### The arm
+
+```rust title="crates/robots/src/reach.rs" {24-36}
+use nalgebra::Point2;
+
+/// A point of Tⁿ: N joint angles, each wrapped to (−π, π].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tn<const N: usize>(pub [f64; N]);
+pub type T2 = Tn<2>;
+
+/// Planar revolute arm with N links. `Reach<2>` is the book's Reach; `Reach<3>`
+/// is the redundant variant of Exercise 5 and Chapter 14.
+pub struct Reach<const N: usize> {
+    pub base: Point2<f64>,
+    pub lengths: [f64; N],
+    /// Capsule radius of each link. 0 gives exact segments — every worked number.
+    pub link_radius: f64,
+}
+
+impl<const N: usize> Reach<N> {
+    /// Choset's Example 3.8.1: L₁ = L₂ = 1 at the origin, zero-thickness links.
+    pub fn choset() -> Reach<2> {
+        Reach { base: Point2::origin(), lengths: [1.0, 1.0], link_radius: 0.0 }
+    }
+
+    /// φ as the chain T₀₁(θ₁) T₁₂(θ₂) ⋯: joint positions base..tip.
+    ///
+    /// One running heading and one running position. Joint angles are relative,
+    /// so the absolute heading of link k is θ₁ + ⋯ + θₖ — that single fact is
+    /// the whole derivation, and it is why the same loop serves any N.
+    pub fn fk(&self, q: &Tn<N>) -> Vec<Point2<f64>> {
+        let mut pts = Vec::with_capacity(N + 1);
+        let (mut heading, mut p) = (0.0, self.base);
+        pts.push(p);
+        for i in 0..N {
+            heading += q.0[i];
+            p += nalgebra::Vector2::new(heading.cos(), heading.sin()) * self.lengths[i];
+            pts.push(p);
+        }
+        pts
+    }
+
+    pub fn tip(&self, q: &Tn<N>) -> Point2<f64> {
+        *self.fk(q).last().expect("N + 1 points")
+    }
+
+    /// R(q): one capsule per link, as parry2d shapes with their poses.
+    pub fn footprint(&self, q: &Tn<N>) -> Footprint {
+        let pts = self.fk(q);
+        Footprint::capsules(pts.windows(2).map(|w| (w[0], w[1])), self.link_radius)
+    }
+}
+
+impl Reach<2> {
+    /// Closed-form IK (Choset problem 20): [elbow-down, elbow-up]; None outside the annulus.
+    pub fn ik(&self, tip: Point2<f64>) -> [Option<T2>; 2] {
+        let [l1, l2] = self.lengths;
+        let d = tip - self.base;
+        let c2 = (d.norm_squared() - l1 * l1 - l2 * l2) / (2.0 * l1 * l2);
+        if !(-1.0..=1.0).contains(&c2) {
+            return [None, None];
+        }
+        let s2 = (1.0 - c2 * c2).sqrt();
+        let solve = |sign: f64| {
+            let th2 = (sign * s2).atan2(c2);
+            let th1 = d.y.atan2(d.x) - (l2 * th2.sin()).atan2(l1 + l2 * th2.cos());
+            Tn([wrap(th1), wrap(th2)])
+        };
+        [Some(solve(1.0)), Some(solve(-1.0))]
+    }
+}
+```
+
+The browser runs `lib/robots/reach.ts`, a line-for-line port with `Tn` as a readonly number array;
+`fmtTn` is what prints `T2 { th1: 0.785, th2: 1.571 }` in the dashboard.
+
+### The car
+
+```rust title="crates/robots/src/hitch.rs" {18-34}
+/// SE(2) × S¹ with a trailer; SE(2) without.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitchCfg { pub body: Pose2, pub trailer: Option<f64> }
+
+/// Speed and steering angle. φ is a *control*: it is not part of the configuration.
+#[derive(Clone, Copy, Debug)]
+pub struct CarCmd { pub v: f64, pub phi: f64 }
+
+pub struct Hitch {
+    pub wheelbase: f64,
+    pub max_steer: f64,
+    pub body: (f64, f64),            // length, width of the chassis
+    pub hitch_len: Option<f64>,      // rear axle → trailer axle
+}
+
+impl Hitch {
+    /// One tick. The constraint is *in* the model: no input produces a lateral
+    /// velocity, so no command sequence slides the car sideways. (Chapter 20:
+    /// a sideways *displacement* is still reachable, by a Lie bracket.)
+    pub fn step(&self, q: &HitchCfg, u: &CarCmd, dt: f64) -> HitchCfg {
+        let phi = u.phi.clamp(-self.max_steer, self.max_steer);
+        let kappa = phi.tan() / self.wheelbase;
+        let ds = u.v * dt;
+        // Exact arc: the tangent vector (ds, 0, κ ds) pushed through exp on SE(2).
+        let body = q.body.boxplus(&Vector3::new(ds, 0.0, kappa * ds));
+        let trailer = match (q.trailer, self.hitch_len) {
+            (Some(psi0), Some(dh)) => {
+                // ψ̇ = (v/d_h) sin(θ(t) − ψ), θ(t) = θ₀ + κ v t known in closed form;
+                // fixed-step RK4 over the tick keeps the run a pure function.
+                let f = |t: f64, psi: f64| (u.v / dh) * (q.body.theta + kappa * u.v * t - psi).sin();
+                Some(wrap(rk4(f, psi0, 0.0, dt, 4)))
+            }
+            _ => None,
+        };
+        HitchCfg { body, trailer }
+    }
+
+    /// R(q): the chassis rectangle, and the trailer's when attached. Both poses
+    /// are functions of (x, y, θ, ψ) — the content of Exercise 2.
+    pub fn footprint(&self, q: &HitchCfg) -> Footprint { /* two oriented rectangles */ }
+}
+```
+
+### The black box
+
+```rust title="crates/collide/src/collision.rs" {22-47}
+use parry2d::query::{self, ClosestPoints, ShapeCastOptions};
+
+pub struct Witness { pub on_robot: Point2<f64>, pub on_obstacle: Point2<f64>, pub dist: f64 }
+
+/// The four questions, and no others.
+pub trait Collision {
+    fn intersects(&self, fp: &Footprint) -> bool;
+    /// 0.0 when intersecting.
+    fn distance(&self, fp: &Footprint) -> f64;
+    fn witness(&self, fp: &Footprint) -> Option<Witness>;
+    /// Rigid straight-line sweep in the chart from fp_a's poses to fp_b's.
+    fn swept(&self, fp_a: &Footprint, fp_b: &Footprint) -> bool;
+}
+
+/// Walls as thin segments, obstacles as convex polygons, all under one Qbvh.
+pub struct Scene { obstacles: Vec<Obstacle>, bvh: Qbvh<u32>, pub bounds: Aabb }
+
+impl Collision for Scene {
+    // The only module in the workspace that imports parry2d::query.
+
+    fn intersects(&self, fp: &Footprint) -> bool {
+        fp.parts.iter().any(|(pose, shape)| {
+            self.candidates(pose, shape).any(|o| {
+                query::intersection_test(pose, &**shape, &o.pose, &*o.shape).unwrap_or(true)
+            })
+        })
+    }
+
+    fn witness(&self, fp: &Footprint) -> Option<Witness> {
+        let mut best: Option<Witness> = None;
+        for (pose, shape) in &fp.parts {
+            for o in self.candidates(pose, shape) {
+                // GJK, inside the engine (Choset App. F.5). We never see the simplex.
+                match query::closest_points(pose, &**shape, &o.pose, &*o.shape, f64::MAX).ok()? {
+                    ClosestPoints::Intersecting => return Some(Witness::contact(pose)),
+                    ClosestPoints::WithinMargin(a, b) | ClosestPoints::Disjoint => { /* keep min */ }
+                }
+            }
+        }
+        best
+    }
+
+    fn swept(&self, fp_a: &Footprint, fp_b: &Footprint) -> bool {
+        fp_a.parts.iter().zip(&fp_b.parts).any(|((pa, shape), (pb, _))| {
+            let vel = (pb.translation.vector - pa.translation.vector) / 1.0;
+            self.candidates(pa, shape).any(|o| {
+                // A shape-cast reports a time of impact in [0, 1] if the swept volume hits.
+                query::cast_shapes(pa, &vel, &**shape, &o.pose, &Vector2::zeros(), &*o.shape,
+                                   ShapeCastOptions::with_max_time_of_impact(1.0))
+                    .map(|hit| hit.is_some()).unwrap_or(true)
+            })
+        })
+    }
+}
+```
+
+<Callout type="info">
+The widgets on this page run `web/lib/collide`, which hand-rolls the same four queries over
+segments and polygons — point-in-polygon, segment–segment, a separating-axis test for convex pairs,
+and the sphere march for the sweep. The library check `polygons` compares the separating-axis test
+against an edge-and-containment brute force on 400 random convex pairs; every other check on this
+page holds the port to the same numbers as the Rust.
+</Callout>
+
+### The worked example as a program
+
+```rust title="crates/robots/examples/lab_tour.rs"
+fn main() {
+    let arm = Reach::<2>::choset();
+    let q = Tn([FRAC_PI_4, FRAC_PI_2]);
+    let pts = arm.fk(&q);
+    println!("elbow ({:.4}, {:.4})  tip ({:.4}, {:.4})", pts[1].x, pts[1].y, pts[2].x, pts[2].y);
+
+    // A scratch scene with the worked example's square — which is also the Workbench's block.
+    let scene = Scene::empty(WORKBENCH_BOUNDS).with_obstacle("the block", Cuboid::from_aabb(0.5, 1.0, 1.0, 1.5));
+    let fp = arm.footprint(&q);
+    let w = scene.witness(&fp).expect("a witness exists");
+    println!("intersects: {}  distance: {:.4}", scene.intersects(&fp), scene.distance(&fp));
+    println!("witness a*=({:.4}, {:.4}) b*=({:.4}, {:.4})", w.on_robot.x, w.on_robot.y, w.on_obstacle.x, w.on_obstacle.y);
+
+    // Rusty against one wall.
+    let wall = Scene::of_walls(&[Segment::new(point![3.0, 0.0], point![3.0, 3.0])]);
+    let rusty = Footprint::disc(point![2.0, 1.0], RUSTY.body_radius);
+    println!("distance: {:.4}", wall.distance(&rusty));
+
+    // The 60 s tour at BOOK_SEED, recorded and replayed.
+    let log = Run::record(TourConfig::default(), BOOK_SEED);
+    assert_eq!(Run::replay(&log), log.frames, "replay must be bit-identical");
+    print_final(&log);
+    svg::write("figures/ch02_tour.svg", &log);
+}
+```
+
+```text
+elbow (0.7071, 0.7071)  tip (0.0000, 1.4142)
+intersects: false  distance: 0.0607
+witness a*=(0.4571, 0.9571) b*=(0.5000, 1.0000)
+distance: 0.8900
+```
+
+Every line of that output is locked by a test in the crate and by a check in the browser library:
+
+```rust title="crates/robots/tests/worked_example.rs"
+#[test]
+fn fk_matches_choset_example() {
+    let tip = Reach::<2>::choset().tip(&Tn([FRAC_PI_4, FRAC_PI_2]));
+    assert_abs_diff_eq!(tip.x, 0.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(tip.y, SQRT_2, epsilon = 1e-12);
+}
+
+#[test]
+fn reach_distance_to_square() {
+    let (scene, fp) = worked_scene();
+    assert_abs_diff_eq!(scene.distance(&fp), 1.5 / SQRT_2 - 1.0, epsilon = 1e-9);
+    let w = scene.witness(&fp).unwrap();
+    assert_abs_diff_eq!(w.on_obstacle, point![0.5, 1.0], epsilon = 1e-6);
+    assert_abs_diff_eq!(w.on_robot, point![0.4571, 0.9571], epsilon = 1e-4);
+}
+
+#[test]
+fn rusty_wall_distance() { assert_abs_diff_eq!(wall_scene().distance(&rusty_at(2.0, 1.0)), 0.89, epsilon = 1e-12); }
+
+#[test]
+fn ik_roundtrip() { /* 1,000 seeded q: fk(ik(fk(q))) == fk(q) to 1e-9, both elbows */ }
+
+#[test]
+fn swept_catches_midpoint() {
+    // Two free configurations whose straight sweep passes link 1 through the post.
+    let c = ChainChecker::new(Scene::workbench(), Reach::<2>::workbench());
+    let (a, b) = (Tn([2.0, 0.0]), Tn([3.1, 0.0]));
+    assert!(c.is_free(&a) && c.is_free(&b));
+    assert!(!c.edge_free(&a, &b));
+}
+
+#[test]
+fn tour_replays_bitwise() {
+    let (a, b) = (Run::record(TourConfig::default(), BOOK_SEED), Run::record(TourConfig::default(), BOOK_SEED));
+    assert_eq!(a.frames, b.frames); // every f64 equal exactly, not approximately
+}
+
+#[test]
+fn scan_is_rho_r() {
+    // min over 360 rays from (2, 1) equals the point distance to the wall at x = 3.
+    let scan = RangeSensor { n_rays: 360, max_range: 4.0 }.scan(&wall_scene(), point![2.0, 1.0]);
+    assert_abs_diff_eq!(scan.iter().cloned().fold(f64::INFINITY, f64::min), 1.0, epsilon = 1e-9);
+}
+```
+
+## Putting it together
+
+The integration lab is the tour itself. Sixty seconds at 20 Hz, three robots, one seed: Rusty
+pursues a loop of waypoints out of room A, down the corridor, into room C and back, with the sister
+book's wheel slip as the run's one stochastic subsystem; Reach follows two incommensurate sinusoids
+whose amplitudes, frequencies, and phases the seed chose; Hitch runs a six-leg reversing script with
+the seed's steering angles. Every tick, each robot's footprint goes to its own `Collision`
+implementation; a contact flashes, is counted, and — for Rusty and Hitch, whose motion is integrated
+— holds the body where it is while the wheels keep turning, which is exactly what a stuck robot's
+encoders do.
+
+Run it twice and compare every frame. The library check `tour_replays_bitwise` does: 1,200 frames,
+every coordinate equal to the last bit, and a different seed gives a different log. After the full
+minute at `BOOK_SEED = 2005` the browser port reports
+
+```text
+Rusty  Pose2 { x: 6.212, y: 4.466 }        contacts: 0
+Reach  T2 { th1: 0.186, th2: 1.324 }       contacts: 9
+Hitch  Pose2 { x: 6.245, y: 1.351, theta: 0.272 }   contacts: 12
+```
+
+and the check `tour at BOOK_SEED` pins those digits. Press re-roll on the dashboard and every one
+of them changes; type the seed back and every one of them returns. Rusty's zero contacts are not
+luck: the waypoint controller closes its loop on ground truth, which — as the sister book is careful
+to say wherever it uses the same trick — is a quantity no real robot has.
+
+One honesty item about the two implementations. The geometry agrees across them to the digit, and
+each replays itself bit for bit. The *tours* do not agree across them, because `SmallRng` and the
+browser's generator draw different numbers from the same seed, and Rusty's slip and the scripts'
+parameters come from those draws. The claim this book makes is the one it can test: that each
+implementation is a pure function of its seed, and that both compute the same geometry.
+
+### The anatomy of a widget
+
+Every interactive figure in this book is built from the same parts, fixed here and never
+renegotiated. A `WidgetFrame` carries the id from the chapter's design manifest, the title, one line
+naming the misconception the widget kills, and a color key. Inside it, one or more `SimCanvas`
+instances draw in metres and radians and let the framework map to pixels, resize, and re-read the
+palette when the reader flips theme. A `useSimulation` hook runs a fixed-rate clock from a seed;
+`Transport` shows play, step, reset, re-roll, and the seed itself, because reproducibility is part
+of what is being taught. Colors are never named in a widget — they come from the palette the canvas
+hands to `draw`, which is how hovering a tinted term in an equation can fade every other role on the
+page without any widget knowing the feature exists. Each widget autoplays a seeded default,
+foregrounds one parameter, and hides the rest behind a disclosure. The frame also carries a
+`<noscript>` slot for a static description, so a reader without JavaScript is told what the
+simulation would have drawn rather than shown a blank.
+
+Which chapter opens which box: Chapter 3 builds the Bug algorithms on `RangeSensor` and the Apartment;
+Chapter 4 opens `collide` and adds Reach's Jacobian beside the forward kinematics defined here;
+Chapter 5 implements `Manifold` *for* the configuration types defined here; every planner from
+Chapter 7 to Chapter 21 takes a `&dyn Collision` and a robot from `robots`; and Appendix F is this
+section, expanded into a reference.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Inverse kinematics for general link lengths">
+    Derive Reach's inverse kinematics for general $L_1, L_2$ using the law of cosines and
+    $\operatorname{atan2}$ (Choset problem 20). State the reachable annulus and show exactly which
+    tip positions have one solution rather than two. Then explain why `Reach::ik` returns
+    `[Option<T2>; 2]` rather than `Option<[T2; 2]>` — what does it mean for exactly one entry to be
+    `None`?
+    <Hints>
+      <>Place the triangle: origin, elbow, tip, with sides $L_1$, $L_2$, $\norm{x}$. The law of cosines at the elbow gives $\cos\theta_2$; a cosine has two preimages in $(-\pi, \pi]$.</>
+      <>The two preimages coincide when $\cos\theta_2 = \pm 1$, i.e. on the annulus boundary — both circles. Inside, two; on the boundary, one; outside, none.</>
+      <>With the library's convention the two entries are both `Some` or both `None`, so a single `None` cannot occur — the type is more permissive than the mathematics. Chapter 5 revisits this when `Manifold` gives the annulus boundary its own treatment.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="R(q) for a car and trailer">
+    Write $\Rq$ as a set for Hitch with the trailer: show it is the union of two rectangles whose
+    poses are functions of $(x, y, \theta, \psi)$, and give those two poses explicitly in terms of
+    the wheelbase, the overhangs, and $d_h$. Then explain why $\psi$ is a configuration variable but
+    the steering angle $\phi$ is not. (The compiler already knows: $\phi$ lives in `CarCmd`, not in
+    `HitchCfg`.)
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Predict a witness, then watch it jump">
+    Put Reach at $q = (0, \pi/2)$ and imagine the square obstacle of side $0.2$ centered on $(1, 1)$.
+    <Predict
+      id="ch02.e3"
+      question="What does the distance query return for this configuration?"
+      options={[
+        { label: 'About 0.1 — the half-side of the square, measured from its edge to the tip', because: 'That would be the distance from the square\'s center to its edge. But the tip is not outside the square: φ(0, π/2) = (1 + cos 90°, sin 90°) = (1, 1), which is the square\'s center.' },
+        { label: 'Exactly 0 — the configuration is in collision', correct: true, because: 'The elbow is at (1, 0) and the tip at (1, 1), the center of the square. Link 2 ends inside the obstacle, so intersects is true, the distance is 0, and the witness is a contact point rather than a nearest pair.' },
+        { label: 'About 0.9 — the distance from the elbow to the square', because: 'The query minimizes over the whole footprint, not over the joints. Link 2 reaches the square even though the elbow is far from it.' },
+      ]}
+    >
+    Now slide $\theta_2$ to $\pi/2 + 0.3$. The tip swings to about $(0.70, 0.96)$, outside the square,
+    and link 2 runs from $(1, 0)$ past the square's lower-left corner. The nearest obstacle point is
+    that corner, $(0.9, 0.9)$, at a distance you can compute by projecting the corner onto the link.
+    </Predict>
+    <CheckAnswer
+      id="ch02.e3b"
+      prompt="Distance from link 2 to the square at q = (0, π/2 + 0.3), in metres"
+      answer={0.1704}
+      tolerance={0.003}
+      unit="m"
+    >
+    Link 2's direction is $(-\sin 0.3, \cos 0.3) \approx (-0.2955, 0.9553)$. The corner $(0.9, 0.9)$
+    minus the elbow $(1, 0)$ is $(-0.1, 0.9)$, whose projection onto the link is at parameter
+    $0.889 \in [0, 1]$ — so the foot lies on the link — giving the foot $(0.7373, 0.8493)$ and a
+    distance of $0.1704$. The library check `exercise 3` pins it, with $b^* = (0.9, 0.9)$. Keep sliding
+    toward $\pi$ and watch for the moment the nearest feature stops being that corner.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="One metre to the left">
+    In the dashboard, turn the trailer on and try to make Hitch's trailer end up exactly one metre
+    to the left of where it started, with the same heading. Describe the maneuver you find and count
+    its direction reversals.
+    <Hints>
+      <>A pure translation sideways has zero lateral velocity at every instant — and the model has no input for that.</>
+      <>Steer left and drive forward, then steer right and drive backward. Where did the body end up relative to where it started?</>
+      <>Zero reversals is impossible; Chapter 20 proves it with the Lie bracket of the drive and steer fields, and Chapter 21 computes the minimal maneuver.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="Redundancy: a tip that does not move">
+    Add `Reach<3>` with `lengths = [0.6, 0.5, 0.4]` to the dashboard's Workbench pane and show that
+    the tip can stay fixed while the arm moves (redundancy, Choset §3.3). Write a test that takes
+    200 seeded configurations with the same tip — generate them by a one-dimensional walk in the
+    null space of the tip map, re-solving the last two joints by the 2R inverse kinematics after each
+    step of $\theta_1$ — and asserts `tip` constant to $10^{-9}$.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Lie to the Bug (stretch)">
+    Replace the exact `RangeSensor` by the sister book's noisy LiDAR port (`lib/sim/rusty.ts`,
+    `raycastScan`) in the Bug1 stub of Chapter 1 and measure, over 100 seeds, how often the leave
+    point is misjudged. Write one paragraph on why Chapter 3's guarantee needs the ideal sensor, and
+    what a real robot does instead (the sister book's Chapter 10 is the pointer).
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="§3.1 for the circular robot's R(q) and the arm's torus; §3.8, Example 3.8.1, for the forward kinematics and its worked numbers; Appendix F.5 for GJK, the name of what the black box does."
+  />
+  <Reference
+    authors="Gilbert, E. G., Johnson, D. W., and Keerthi, S. S."
+    year={1988}
+    title="A fast procedure for computing the distance between complex objects in three-dimensional space"
+    venue="IEEE Journal on Robotics and Automation 4(2), 193–203"
+    doi="10.1109/56.2083"
+    note="The GJK distance algorithm, Choset's Algorithm 23: the iteration inside every distance and witness query the Rust crate delegates to parry2d."
+  />
+  <Reference
+    authors="Lozano-Pérez, T."
+    year={1983}
+    title="Spatial Planning: A Configuration Space Approach"
+    venue="IEEE Transactions on Computers C-32(2), 108–120"
+    doi="10.1109/TC.1983.1676196"
+    note="Where the disc's one-line Minkowski inflation comes from, and where Chapter 4 picks it up for polygons."
+  />
+  <Reference
+    authors="Pan, J., Chitta, S., and Manocha, D."
+    year={2012}
+    title="FCL: A general purpose library for collision and proximity queries"
+    venue="IEEE International Conference on Robotics and Automation (ICRA), 3859–3866"
+    doi="10.1109/ICRA.2012.6225337"
+    note="The collision library behind MoveIt and OMPL's default checkers, with the same four-query vocabulary — intersection, distance, closest points, continuous collision — that this chapter's Collision trait adopts."
+  />
+  <Reference
+    authors="Şucan, I. A., Moll, M., and Kavraki, L. E."
+    year={2012}
+    title="The Open Motion Planning Library"
+    venue="IEEE Robotics & Automation Magazine 19(4), 72–82"
+    doi="10.1109/MRA.2012.2205651"
+    note="A planner that takes a state validity checker and a state space as abstract interfaces: the architecture this chapter's Collision trait object and typed configurations mirror."
+  />
+  <Reference
+    authors="Dimforge"
+    year={2024}
+    title="parry: 2D and 3D collision-detection library for the Rust programming language"
+    venue="Documentation and source"
+    url="https://parry.rs"
+    note="The crate behind crates/collide: shapes, the Qbvh broad phase, and query::{distance, closest_points, intersection_test, cast_shapes}. Appendix C documents what it does."
+  />
+  <Reference
+    authors="Thrun, S., Burgard, W., and Fox, D."
+    year={2005}
+    title="Probabilistic Robotics"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262201629/probabilistic-robotics/"
+    note="The source of Rusty's differential-drive model, encoders, and LiDAR, ported here from the sister book's Chapter 4 and never re-derived."
+  />
+</References>

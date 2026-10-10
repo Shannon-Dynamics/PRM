@@ -1,0 +1,105 @@
+---
+title: How to Read This Book
+description: The FCP method, the notation, the running lab, and what you need to know before starting.
+---
+
+This book is organized so that you can read it three different ways, and all three are legitimate.
+
+## The three passes
+
+Every chapter makes three passes over its subject, in this order:
+
+<Overview
+  goals={[
+    'Understand what problem each planner solves, what it assumes, and what it guarantees',
+    'Derive the mathematics yourself, with every step available',
+    'Implement it in Rust and watch it run on a simulated robot',
+  ]}
+  prerequisites={[
+    'Linear algebra: matrices, rank, eigenvectors',
+    'Calculus: partial derivatives, the chain rule, the implicit function theorem (reviewed when needed)',
+    'Some programming experience — Rust specifics are taught as needed',
+  ]}
+>
+**Conceptual** comes first, because intuition should precede formalism. You will meet an
+interactive figure before you meet an equation, and the figure will usually make you predict
+something and then show you whether you were right.
+
+**Foundation** is the mathematics, in full. Definitions are precise, assumptions are stated
+where they are made rather than buried, and proofs are sketched in the text with the complete
+argument available in a collapsible block. Completeness, optimality, and complexity are stated as
+theorems with hypotheses, not as adjectives.
+
+**Practical** is the Rust. Not pseudocode dressed up as code: real types, real crates, code that
+compiles and that you could lift into a planner.
+</Overview>
+
+## Reading paths
+
+- **The full path** — read straight through. Part I builds the geometry, Parts II–III the
+  planners, Part IV the uncertainty a planner must live with, Part V dynamics and constraints,
+  Part VI learning and the integrated stack.
+- **The path-planning path** (Choset's own suggestion, updated) — Chapters 4, 5, 6, 7, 8, 11, 12, 13,
+  then 10. The shortest route from "what is a configuration space" to "what a modern planning
+  library actually runs".
+- **The mobile-robotics path** — Chapters 2, 3, 6, 7, 8, 9, 16, 21, 23.
+- **The mechanical-systems path** — Chapters 4, 5, 17, 18, 19, 20, 21.
+- **The builder's path** — skim the Foundation sections, play with every widget, and implement the
+  Practical section of each chapter. The exercises marked **P** are the spine of this route.
+
+## The running lab
+
+Three robots and three worlds recur throughout the book, so that every new method can be compared
+against the last on identical ground.
+
+**Rusty** is a differential-drive rover with a range sensor — the same robot as in the sister
+volume. Rusty lives in the **Apartment**, a 2-D floorplan with rooms, doorways, and a long corridor.
+For most of Parts I–IV Rusty is treated as a disc, which makes its configuration space a plane.
+
+**Reach** is a planar two-link arm (with a three-link variant for redundancy). Reach works at the
+**Workbench**, a table with polygonal obstacles. Its configuration space is a torus, which is why
+it is the book's canonical example whenever topology matters, and its dynamics carry Part V.
+
+**Hitch** is a car-like robot that can pull a trailer. Hitch lives in the **Lot**, a parking lot
+with bays and pillars, and cannot move sideways — which is the whole subject of Chapters 20 and 21.
+
+All three are built in [Chapter 2](/chapters/ch02-the-lab) and act together in
+Chapter 23.
+
+## Notation and color
+
+The book follows the notation of Choset et al. so that readers can move between this text and the
+literature without translating: $\Q$ for the configuration space, $\QO_i$ for a C-obstacle,
+$\Qfree$ for free space, $c : [0,1] \to \Qfree$ for a path. The [notation reference](/notation)
+lists every symbol.
+
+One convention is worth internalizing before you start, because it runs through the prose, the
+equations, the figures, and the code comments alike:
+
+<ColorKey />
+
+Green is always where you start and red is always where you want to be. Slate is a thing in the
+world; amber is the set of configurations that would make the robot touch it. Blue is what a planner
+has explored — a roadmap, a tree, a wavefront. Purple is the path it chose. Orange is the robot
+itself, and the trajectory it actually executed.
+
+Where a belief appears (Chapters 15–16 and the capstone), the sister book's five estimation colors
+are used unchanged, so a reader of both books never has to relearn a color.
+
+<KeyIdea title="Interaction is an invitation, not a requirement">
+Every simulation in this book starts playing on its own with a sensible default, and every one
+of them can be read passively. The sliders are there for when you want to ask a question — shrink
+the corridor until the sampler stops finding it, and you will remember why narrow passages are hard.
+</KeyIdea>
+
+## On the Rust
+
+The book uses Rust because motion planning is exactly the kind of code where the type system earns
+its keep: a configuration on a torus cannot be passed where a rigid-body pose is expected, a path
+cannot be handed to a controller that needs a trajectory, and there is no garbage collector to
+interfere with a planning loop.
+
+You do not need to know Rust before starting. What you need is patience with a compiler that is
+stricter than you are used to, and the willingness to read a type signature as documentation. The
+crates the book relies on — `nalgebra`, `parry2d`, `petgraph`, `rand` — are introduced when they are
+first needed.
