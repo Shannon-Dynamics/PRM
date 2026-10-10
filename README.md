@@ -18,21 +18,29 @@ Implementations* (MIT Press, 2005), and is the sister volume of
 [*Probabilistic Robotics via Rust*](../ProbabilisticRoboticRust/), with which it shares its robot,
 its simulator, and its publishing architecture.
 
-## Running the book while it is being written
+## Running the book
 
 ```sh
 export PATH="$HOME/.local/node/bin:$PATH"   # Node 24 (see web/README.md to install it)
 cd web && npm install
-npm run build        # builds whatever chapters exist; unwritten ones show as "in preparation"
+npm run build        # static export of all 23 chapters to web/out
 npm run preview      # serve the built book (compressed, like GitHub Pages)
 npm run check        # numerical invariants of every landed algorithm module
-ALLOW_MISSING=1 npm run check:book   # book consistency, tolerating chapters not yet written
+npm run smoke        # compile + server-render every chapter in seconds
+npm run verify       # everything above, strictly, then the build
 ```
 
 `npm run build` regenerates the sidebar from the chapter files present (`scripts/sync-meta.mjs`),
-so a partially written book always builds. The strict `npm run verify` is for the finished book.
+and `ALLOW_MISSING=1 npm run check:book` tolerates missing chapters, so a partially edited book
+still builds.
 
-## Status: implementation in progress
+For the print edition: `cd pr-latex && make` (needs `pdflatex` with `newpx`, `tcolorbox`,
+`fontawesome5`, `listings`; a TinyTeX install at `~/.TinyTeX` is picked up automatically).
+
+## Status
+
+The web edition is complete: 23 chapters, 82 interactive widgets, 307 numerical self-checks, all
+passing. The print edition's LaTeX is generated from it; the PDF has not been typeset yet.
 
 This repository holds the **design documents** the book is built from, the web edition under
 `web/` (chapters land one at a time), and the print pipeline under `pr-latex/`:

@@ -120,7 +120,8 @@ export function HeuristicCalibration() {
     return { ...s };
   }, []);
 
-  const sim = useSimulation<State>({ init, step: stepFn, fps: 20, initialSeed: 7 });
+  // Seed 39: the learned ĥ expands fewer nodes than octile *and* returns a longer path — the misconception, on screen.
+  const sim = useSimulation<State>({ init, step: stepFn, fps: 20, initialSeed: 39 });
   const resetRef = useRef(sim.reset);
   resetRef.current = sim.reset;
   useEffect(() => {

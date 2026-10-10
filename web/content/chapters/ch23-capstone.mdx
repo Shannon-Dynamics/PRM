@@ -1,0 +1,1229 @@
+---
+title: "Capstone: A Planning Stack from Sensor to Motion"
+description: Twenty-two chapters built planners; this one builds the stack — Rusty replanning on a belief in an Apartment whose doors shut, Reach planning, time-scaling and smoothing on the Workbench, Hitch towing a trailer into the Lot — three chains of typed contracts, three guards, one deterministic scheduler, every internal inspectable in the browser.
+chapter: 23
+part: PART VI
+partTitle: Frontiers and Integration
+difficulty: Advanced
+readingTime: 75 min
+quote: The distinction between offline algorithms and online sensor-based algorithms can be somewhat murky; if an offline planner runs quickly enough, for example, then it can be used in a feedback loop to continually replan when new sensor data updates the environment model.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 1
+---
+
+import { GrandPlan } from '@/components/ch/ch23/grand-plan';
+import { StackAnatomy } from '@/components/ch/ch23/stack-anatomy';
+import { FailureTour } from '@/components/ch/ch23/failure-tour';
+import { RetrospectiveScorecard } from '@/components/ch/ch23/retrospective-scorecard';
+import { LibraryMap } from '@/components/ch/ch23/library-map';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Read a planning stack as a chain of contracts — input type, output type, frame, period, and the guarantee a stage gives when its input is valid — and make the path/trajectory distinction a type nothing can cross by accident',
+    'Prove the guarantee-composition rule: a pipeline is as complete as its weakest rejecting stage, and only that complete if every post-processor verifies its output or falls back to its input',
+    'Derive the replanning budget v·T_react + v²/2a < d_detect from the staleness of each stage, compute the safe speed and the validity horizon for the book’s default rates, and see the D23.2 check catch what the budget alone would miss',
+    'Turn two statistics the book already owns into guards with thresholds you can defend: the manipulability μ = l₁l₂|sin θ₂| of Chapter 4 and the hitch angle of Chapter 20',
+    'Compose Chapters 2–22 in Rust as stages behind one trait, scheduled on threads natively and by a deterministic round-robin in WASM, with a supervisor whose Mode the compiler keeps exhaustive',
+    'Map every stage onto its counterpart in OMPL, MoveIt and Nav2, and write the retrospective honestly: what the type system caught, and what it cost',
+  ]}
+  prerequisites={[
+    'The whole book. The load-bearing chapters are 4 (Jacobian, inflation), 6 (D* Lite), 12–13 (RRT-Connect, Informed RRT*), 16 (particle belief, replan_on_belief), 18 (time scaling), 19 (CHOMP, MPC), 20–21 (the trailer, hybrid A*)',
+    'Chapter 1’s completeness vocabulary — complete, resolution-complete, probabilistically complete — which this chapter composes',
+    'Rust traits, enums with data, and exhaustive match',
+  ]}
+  builds="Nothing. This is the last chapter: every algorithm in it is a citation into an earlier one, and the only new mathematics is the mathematics of putting them together."
+>
+Twenty-two chapters built planners. Each one came with its own world, its own query, and a widget
+that ran it in isolation: a tree growing on a torus, a wave front crossing a grid, a car tracing
+Reeds–Shepp arcs between two poses nobody would ever drive between. This chapter builds the thing
+those planners are for — *the stack* — three times over, and runs all three at once.
+
+Rusty is dropped into the Apartment with the architect’s drawing and nothing else. Nobody told it
+where the furniture is, or which doors are shut. It localizes against the drawing with Chapter 16’s
+particle filter, plans on Chapter 6’s grid with D\* Lite, and tracks the plan with Chapter 19’s
+receding-horizon controller; when a door it was counting on turns out to be closed, two scans confirm
+it, the grid grows a few amber cells, and the plan repairs. Reach makes three picks on the Workbench:
+Chapter 12 finds a joint path, Chapter 13 improves it inside a budget, Chapter 18 gives it a clock that
+saturates the motors, Chapter 19 smooths it — and a verifier throws the smoothed version away whenever
+it touches the block. Hitch tows a trailer across the Lot into bay 3 with Chapter 21’s hybrid A\*,
+while a guard built from Chapter 20’s trailer kinematics watches the hitch angle.
+
+The argument of the chapter is architectural, and it has mathematics. A stack is a chain of
+**contracts**; each stage lives in a different cell of Choset’s task × robot × algorithm table, and
+the composed system has exactly the guarantee of its weakest stage — no more, and only that much if
+every downstream stage either checks its input or falls back to it. Staleness adds up along the chain
+and turns into a braking distance. Recoveries are not luck: each one is a statistic the book already
+derived, crossing a threshold someone has to defend. And the claim the book has been building toward
+is literal here: **everything you studied is running on this page, unmodified, at real time, in the
+browser.**
+</Overview>
+
+## Sixty seconds, three robots
+
+<Deferred minHeight={760}>
+  <GrandPlan />
+</Deferred>
+
+Nothing in that widget is recorded. Each animation frame advances one `Mission` by roughly one 50 ms
+tick of simulated time: fifteen stages on one round-robin scheduler, each running only when its
+period has elapsed. The particle cloud is being reweighted ten times a second against the
+architect’s drawing; D\* Lite repairs its cost-to-goal field twice a second; Informed RRT\* is doing
+forty iterations per tick on the torus until its budget runs out; the trailer’s heading is being
+integrated by the same RK4 that Chapter 2’s simulator uses. Every number in the inspectors is read
+straight out of the running stages.
+
+Three things are worth watching before any button is pressed.
+
+**Rusty is drawn where it *believes* it is.** The orange triangle is the mode of a particle cloud
+localized against the blueprint; the purple ellipse is three standard deviations of that cloud.
+Switch on *ground truth* and a gray outline appears where Rusty really is — a few centimeters away,
+because the wheels slip and the belief only ever learns about it from the scans. Every downstream
+stage plans from the belief. If that sounds like a detail, open the Belief tab and read the line
+*map trusts scans*: the mapping stage refuses to paint an obstacle while the cloud is wider than 5 cm,
+because a scan projected through a loose belief puts walls where there are none.
+
+**Reach’s motion has a clock, and the clock is tight.** The strip under the torus is the phase plane
+$(s, \dot s)$ of Chapter 18. The purple profile touches the amber velocity-limit curve: at every
+instant one of the two motors is at its torque limit. That is what *time-optimal* means, and it is
+why the smoothed path Reach actually executes is a few hundredths of a second faster than the
+shortcut path it came from — CHOMP lowered the curvature, which raised the limit curve.
+
+**Hitch reverses first.** It starts facing the east curb with the bay behind it, so the only way in
+is to back out, and reversing is exactly when a trailer is unstable. The hybrid A\* path is accepted
+only because the trailer, simulated along it, never folds past $\phi_{plan} = 0.85$ rad. The gauge
+in the Guards tab shows the hitch angle the whole way.
+
+Now press the three chaos buttons. *Close Door* shuts the next door on Rusty’s path; *Singular Goal*
+moves Reach’s next pick out to full stretch; *Reverse Hard* throws Hitch into full reverse at full
+lock. Each robot recovers, and the left rail shows the mode machine that did it. The rest of the
+chapter explains every panel and every recovery.
+
+<KeyIdea title="The one sentence version">
+A planning stack is a chain of typed contracts: each stage promises something only about valid
+input, the composed guarantee is the weakest promise in the chain, and every recovery is a named
+statistic crossing a threshold followed by a mode with a plan.
+</KeyIdea>
+
+## Why not one planner?
+
+The first question, having built twenty planners, is why the capstone needs three different
+pipelines rather than one good one. [Chapter 1](/chapters/ch01-robots-that-plan) already gave the
+answer in Choset’s own form: a motion-planning problem is a point in a space of *task* × *robot* ×
+*algorithm*, and the algorithm column is decided by the other two. Our three robots sit in three
+different rows.
+
+| | Rusty | Reach | Hitch (+ trailer) |
+|---|---|---|---|
+| Configuration space | $\mathbb{R}^2$ (disc) | $T^2$ | $SE(2) \times S^1$ |
+| Constraint | holonomic, slips | dynamics, torque limits | nonholonomic, jackknife |
+| What it knows | a blueprint; not the furniture, not the doors | the Workbench, exactly | the Lot, exactly |
+| Task | navigate, replan | pick, fast and smooth | park, towing |
+| Algorithm family | grid search on a belief | sampling, then time scaling | lattice search with analytic shots |
+| What it cannot promise | anything, if the belief is lost | a solution in finite time | a path the car search never proposes |
+
+Each column is a different chapter of this book, and each bottom row is a different *kind* of
+incompleteness. D\* Lite on an inflated grid is resolution-complete for a robot whose position it
+knows; sampling is probabilistically complete, which promises nothing about any particular deadline;
+hybrid A\* is resolution-complete with respect to its own expansion primitives and to nothing else.
+There is no single planner that is good at all three, and even if there were, the guarantees would
+still be different statements about different objects.
+
+The second reason is time. A plan is computed for the world as it was when the planner last looked.
+By the time it reaches the wheels, the scan it was built on is a tenth of a second old, the belief a
+little older, the map older still; if the door shut in between, the plan is a confident description
+of a world that no longer exists. A stack is how a robot keeps those ages bounded — and the
+mathematics of this chapter is mostly the mathematics of adding them up.
+
+<Deferred minHeight={620}>
+  <StackAnatomy />
+</Deferred>
+
+The block diagram above is not a picture of the stack; it is the stack, replaying a recorded mission.
+The numbers on the arrows are the messages per second each stage actually emitted over the last
+simulated second, and the amber tint on each block is how old its newest input was when it last ran.
+Rusty’s chain is the deepest — scan, belief, map, plan, control — and its control stage at 20 Hz
+reads a plan that can be half a second old. Reach’s stages run at the base rate but emit only when
+they have work: the planner is silent between picks. Switch a block off and the mission re-records
+with that stage dead from three seconds in, which turns each sentence in the contract card into
+something you can watch happen.
+
+Honesty item, stated once and kept: **the three panels do not share a world.** This is three stacks
+on one scheduler, not a team. Nothing Reach does can block Rusty; nothing Hitch does needs Rusty’s
+permission. Coupled robots are [Chapter 14](/chapters/ch14-many-bodies)’s subject, and the composite
+configuration spaces there are exactly what three-robot coordination would require.
+
+## Every chapter, running
+
+The capstone imports; it does not reimplement. The table is exhaustive. *Artifact* means the
+chapter’s code is linked into `lib/capstone` and executed by the browser port (and into
+`crates/capstone` on the Rust side); *background* means the chapter’s idea is load-bearing but no
+code from it runs.
+
+| Chapter | Contribution to the capstone | Kind |
+|---|---|---|
+| [Ch. 1](/chapters/ch01-robots-that-plan) | Task × robot × algorithm taxonomy (Choset Table 1.1); path vs trajectory; the completeness vocabulary the composed guarantee is written in | background |
+| [Ch. 2](/chapters/ch02-the-lab) | The three robots and worlds; the `Collision` contract (disc, chain, footprint checkers) that every dense recheck calls; the range sensor | artifact |
+| [Ch. 3](/chapters/ch03-bug-algorithms) | Tangent Bug as Rusty’s complete local fallback when the inflated grid has no path | artifact |
+| [Ch. 4](/chapters/ch04-configuration-space-i) | Disc inflation for Rusty’s grid; Reach’s Jacobian, $\lvert\det J\rvert$ and $\sigma_{min}$ — the singularity guard | artifact |
+| [Ch. 5](/chapters/ch05-configuration-space-ii) | The manifolds every stage is generic over: $T^2$ for Reach’s planner and shortcut, $\mathbb{R}^2$ for Rusty’s | artifact |
+| [Ch. 6](/chapters/ch06-graph-search) | D\* Lite on Rusty’s inflated grid; the grid raster of the blueprint; A\* for the final-map optimum | artifact |
+| [Ch. 7](/chapters/ch07-potential-functions) | The brushfire distance transform under CHOMP’s distance field | artifact |
+| [Ch. 8](/chapters/ch08-roadmaps-i) | Accessibility, connectivity, departability — the vocabulary of a stage contract | background |
+| [Ch. 9](/chapters/ch09-roadmaps-ii) | Why Rusty does not trace the GVG online: at Apartment scale a repaired grid plan is cheaper | background |
+| [Ch. 10](/chapters/ch10-cell-decompositions) | Coverage — the one Table 1.1 task the capstone does not run | background |
+| [Ch. 11](/chapters/ch11-prm) | The `Steer` contract and greedy shortcutting; Reach’s `FreeSpace` over the chain checker | artifact |
+| [Ch. 12](/chapters/ch12-tree-planners) | RRT-Connect: Reach’s first feasible path and the source of its probabilistic completeness | artifact |
+| [Ch. 13](/chapters/ch13-optimal-sampling) | Informed RRT\*, anytime inside an iteration budget | artifact |
+| [Ch. 14](/chapters/ch14-many-bodies) | Composite manifolds and coupling — why three robots in three worlds are three stacks, not a team | background |
+| [Ch. 15](/chapters/ch15-kalman-observer) | The 3σ margin and the covariance vocabulary of the belief gate (the browser port reads σ from Chapter 16’s cloud) | background |
+| [Ch. 16](/chapters/ch16-bayesian-localization) | The particle localizer Rusty plans from; `replan_on_belief` scoring the first move on D\* Lite’s field | artifact |
+| [Ch. 17](/chapters/ch17-robot-dynamics) | Reach’s $M(q)$, $C(q,\dot q)$, $g(q)$ and torque limits | artifact |
+| [Ch. 18](/chapters/ch18-trajectory-planning) | Path-constrained dynamics, the time-optimal Time-Scaling Algorithm, the `Trajectory<M>` type | artifact |
+| [Ch. 19](/chapters/ch19-trajectory-optimization) | CHOMP smoothing for Reach; the receding-horizon iLQR tracker for Rusty | artifact |
+| [Ch. 20](/chapters/ch20-nonholonomic-i) | The car-with-trailer drive field behind the hitch-angle rate of the jackknife guard | artifact |
+| [Ch. 21](/chapters/ch21-nonholonomic-ii) | Hybrid A\* with Reeds–Shepp shots; the trailer simulated along a car path; the path scorer | artifact |
+| [Ch. 22](/chapters/ch22-learning-and-planning) | The optional learned sampler for Reach’s RRT-Connect, shipped only inside a uniform floor | artifact |
+| App. A–F | Rust idioms, topology card, collision reference, completeness definitions, linear-systems card, simulator framework | background |
+
+Two rows deserve a sentence. Chapter 15 is *background* in the browser port: the belief Rusty plans
+from is Chapter 16’s particle cloud, and the 0.15 m inflation margin is three standard deviations of
+a 5 cm localization error — Chapter 15’s vocabulary, applied to a cloud. And Chapter 3 is an artifact
+that the default missions never exercise: Tangent Bug takes over only when D\* Lite reports no path
+on the inflated grid, which happens when the map has sealed off a route the true world still has. A
+fallback that never runs in the demo is still part of the contract, and the contract card in the
+Stack Anatomy says so.
+
+The capstone’s own worlds add exactly two things to Chapter 2’s. The Apartment’s floor plan is a
+tree — every room has one door — so a shut door would simply end Rusty’s mission; the architect’s
+drawing Rusty is given therefore has one more opening, a connecting door between the study and the
+bedroom. And the furniture is new: four curated placements, of which a seed picks two (seed 7: a cart
+in the corridor and a basket in the bedroom). Curated, not uniform, because a box dropped in a doorway
+makes the mission infeasible, and the capstone’s subject is replanning, not infeasibility.
+
+## The mathematics
+
+Choset has no systems chapter, so the formal content here is new, but it is small: four definitions
+and four derivations, each of which composes results proved elsewhere in the book. The notation adds
+to [TOC §2](/chapters/ch01-robots-that-plan) and changes nothing in it.
+
+<NotationTable
+  rows={[
+    { sym: '\\mathcal{S}_i,\\ \\tau_i,\\ \\varsigma_i', meaning: 'stage i; its period; its worst-case staleness as a producer', note: 'ς_i = τ_i for a periodic stage' },
+    { sym: 'T_{react}', meaning: 'worst-case sense-to-command delay through a pipeline', note: 'F2' },
+    { sym: 'd_{detect},\\ v_{max},\\ a_{max}', meaning: 'distance at which a new obstacle is first trusted; Rusty’s speed and braking limits', note: '2.0 m, 0.6 m/s, 1.0 m/s²' },
+    { sym: 'L_{valid}', meaning: 'validity horizon: the path prefix re-checked against the newest map every control tick', note: 'D23.2' },
+    { sym: '\\mu(q) = \\lvert\\det J(q)\\rvert = l_1 l_2 \\lvert\\sin\\theta_2\\rvert', meaning: 'Reach’s manipulability (2R, square Jacobian)', note: 'Ch. 4; μ_min = 0.25' },
+    { sym: '\\sigma_{min}(J)', meaning: 'smallest singular value of the Jacobian', note: '‖q̇‖ ≤ ‖ẋ‖/σ_min' },
+    { sym: '\\phi = \\theta - \\psi', meaning: 'hitch angle: car heading minus trailer heading', note: 'Ch. 2’s convention; d = 2.5 m' },
+    { sym: '\\phi_{plan} < \\phi_{warn} < \\phi_{max}', meaning: 'trailer filter bound; guard threshold; mechanical jackknife', note: '0.85, 0.90, 1.30 rad' },
+    { sym: '\\mathcal{G}', meaning: 'a guarantee: complete ≻ resolution-complete ≻ probabilistically complete ≻ none', note: 'a total order' },
+  ]}
+/>
+
+### Four definitions
+
+**D23.1 — Stage and contract.** A stage $\mathcal{S}_i$ consumes stamped inputs and emits one stamped
+output at period $\tau_i$. Its *contract* names the input type, the output type, the frame both are
+expressed in, and the guarantee $\mathcal{G}_i$ the stage provides **given valid inputs**. The types
+are the contract: a `Path<M>` is a geometric curve $c : [0, 1] \to \Qfree$; a `Trajectory<M>` is a
+path with a clock, $q(t)$ for $t \in [0, t_f]$ ([Choset §1.3](/chapters/ch01-robots-that-plan),
+[Chapter 18](/chapters/ch18-trajectory-planning)). Nothing executes a `Path`.
+
+**D23.2 — Validity horizon.** $L_{valid} = v_{max}\,(\tau_{plan} + \varsigma_{map})$: the prefix of the
+current path the robot may drive before the next plan can possibly arrive. Every control tick, that
+prefix is re-checked against the *newest* map — which may be newer than the map the path was planned
+on — and the robot brakes if any cell in it is occupied.
+
+**D23.3 — Composed guarantee.** Call a stage *rejecting* if it can answer "no" to a query (a planner, a
+filter). Then
+
+<LinkedMath>
+$$
+\mathcal{G}(\text{pipeline}) \;=\; \min_{i\,:\,\mathcal{S}_i \text{ rejects}} \mathcal{G}_i
+$$
+</LinkedMath>
+
+provided every post-processor downstream of a planner either verifies its output or falls back to its
+input; if any post-processor can silently break its input’s property, $\mathcal{G} = $ none.
+
+**D23.4 — Mode.** The supervisor’s discrete state per robot is an exhaustive enum,
+`Plan | Execute | Replan | Recover(kind) | Done | Failed(reason)`, and its transition function is
+total: every (mode, event) pair lands on a mode. Recoveries carry parameters —
+`PullGoalInward { delta }`, `PullForward { until_phi }`, `TangentBug` — because "recover" is not a plan.
+
+### F1 — Guarantee composition: the weakest link, with verified post-processors
+
+**Statement.** Rusty’s pipeline is resolution-complete *given a localized belief and a world that is
+static between detections*; Reach’s is probabilistically complete; Hitch’s is resolution-complete for
+the car alone and promises **nothing** for the car with its trailer, because the trailer filter can
+reject every candidate the car search proposes.
+
+The sketch has four steps. List the stages and their $\mathcal{G}_i$. Identify which of them can reject
+a query. Check each post-processor for a fallback. Take the minimum. The interesting work is in the
+third step, and in being honest in the first.
+
+<Derivation title="F1 for the three pipelines, stage by stage" result="Rusty: resolution-complete (conditional) · Reach: probabilistically complete · Hitch: none for the trailer">
+
+**Rusty.** The stages and their roles:
+
+| Stage | Role | $\mathcal{G}_i$ / property |
+|---|---|---|
+| scan (Ch. 2) | source | — |
+| belief (Ch. 16) | source | localized only while $\sigma \le 5$ cm, which the map stage enforces |
+| inflated grid (Ch. 4, Ch. 6) | source | the C-obstacle of the disc, sampled at cell centres |
+| D\* Lite (Ch. 6) | rejecting | resolution-complete on the inflated grid it is given |
+| D23.2 check + MPC (Ch. 19) | verified post-processor | never drives a prefix the newest map marks occupied; falls back to braking and replanning |
+| Tangent Bug (Ch. 3) | fallback | complete for a point with clearance $W^*$ in a static plane |
+
+The only rejecting stage is D\* Lite, so the pipeline inherits *resolution completeness on the grid it
+was given*. Two conditions hide in that phrase, and the text states both rather than letting the reader
+infer more. First, the grid is built by projecting scans through the belief; if the belief is lost the
+grid is wrong and no completeness statement about it says anything about the Apartment. The map stage
+therefore refuses to insert obstacles while $\sigma > 5$ cm — the condition is enforced, not assumed.
+Second, D\* Lite is resolution-complete for a static graph; between two repairs the world must not
+change faster than the budget F2 allows. Tangent Bug is the fallback for the case in which the grid
+says "no path" but the world disagrees.
+
+**Reach.**
+
+| Stage | Role | $\mathcal{G}_i$ / property |
+|---|---|---|
+| singularity guard (Ch. 4) | guard | rejects a goal with $\mu < \mu_{min}$, recovers by moving it |
+| RRT-Connect (Ch. 12) | rejecting | probabilistically complete |
+| Informed RRT\* (Ch. 13) | anytime improver | returns the better of its own best and RRT-Connect’s path |
+| shortcut (Ch. 11) | verified post-processor | every replaced piece is a steered, checked segment |
+| time scaling (Ch. 18) | verified post-processor | the spline is densely rechecked; if it cuts a corner, the polyline is scaled segment by segment, rest to rest |
+| CHOMP (Ch. 19) | **unverified** alone | can push a waypoint into the block |
+| verify (Ch. 2) | guard | swept recheck of CHOMP’s trajectory; on failure, falls back to the time-scaled shortcut |
+
+CHOMP alone would make the composed guarantee *none*: it is a local optimizer of a soft penalty, and
+nothing in its objective forbids collision. Wrapped by the verifier it becomes a verified
+post-processor, and the pipeline is probabilistically complete — RRT-Connect’s guarantee. Switch the
+verifier off in Stack Anatomy and the 𝒢 printed under Reach’s row drops to *none* whether or not this
+particular seed collides, because the guarantee is a property of the pipeline, not of the run.
+
+The Chapter 22 toggle leaves this row unchanged. The learned sampler only ever ships inside the
+mixture $(1-\lambda)\hat p_\theta + \lambda u$ with $\lambda > 0$, so every set $A$ of positive measure is
+still sampled with probability at least $\lambda\,\mu(A)/\mu(\mathcal{Q})$ per draw — the hypothesis
+probabilistic completeness needs.
+
+**Hitch.**
+
+| Stage | Role | $\mathcal{G}_i$ / property |
+|---|---|---|
+| hybrid A\* + RS shots (Ch. 21) | rejecting | resolution-complete w.r.t. its primitives, *for the car* |
+| trailer filter (Ch. 20) | rejecting | none: it tests, it does not search |
+| jackknife guard (Ch. 20) | guard | fires on $\lvert\phi\rvert > \phi_{warn}$ while reversing |
+| segment tracker (Ch. 21) | executor | replays the words exactly on Chapter 2’s `Hitch.step` |
+
+Chapter 21’s hybrid A\* expands the car; the trailer is simulated along each candidate path afterwards
+and the candidate is rejected if the trailer touches anything or folds past $\phi_{plan}$. A filter
+that can say "no" without searching for an alternative is itself a rejecting stage with
+$\mathcal{G} = $ none, so the minimum is none. The retry ladder (finer cells, reverse penalties,
+staging poses) widens the set of candidates the filter sees; it does not close the gap. What would
+close it is a search with the trailer in its state: Chapter 21’s CAR GRID SEARCH with the hitch angle
+as a fourth grid axis and jackknife pruning is resolution-complete *for the trailer*, at the price of
+two orders of magnitude more expansions. The panels display `composed_guarantee` — none — rather than
+letting the reader infer more from a successful run. (Switch the filter *off* in Stack Anatomy and the
+displayed guarantee rises to resolution-complete: completeness for the car, bought by giving up every
+claim about the trailer. Completeness and soundness are different promises.)
+</Derivation>
+
+### F2 — The replanning budget: staleness plus braking
+
+A corridor that becomes blocked is first *trusted* at some distance $d_{detect}$ ahead: the sensor
+sees it earlier, but two consecutive scans must agree before a cell becomes an obstacle, and the stack
+trusts returns only within 2 m, where its 5° beam spacing still puts five rays across a 0.9 m door.
+From that moment, the information has to travel scan → belief → map → plan → control, and then the
+wheels have to stop.
+
+<LinkedMath>
+$$
+\htmlClass{term-robot}{v_{max}}\, T_{react} \;+\; \frac{\htmlClass{term-robot}{v_{max}}^2}{2\,a_{max}} \;<\; \htmlClass{term-obstacle}{d_{detect}},
+\qquad
+T_{react} = \varsigma_{scan} + \varsigma_{bel} + \varsigma_{map} + \tau_{plan} + \tau_{ctrl}.
+$$
+</LinkedMath>
+
+<Derivation title="Chaining the delays" result="T_react = Σ periods; stop = v T_react + v²/2a">
+1. **Worst-case staleness per stage.** A periodic stage that reads its input just *before* the
+   producer publishes sees a message almost one producer period old. So each link in the chain can add
+   up to one period: $\varsigma_{scan} = 1/f_{scan}$, $\varsigma_{bel} = 1/f_{bel}$,
+   $\varsigma_{map} = 1/f_{map}$. The planner itself takes up to one of its own periods to produce
+   the repaired path, and the controller up to one of its periods to act on it: $\tau_{plan}$,
+   $\tau_{ctrl}$. Summing gives $T_{react}$.
+2. **Reaction distance.** During $T_{react}$ the robot keeps its current speed, at most $v_{max}$, and
+   covers $v_{max}\,T_{react}$.
+3. **Braking distance.** Decelerating at $a_{max}$ from $v_{max}$ takes $v_{max}^2/2a_{max}$. The
+   corridor is handled iff the sum is less than the distance at which the blockage was trusted.
+
+The **moving-obstacle variant** adds the obstacle’s own closing distance, $v_{obs}T_{react}$, to the
+left side; Exercise 1 asks for the fastest walker the default rates tolerate.
+</Derivation>
+
+**The micro-example**, with the book’s default rates — range sensor 10 Hz, Chapter 16 belief 10 Hz,
+inflated-grid update 5 Hz, D\* Lite 2 Hz, MPC 20 Hz — and Rusty’s $v_{max} = 0.6$ m/s,
+$a_{max} = 1.0$ m/s², $d_{detect} = 2.0$ m:
+
+$$
+T_{react} = 0.10 + 0.10 + 0.20 + 0.50 + 0.05 = 0.95\ \text{s},
+\qquad
+0.6 \times 0.95 + \frac{0.6^2}{2 \times 1.0} = 0.570 + 0.180 = \mathbf{0.750\ m} < 2.0\ \text{m}.
+$$
+
+The margin is 1.25 m. The fastest Rusty could safely drive with these rates solves
+$v^2/2 + 0.95\,v - 2.0 = 0$:
+
+$$
+v_{safe} = -0.95 + \sqrt{0.9025 + 4.0} = \mathbf{1.264\ m/s},
+\qquad
+1.264 \times 0.95 + \tfrac{1.264^2}{2} = 1.201 + 0.799 = 2.000.
+$$
+
+And the validity horizon of D23.2 is $L_{valid} = 0.6 \times (0.50 + 0.20) = \mathbf{0.42\ m}$. These
+are the first line the worked example prints (`replanning_budget`), and the check file pins all five
+numbers to $10^{-3}$.
+
+Why have both F2 and D23.2? Because F2 is a statement about the *worst case of a schedule*, and D23.2
+is a run-time check of *this* path against *this* map. Throttle the replanner to 0.5 Hz in the Failure
+Tour and the budget still closes — $T_{react}$ grows to 2.45 s, the stopping distance to 1.65 m — but
+the validity horizon grows to $0.6 \times 2.2 = 1.32$ m, and it is the D23.2 check, not the planner,
+that brakes Rusty in front of the door. The budget says the stack *can* stop in time; the check is
+what makes it actually do so when the plan is stale.
+
+### F3 — The singularity guard, from Chapter 4’s Jacobian
+
+**Statement.** For a commanded tip velocity $\dot x$, the joint velocity satisfies
+$\lVert\dot q\rVert \le \lVert\dot x\rVert / \sigma_{min}(J)$, and for the 2R arm $\sigma_{min} \to 0$
+exactly when $\mu(q) = l_1 l_2 \lvert\sin\theta_2\rvert \to 0$. The guard rejects a goal with
+$\mu(q_{goal}) < \mu_{min}$.
+
+<Derivation title="From the SVD to a threshold you can defend" result="μ_min = 0.25 ⇒ σ_min = 0.1127 ⇒ ‖q̇‖ ≤ 1.775 rad/s at 0.2 m/s">
+1. **Resolved rates.** Away from singularities $J(q)$ is invertible and the approach controller
+   commands $\dot q = J^{-1}\dot x$ ([Chapter 4](/chapters/ch04-configuration-space-i)).
+2. **The bound.** With the SVD $J = U\Sigma V^\top$, $J^{-1} = V\Sigma^{-1}U^\top$ and
+   $\lVert J^{-1}\rVert_2 = 1/\sigma_{min}$, so $\lVert\dot q\rVert \le \lVert\dot x\rVert/\sigma_{min}$,
+   with equality when $\dot x$ points along the left singular vector of $\sigma_{min}$ — for an arm at
+   full stretch, *radially*.
+3. **The 2R determinant.** Chapter 4 computed $\det J = l_1 l_2 \sin\theta_2$; since
+   $\lvert\det J\rvert = \sigma_1\sigma_2$ and $\sigma_1$ is bounded above by the arm length,
+   $\sigma_{min} \to 0$ if and only if $\sin\theta_2 \to 0$: arm straight or folded.
+4. **The threshold.** Reach’s last 12 cm of every pick is a straight Cartesian approach at
+   $\lVert\dot x\rVert = 0.2$ m/s, and its joints are limited to 2 rad/s. At $\mu_{min} = 0.25$ the
+   smallest singular value is $\sigma_{min} = 0.1127$, so the approach needs at most
+   $0.2 / 0.1127 = 1.775$ rad/s — under the limit. Any goal the guard admits is one the approach can
+   reach without saturating a joint; any goal it rejects is one where the bound is no longer a
+   promise.
+
+The **recovery** is `Recover(PullGoalInward { delta: 0.15 })`: move the tip target 15 cm toward the
+base and run the guard again. A full-stretch target at $r = 2$ m becomes $r = 1.85$ m, where
+$\cos\theta_2 = (r^2 - 2)/2$ gives $\mu = 0.703$. Nothing else in the pipeline changes: joint-space
+planning and time scaling are singularity-agnostic — their limits are torques, not Cartesian speeds —
+which is exactly why the guard belongs in front of the Cartesian approach and nowhere else.
+
+For the redundant 3R variant the same argument runs with $\mu = \sqrt{\det JJ^\top}$, the product of
+the two singular values of the $2 \times 3$ Jacobian.
+</Derivation>
+
+### F4 — The jackknife guard, from Chapter 20’s trailer field
+
+**Statement.** With the trailer hitched at the rear axle, Chapter 20’s drive field
+$g_1 = [\cos\theta,\ \sin\theta,\ 0,\ \tan\delta/L,\ \sin(\theta-\psi)/d]^\top$ gives the hitch-angle rate
+
+<LinkedMath>
+$$
+\dot\phi \;=\; \frac{v}{L}\tan\delta \;-\; \frac{v}{d}\sin\phi
+\;\;\xrightarrow{\ \delta = 0,\ \phi \approx 0\ }\;\;
+\dot\phi \approx -\frac{v}{d}\,\phi ,
+$$
+</LinkedMath>
+
+stable forward ($v > 0$), unstable in reverse with rate $\lvert v\rvert/d$. The guard fires on
+$\lvert\phi\rvert > \phi_{warn}$ while $v < 0$.
+
+<Derivation title="Why reversing a trailer is the dangerous direction" result="φ(s) ≈ φ₀ e^(s/d) in reverse; e-folding distance d = 2.5 m">
+1. **Two headings.** The car turns at $\dot\theta = (v/L)\tan\delta$; the trailer, dragged by the
+   hitch at the rear axle, turns at $\dot\psi = (v/d)\sin(\theta - \psi)$ — Chapter 2’s simulator
+   integrates exactly this.
+2. **Their difference.** $\dot\phi = \dot\theta - \dot\psi$ is the displayed equation; the check file
+   evaluates it through Chapter 20’s `carTrailer` field and compares with the closed form.
+3. **Linearize.** With the wheel straight and $\phi$ small, $\dot\phi \approx -(v/d)\phi$. Per metre
+   travelled, $d\phi/ds = -\operatorname{sign}(v)\,\phi/d$.
+4. **Sign of $v$.** Forward, $\phi$ decays like $e^{-s/d}$; in reverse it grows like $e^{s/d}$ — every
+   2.5 m of straight reversing multiplies a small hitch angle by $e$.
+
+The **recovery** is `Recover(PullForward { until_phi: 0.15 })`: drive forward — the stable direction —
+steering toward the trailer to straighten it faster, until $\lvert\phi\rvert < \phi_{ok} = 0.15$ rad,
+then replan from where the car is, with the trailer’s current heading. The thresholds are ordered on
+purpose: $\phi_{plan} = 0.85 < \phi_{warn} = 0.90 < \phi_{max} = 1.30$ rad. The planner leaves
+headroom, the guard sits in it, and the hard bound is the mechanism’s. $\phi_{max}$ is a *state*
+constraint layered on the Pfaffian one: the nonholonomic constraint says which velocities exist; the
+jackknife bound says which configurations are allowed, and only a guard or a planner that knows about
+it enforces it.
+</Derivation>
+
+## The algorithms
+
+Every box below is a composition of algorithms numbered elsewhere in the book; the line that does the
+real work is always a call. What is new is the order, the rates, and what happens when a line says no.
+
+<Algorithm
+  name="pipeline_tick(bus, stages, now) — the WASM round-robin"
+  inputs="the stamped bus, stages in topological order with periods τ_i and phases, the simulated time now (integer ms)"
+  outputs="every due stage run once; their outputs published with stamp now"
+  complexity="the sum of the due stages’ costs; 60 fps kept by time-slicing the expensive ones"
+>
+1. **for** each stage $\mathcal{S}_i$ in topological order (producers before consumers):
+2. $\quad$**if** $\mathcal{S}_i$ is enabled **and** $(now - phase_i) \bmod \tau_i = 0$:
+3. $\quad\quad$read the newest message on each input topic; record its age $now - t$ (the measured $\varsigma$)
+4. $\quad\quad$out $\leftarrow \mathcal{S}_i$.tick(inputs, now) — a *bounded* chunk of work: 40 tree iterations, 10 CHOMP steps, one hybrid A\* rung
+5. $\quad\quad$**if** out is some message: publish it stamped (now, frame of $\mathcal{S}_i$’s output)
+6. advance now by the base period (50 ms); integer arithmetic, so two replays never drift apart
+</Algorithm>
+
+<Algorithm
+  name="rusty_stack — one round of Rusty’s pipeline"
+  inputs="the blueprint, the belief (Ch. 16), the newest scan, the inflated grid, D* Lite’s state (Ch. 6), the goal"
+  outputs="a twist (v, ω) for the wheels, or a mode event"
+  complexity="belief O(N·beams); D* Lite incremental in the changed cells; MPC O(H) per iteration at 20 Hz"
+>
+1. **scan** (10 Hz): 72 beams of the range sensor in the *true* world
+2. **belief** (10 Hz): predict with odometry, correct with every third beam against the blueprint, resample when ESS falls below N/2
+3. **map** (5 Hz): **if** $\sigma_{belief} > 5$ cm: trust nothing this round; **else** project returns within $d_{detect}$ through the belief, keep those the blueprint does not explain, and inflate by $r + 0.15$ m every cell hit in two consecutive rounds
+4. **plan** (2 Hz): set D\* Lite’s start to the belief’s cell; UpdateCells(new changes) — Koenig and Likhachev’s repair; path ← greedy descent, shortcut with Chapter 11’s Steer; score the first move with `replan_on_belief`; **if** no path: Recover(TangentBug)
+5. **control** (20 Hz): **if** the D23.2 prefix of length $L_{valid}$ hits an occupied cell of the newest map: Blocked → Replan, brake; **else** iLQR over 10 steps toward reference points along the path (turn in place first if the path doubles back)
+</Algorithm>
+
+<Algorithm
+  name="reach_stack — one pick"
+  inputs="a tip target, Reach’s state q, the Workbench, torque limits (20, 12) N·m"
+  outputs="an executed, verified Trajectory<T²> ending in a straight 12 cm Cartesian approach"
+  complexity="RRT* O(n log n) for n ≤ 400; time scaling O(N_s) on 400 grid nodes; CHOMP O(k N_w) for 30 steps on 24 waypoints"
+>
+1. IK both elbow branches for the target and the pre-grasp 12 cm before it; keep the collision-free branch nearest $q$
+2. **singularity_guard**: **if** $\mu(q_{goal}) < \mu_{min}$: Recover(PullGoalInward $\delta$); move the target; goto 1
+3. RRT-Connect to the pre-grasp (Ch. 12), 40 attempts per tick; then Informed RRT\* (Ch. 13) for a budget of 400 iterations
+4. path ← the cheaper of the two; shortcut it (Ch. 11)
+5. spline through the shortcut path resampled at 26 knots; **if** a dense swept check fails: scale the polyline segment by segment, rest to rest; $T_1 \leftarrow$ time_scale (Ch. 18)
+6. CHOMP (Ch. 19) from the same 24 waypoints, 10 steps per tick; spline; $T_2 \leftarrow$ time_scale
+7. **verify**: **if** the $T_2$ trajectory passes the swept recheck **then** execute it **else** execute $T_1$
+8. approach: $\dot q = J^{-1}\dot x$ at 0.2 m/s for 12 ticks; **if** $\lVert\dot q\rVert_\infty > 2$ rad/s: Fault(JointRate)
+</Algorithm>
+
+<Algorithm
+  name="hitch_stack — plan, filter, guard"
+  inputs="Hitch’s configuration (x, y, θ, ψ), the Lot, the goal pose in bay 3, the retry ladder"
+  outputs="a segment list executed on Chapter 2’s Hitch.step, or Failed(reason)"
+  complexity="one hybrid A* rung per tick (≤ 4000 expansions); filter O(samples); guard O(1) at 20 Hz"
+>
+1. **plan**: hybrid A\* with Reeds–Shepp shots on the car (Ch. 21), rung $k$ of the ladder: (cell, reverse penalty, optional staging pose)
+2. **filter**: simulate $\psi$ along the candidate from the trailer’s current heading; **if** the trailer touches anything **or** $\max\lvert\phi\rvert > \phi_{plan}$: reject, $k \leftarrow k + 1$; **if** the ladder is exhausted: Failed(NoPath)
+3. **track**: replay the words at $\lvert v\rvert = 1$ m/s, steering $\pm\phi_{steer,max}$ or straight, never overshooting a segment
+4. **guard** (20 Hz): **if** $v < 0$ **and** $\lvert\phi\rvert > \phi_{warn}$: Recover(PullForward); **if** $\lvert\phi\rvert > \phi_{max}$: Failed(Jackknife)
+5. **recover**: forward at 0.8 m/s steering toward the trailer until $\lvert\phi\rvert < \phi_{ok}$; then $k \leftarrow 0$ and replan from here
+</Algorithm>
+
+<Algorithm
+  name="supervisor_step(mode, event) — D23.4"
+  inputs="the robot’s mode, one event from its stages"
+  outputs="the next mode"
+  complexity="O(1); total over 6 modes × 10 events"
+>
+1. **if** event is Fault(reason) **and** mode is live: **return** Failed(reason)
+2. **match** mode: Plan or Replan — PlanReady → Execute; NoPath(r) → Recover(r) or Failed(NoPath); Singular(δ) → Recover(PullGoalInward δ); Jackknife → Recover(PullForward)
+3. $\quad$Execute — Blocked → Replan; Arrived → Done; Jackknife → Recover(PullForward)
+4. $\quad$Recover — Recovered → Replan; PlanReady → Execute (Tangent Bug handing back to the grid)
+5. $\quad$Done — NextTask → Plan; Failed — absorbing
+6. every other pair leaves the mode unchanged — and the compiler, not this list, is what proves there is no pair left out
+</Algorithm>
+
+## Implementation in Rust
+
+The capstone crate adds one dependency to the workspace — `crossbeam-channel` 0.5, for the native
+bus — and otherwise only imports: `nalgebra` 0.35, `parry2d` 0.30, `petgraph` 0.8 and `rand` 0.9
+arrive through the Chapter 2–22 crates it links. The module plan:
+
+```text
+crates/capstone/src/
+  bus.rs          Stamped<T, F>, frame markers, the native channels and the WASM slots
+  stage.rs        trait Stage, Guarantee, composed_guarantee, ThreadRunner (native), RoundRobin (wasm)
+  stacks/rusty.rs Ch. 16 belief → Ch. 4 inflation → Ch. 6 D* Lite → D23.2 → Ch. 19 MPC; Ch. 3 fallback
+  stacks/reach.rs Ch. 4 guard → Ch. 12 → Ch. 13 → Ch. 11 → Ch. 18 → Ch. 19 → verify (Ch. 2)
+  stacks/hitch.rs Ch. 21 hybrid A* → Ch. 20 trailer filter → tracker; jackknife guard
+  guards.rs       singularity_guard (F3), jackknife_guard (F4), corridor_blocked (D23.2)
+  budget.rs       replanning_budget (F2) and RateTable::DEFAULT
+  supervisor.rs   Mode, Recover, supervisor_step
+  mission.rs      MissionCfg, run_mission, MissionReport, format_mission
+```
+
+### The contract, as types
+
+The first listing is the whole of D23.1 and D23.3. One deviation from the design sketch is deliberate:
+frames are **zero-sized marker types** rather than a runtime `FrameId(&'static str)`. A string frame
+can only be checked when the program runs; a marker type makes "a map-frame pose handed to the
+odom-frame belief" a compile error, which is the third vignette of the retrospective.
+
+```rust title="crates/capstone/src/stage.rs" {14-19,33-40,47-55}
+use std::marker::PhantomData;
+
+/// Simulated time in integer milliseconds. Floating-point seconds would turn
+/// 0.05 + 0.05 + … into 0.30000000000000004 and two stages with equal periods
+/// would drift out of phase; integers keep replays bit-identical.
+pub type SimTime = u64;
+
+/// Frames are types, not strings: a mix-up is rejected by rustc, not at run time.
+pub trait Frame: Copy + Send + 'static {
+    const NAME: &'static str;
+}
+#[derive(Clone, Copy, Debug)] pub struct Map;
+#[derive(Clone, Copy, Debug)] pub struct Odom;
+#[derive(Clone, Copy, Debug)] pub struct Base;
+#[derive(Clone, Copy, Debug)] pub struct Torus;
+#[derive(Clone, Copy, Debug)] pub struct Lot;
+impl Frame for Map { const NAME: &'static str = "map"; }
+impl Frame for Odom { const NAME: &'static str = "odom"; }
+// … Base, Torus, Lot likewise.
+
+/// D23.1: nothing crosses a stage boundary without a time and a frame on it.
+#[derive(Clone, Debug)]
+pub struct Stamped<T, F: Frame> {
+    pub t: SimTime,
+    pub v: T,
+    frame: PhantomData<F>,
+}
+
+impl<T, F: Frame> Stamped<T, F> {
+    pub fn new(t: SimTime, v: T) -> Self { Self { t, v, frame: PhantomData } }
+    pub fn age(&self, now: SimTime) -> SimTime { now.saturating_sub(self.t) }
+}
+
+/// 𝒢, weakest first, so `Ord::min` over stages is "the weakest link".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Guarantee { None, ProbabilisticallyComplete, ResolutionComplete, Complete }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role { Source, Rejecting, Verified, Unverified, Executor, Guard }
+
+pub trait StageInfo {
+    fn id(&self) -> &'static str;
+    fn period_ms(&self) -> SimTime;
+    fn role(&self) -> Role;
+    /// What this stage promises *given valid input* (D23.1).
+    fn guarantee(&self) -> Guarantee;
+}
+
+/// One pipeline stage. The same impl runs on its own thread (native) or
+/// inside the round-robin (wasm): it cannot tell which.
+pub trait Stage: StageInfo + Send {
+    type In;
+    type Out;
+    type FIn: Frame;
+    type FOut: Frame;
+    fn tick(&mut self, input: &Stamped<Self::In, Self::FIn>, now: SimTime)
+        -> Option<Stamped<Self::Out, Self::FOut>>;
+}
+
+/// D23.3: the minimum over rejecting stages — and nothing at all if any
+/// post-processor can silently break the property it was handed.
+pub fn composed_guarantee(stages: &[&dyn StageInfo]) -> Guarantee {
+    if stages.iter().any(|s| s.role() == Role::Unverified) {
+        return Guarantee::None;
+    }
+    stages
+        .iter()
+        .filter(|s| s.role() == Role::Rejecting)
+        .map(|s| s.guarantee())
+        .min()
+        .unwrap_or(Guarantee::None)
+}
+```
+
+`Path<M>` and `Trajectory<M>` are Chapter 18’s, unchanged; the capstone adds no types there. What it
+adds is the *place* where the distinction bites: Reach’s tracker is a `Stage` whose `In` is
+`Trajectory<Torus2>`, so wiring the shortcut stage’s `Path<Torus2>` output into it does not compile.
+In the browser port, where TypeScript has no phantom frames and no exhaustiveness the compiler
+enforces, the same mistake is a runtime refusal: switch the time-scaling block off in Stack Anatomy
+and the tracker fails the task with the rustc message as its reason.
+
+### Two runtimes, one schedule
+
+```rust title="crates/capstone/src/stage.rs (continued)" {20-31}
+/// Native: one thread per stage, a bounded channel per edge. A full channel
+/// drops the *oldest* message — a stage always wants the newest one.
+pub struct ThreadRunner { handles: Vec<std::thread::JoinHandle<()>> }
+
+impl ThreadRunner {
+    pub fn spawn<S>(mut stage: S, rx: crossbeam_channel::Receiver<Stamped<S::In, S::FIn>>,
+                    tx: crossbeam_channel::Sender<Stamped<S::Out, S::FOut>>, clock: Clock) -> Self
+    where S: Stage + 'static, S::In: Send + 'static, S::Out: Send + 'static {
+        let period = std::time::Duration::from_millis(stage.period_ms());
+        let h = std::thread::spawn(move || loop {
+            let Some(input) = rx.try_iter().last() else { std::thread::sleep(period); continue };
+            if let Some(out) = stage.tick(&input, clock.now()) { let _ = tx.try_send(out); }
+            std::thread::sleep(period);
+        });
+        Self { handles: vec![h] }
+    }
+}
+
+/// WASM: no threads. Every stage whose period divides `now − phase` runs once,
+/// in topological order, inside the animation frame — same stage code, same
+/// messages, same seeds, so a mission replays bit for bit.
+pub struct RoundRobin { entries: Vec<Box<dyn Runnable>> }
+
+impl RoundRobin {
+    pub fn tick(&mut self, bus: &mut Bus, now: SimTime) {
+        for e in self.entries.iter_mut().filter(|e| e.enabled()) {
+            if now >= e.phase() && (now - e.phase()) % e.period_ms() == 0 {
+                e.run(bus, now); // reads the newest slot, publishes Stamped::new(now, …)
+            }
+        }
+    }
+}
+```
+
+The native runner is *nondeterministic* — thread interleavings differ run to run — which is why the
+book’s regression mission runs on the round-robin even natively, and why the chapter never claims the
+browser demonstrates real-time scheduling. What it demonstrates is throughput: fifteen stages keep
+their rates inside a frame budget, with every expensive one sliced into bounded chunks.
+
+### The supervisor and its guards
+
+```rust title="crates/capstone/src/supervisor.rs" {3-7,24-27}
+use crate::guards::{Jackknife, Singular};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Recover { PullGoalInward { delta: f64 }, PullForward { until_phi: f64 }, TangentBug }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mode { Plan, Execute, Replan, Recover(Recover), Done, Failed(FailReason) }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FailReason { NoPath, Collision, Timeout, Jackknife, JointRate, Boxed }
+
+pub enum Event {
+    PlanReady, NoPath(Option<Recover>), Blocked { at: f64 }, Arrived, NextTask,
+    Singular(Singular), Jackknife(Jackknife), Recovered, Fault(FailReason),
+}
+
+/// D23.4, total by construction: add a variant to `Mode`, `Recover` or `Event`
+/// and every match that forgot it stops compiling (E0004).
+pub fn supervisor_step(mode: Mode, ev: Event) -> Mode {
+    use Mode::*;
+    match (mode, ev) {
+        (Failed(r), _) => Failed(r),
+        (Done, Event::NextTask) => Plan,
+        (Done, _) => Done,
+        (_, Event::Fault(r)) => Failed(r),
+        (Plan | Replan, Event::PlanReady) => Execute,
+        (Plan | Replan, Event::NoPath(Some(r))) => Recover(r),
+        (Plan | Replan, Event::NoPath(None)) => Failed(FailReason::NoPath),
+        (Plan | Replan | Execute, Event::Singular(_)) => Recover(Recover::PullGoalInward { delta: 0.15 }),
+        (Plan | Replan | Execute, Event::Jackknife(_)) => Recover(Recover::PullForward { until_phi: 0.15 }),
+        (Execute, Event::Blocked { .. }) => Replan,
+        (Execute, Event::Arrived) | (Recover(_), Event::Arrived) => Done,
+        (Execute, Event::NoPath(_)) => Replan,
+        (Recover(_), Event::Recovered) => Replan,
+        (Recover(Recover::TangentBug), Event::PlanReady) => Execute,
+        (m, _) => m,
+    }
+}
+```
+
+There is no `PathNotTrajectory` variant in the Rust `FailReason`, and that absence is the point: the
+browser port needs one because TypeScript lets the mistake reach run time; the Rust supervisor never
+sees it, because the program containing it does not build.
+
+```rust title="crates/capstone/src/guards.rs"
+use nalgebra::Matrix2;
+use robots::{Reach, T2};
+
+pub struct Singular { pub mu: f64, pub sigma_min: f64 }
+pub struct Jackknife { pub phi: f64 }
+pub struct Blocked { pub cell: usize, pub at: f64 }
+
+/// F3. μ = |det J| = l₁l₂|sin θ₂|; ‖q̇‖ ≤ ‖ẋ‖/σ_min. Chapter 4 owns `jacobian2`.
+pub fn singularity_guard(arm: &Reach, q: &T2, mu_min: f64) -> Result<(), Singular> {
+    let j: Matrix2<f64> = cspace::jacobian2(arm, q);
+    let mu = j.determinant().abs();
+    if mu >= mu_min { return Ok(()); }
+    let sigma_min = j.svd(false, false).singular_values.min();
+    Err(Singular { mu, sigma_min })
+}
+
+/// F4. Reversing is the unstable direction (φ̇ ≈ −(v/d)φ), so only reverse can trip it.
+pub fn jackknife_guard(phi: f64, v: f64, phi_warn: f64) -> Result<(), Jackknife> {
+    if v < 0.0 && phi.abs() > phi_warn { Err(Jackknife { phi }) } else { Ok(()) }
+}
+
+/// D23.2: the first occupied cell of the *newest* map within L_valid along the path.
+pub fn corridor_blocked(path: &Path<R2>, grid: &OccupancyGrid, from: R2, l_valid: f64) -> Option<Blocked> {
+    let s0 = path.project(from);
+    let step = grid.cell_size / 2.0;
+    (1..)
+        .map(|k| s0 + k as f64 * step)
+        .take_while(|&s| s <= (s0 + l_valid).min(path.length()))
+        .map(|s| (s - s0, grid.cell_at(path.point_at(s))))
+        .find(|&(_, c)| grid.occupied(c))
+        .map(|(at, cell)| Blocked { cell, at })
+}
+```
+
+### Verify or fall back
+
+D23.3 lives or dies on post-processors that cannot silently break their input. Reach’s smoothing
+stage is the one place in the stack where that is a design decision rather than a property of the
+algorithm, so it is written out:
+
+```rust title="crates/capstone/src/stacks/reach.rs"
+/// CHOMP is a local optimizer of a *soft* collision penalty: nothing in its objective
+/// forbids contact. Wrapped like this it is a verified post-processor, and Reach's
+/// composed guarantee stays RRT-Connect's (probabilistically complete).
+pub struct ChompVerify { pub checker: ChainChecker, pub problem: ChompProblem, pub iters: usize }
+
+impl Stage for ChompVerify {
+    type In = Trajectory<Torus2>;       // T₁, already time-scaled (Ch. 18)
+    type Out = Trajectory<Torus2>;
+    type FIn = Torus;
+    type FOut = Torus;
+
+    fn tick(&mut self, t1: &Stamped<Trajectory<Torus2>, Torus>, now: SimTime)
+        -> Option<Stamped<Trajectory<Torus2>, Torus>> {
+        let xi = trajopt::chomp(&self.problem, &t1.v.waypoints(24), self.iters);
+        let smoothed = CubicSpline::through(&xi);
+        let t2 = trajectory::time_scale(&smoothed, &REACH_LIMITS).ok()?;
+        // Dense swept recheck of every consecutive pair of samples (Ch. 2's sphere marching).
+        let ok = t2.samples().windows(2).all(|w| self.checker.edge_free(&w[0].q, &w[1].q));
+        Some(Stamped::new(now, if ok { t2 } else { t1.v.clone() }))
+    }
+}
+// StageInfo for ChompVerify: role() = Role::Verified. Remove the recheck and it is
+// Role::Unverified — and composed_guarantee() returns Guarantee::None, as it should.
+```
+
+### The budget and the mission
+
+```rust title="crates/capstone/src/budget.rs"
+pub struct RateTable { pub scan_hz: f64, pub belief_hz: f64, pub map_hz: f64, pub plan_hz: f64, pub ctrl_hz: f64 }
+
+impl RateTable {
+    pub const DEFAULT: Self = Self { scan_hz: 10.0, belief_hz: 10.0, map_hz: 5.0, plan_hz: 2.0, ctrl_hz: 20.0 };
+    /// T_react = ς_scan + ς_bel + ς_map + τ_plan + τ_ctrl: one period per link, worst case.
+    pub fn t_react(&self) -> f64 {
+        [self.scan_hz, self.belief_hz, self.map_hz, self.plan_hz, self.ctrl_hz].iter().map(|f| 1.0 / f).sum()
+    }
+}
+
+pub struct BudgetReport { pub t_react: f64, pub stop: f64, pub margin: f64, pub v_safe: f64, pub l_valid: f64 }
+
+/// F2. v T + v²/2a < d; v_safe is the positive root of v²/2a + T v − d = 0.
+pub fn replanning_budget(r: &RateTable, v_max: f64, a_max: f64, d_detect: f64) -> BudgetReport {
+    let t = r.t_react();
+    let stop = v_max * t + v_max * v_max / (2.0 * a_max);
+    let v_safe = a_max * (-t + (t * t + 2.0 * d_detect / a_max).sqrt());
+    let l_valid = v_max * (1.0 / r.plan_hz + 1.0 / r.map_hz);
+    BudgetReport { t_react: t, stop, margin: d_detect - stop, v_safe, l_valid }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn budget_matches_hand_computation() {
+        let b = replanning_budget(&RateTable::DEFAULT, 0.6, 1.0, 2.0);
+        assert!((b.t_react - 0.950).abs() < 1e-12 && (b.stop - 0.750).abs() < 1e-12);
+        assert!((b.v_safe - 1.264).abs() < 1e-3 && (b.l_valid - 0.42).abs() < 1e-12);
+    }
+}
+```
+
+The worked example runs all three pipelines on seed 7 with the three chaos events of the hook — Close
+Door at 9 s, which shuts the next door on Rusty’s path (here the study–bedroom door; the design sketch
+said 12 s, but by then Rusty is already inside $d_{detect}$ of that door), the singular goal at
+4 s, Reverse Hard at 2.5 s — and prints the budget line, the event timeline, and the report:
+
+```rust title="crates/capstone/examples/mission.rs"
+use capstone::{format_mission, run_mission, ChaosEvent::*, MissionCfg, RateTable};
+
+fn main() {
+    let cfg = MissionCfg {
+        seed: 7,
+        rates: RateTable::DEFAULT,
+        chaos: vec![CloseDoor { t: 9_000 }, SingularGoal { t: 4_000 }, ReverseHard { t: 2_500 }],
+    };
+    let report = run_mission(&cfg);
+    for line in format_mission(&report) {
+        println!("{line}");
+    }
+}
+```
+
+```text title="cargo run --release --example mission -- --seed 7 --close-door-at 9 --singular-goal --reverse-hard"
+t_react 0.950 s  stop 0.750 m  margin 1.250 m  v_safe 1.264 m/s  l_valid 0.42 m
+  2.20 s  reach  pick 1 done at (-1.50, -0.55)
+  2.50 s  hitch  chaos: Reverse Hard — full lock, full reverse
+  4.00 s  reach  chaos: the next pick is pushed out to full stretch
+  4.70 s  hitch  jackknife guard: |φ| = 0.91 rad > φ_warn = 0.9 while reversing
+  5.00 s  reach  pick 2 done at (1.55, -0.55)
+  5.55 s  reach  singularity guard: μ(q_goal) = 0.000 < μ_min = 0.25 (σ_min = 0.000)
+  7.20 s  hitch  recovered: |φ| = 0.15 < φ_ok = 0.15; replanning from here
+  7.25 s  hitch  trailer filter rejects hybrid A* (cell 0.5 m, reverse ×1): |φ| reaches 0.85 > φ_plan
+  7.30 s  hitch  trailer filter rejects hybrid A* (cell 0.4 m, reverse ×3): |φ| reaches 0.85 > φ_plan
+  7.35 s  hitch  hybrid A* (cell 0.5 m, reverse ×1, via (12.4, 4.2)): 11.02 m, 2 cusps, 2 expansions, max |φ| 0.69 rad
+  7.90 s  reach  pick 3 done at (-0.50, 1.78)
+  9.00 s  rusty  chaos: the study–bedroom door swings shut
+ 11.00 s  rusty  D* Lite repaired 3 times, 24–380 vertices each (until 12.00 s)
+ 18.35 s  hitch  parked: 0.000 m, 0.00°
+ 18.50 s  rusty  D* Lite repaired 7 times, 14–117 vertices each (until 24.50 s)
+ 24.90 s  rusty  D23.2: occupied cell 0.40 m ahead inside L_valid = 0.42 m — braking
+ 25.00 s  rusty  D* Lite repaired 3 times, 14–32 vertices each (until 26.50 s)
+rusty  Done: driven 14.54 m vs 11.02 m final-map optimum (ratio 1.32), 13 repairs
+reach  Done: 3 picks; pick 1 cost 2.14 rad, t_f 0.97 s → 0.93 s after CHOMP; max |τ|/τ_max 1.00 at the grid nodes
+hitch  Done: parked within 0.0 cm / 0.0°, 3 cusps, max |φ| 0.91 rad
+dense recheck: rusty true, reach true, hitch true
+```
+
+Every line of that output is produced by the browser port’s `formatMission` and pinned, line for line,
+by the chapter’s check file; the same file pins the no-chaos run’s report (Rusty 10.76 m against a
+10.99 m final-map optimum, ratio 0.98, 3 repairs; Hitch 1 cusp, max $\lvert\phi\rvert$ 0.77 rad) and
+asserts that two runs with the same seed produce byte-identical reports. The design sketch’s numbers
+were targets — 18.4 m against 16.9 m, 1.84 s → 1.71 s, 4 cm and 1.8°; these are what the implementation
+actually does, and they differ for reasons worth reading.
+
+- **Rusty’s ratio is 1.32 with the door and 0.98 without.** The final-map optimum is computed on the
+  world as it *ended*, door shut: an omniscient planner would never have gone into the study. Rusty
+  did, because the door was open when it planned, and the 3.5 m of detour is the price of not being
+  omniscient. Without chaos the ratio dips below one because Rusty’s MPC rounds corners inside the
+  inflation margin that the any-angle optimum respects.
+- **Reach’s torque ratio is exactly 1.00 at the grid nodes** — a time-optimal profile saturates a motor
+  by construction. Sampled every 50 ms the replayed torques overshoot by a few percent, because the
+  stage acceleration is held constant between nodes; Chapter 18’s construction is exact only at them.
+- **Hitch parks with zero error** because the last word of every hybrid A\* path is an analytic
+  Reeds–Shepp shot and the tracker replays it on the same exact-arc kinematics. The simulator grades its
+  own homework here, and the retrospective says what evaluation looks like on hardware.
+
+## Putting it together: the failure tour
+
+The Grand Plan lets you break the stack whenever you like; the Failure Tour breaks it the same way every
+time, records the result, and lets you scrub to the instant a statistic crosses its threshold. Each tab
+is one robot, one injection, one contract.
+
+<Deferred minHeight={640}>
+  <FailureTour />
+</Deferred>
+
+**Blocked Corridor.** At 9 s the study–bedroom door shuts. Rusty is still in the study, heading for it.
+Nothing happens for almost two seconds — the door is outside the 2 m the stack trusts, and then a cell
+has to be hit by two consecutive scans — and at 11 s the map inflates a handful of cells across the
+doorway. The next planning tick hands those changes to D\* Lite, which repairs **380 of the grid’s
+10,800 vertices** and returns a path that turns around, leaves the study by its corridor door and enters
+the bedroom from the corridor. The tracker turns in place first — a differential drive’s privilege —
+and follows. Tick *throttle replanner* and run it again: the planner now ticks every two seconds, the
+validity horizon is 1.32 m, and you will see the D23.2 check brake Rusty in front of a door the
+planner has not yet heard about. The budget still closes ($0.6 \times 2.45 + 0.18 = 1.65$ m $< 2.0$ m);
+what the throttle costs is time, not safety, because the check is there.
+
+**Singular Arm.** At 4 s the next pick is pushed out to full stretch. When Reach finishes its current
+pick and the guard evaluates the new goal, $\mu(q_{goal})$ dives to zero — the arm would be straight —
+and the mode machine reads `Plan → Recover(PullGoalInward { delta: 0.15 }) → Replan` within one tick.
+The target moves 15 cm toward the base, $\mu$ comes back at 0.703, and the joint-space pipeline below
+it runs exactly as it did for every other pick. Switch the guard off in Stack Anatomy to see the other
+branch: the approach runs into the singularity, $\lVert\dot q\rVert$ passes 2 rad/s just before the tip
+reaches its target, and the task fails with `Failed(JointRate)` — the F3 bound arriving
+as a fault instead of as a threshold.
+
+**Jackknife.** At 2.5 s Hitch is thrown into full reverse at full lock, steering the way that folds the
+trailer. The hitch angle grows for about two seconds — reversing is the unstable direction, and the
+steering makes it worse — and at 4.70 s crosses $\phi_{warn} = 0.90$ rad. The guard switches to
+`Recover(PullForward { until_phi: 0.15 })`; driving forward, the angle decays exactly as F4 predicts, and
+at 7.20 s Hitch is straight enough to replan. The first two rungs of the ladder propose the obvious
+Reeds–Shepp shot to the bay, and the trailer filter rejects both — simulated along them, the trailer
+would reach 0.85 rad, past $\phi_{plan}$. The third rung plans to a staging pose east of the bays first
+and then to the bay: 11.02 m, 2 cusps, never above 0.69 rad. Hitch parks at 18.35 s.
+
+The pattern is the same in all three tabs, and it is the chapter’s second key idea.
+
+<KeyIdea title="Recovery is a mechanism">
+Each recovery is a statistic the book already derived — scan returns the blueprint cannot explain, the
+manipulability of Chapter 4, the hitch angle of Chapter 20 — crossing a threshold chosen from a bound
+you can state, followed by a mode whose parameters say what the recovery will do and when it is over.
+</KeyIdea>
+
+### The same contracts in production
+
+None of this is peculiar to a textbook. Production motion stacks are chains of
+the same contracts — a state space, a validity checker, a planner that can say no, post-processors,
+time parameterization, a controller, recoveries — and the figure maps our stages onto three widely used
+open-source ones.
+
+<LibraryMap />
+
+Three columns, three philosophies. OMPL is a *planning library*: it owns state spaces, validity
+checking, planners and path simplification, and deliberately nothing else — no map, no controller, no
+clock. MoveIt is a *manipulation pipeline* around a planning scene: planner plugins (OMPL among them),
+then request adapters that add exactly the stages our Reach pipeline has — time parameterization and
+optimization-based smoothing — then execution. Nav2 is a *navigation system*: layered costmaps with an
+inflation layer, a planner server, a controller server, and a behavior tree that runs recoveries such as
+backing up or spinning when a statistic says the robot is stuck. The dashes are as informative as the
+names: a library that does not own a job will not quietly do it for you.
+
+## What Rust caught, and what it cost
+
+The design brief for this book promised a retrospective with the costs reported as carefully as the
+wins. Here are both, in panels of the same size.
+
+<RetrospectiveScorecard />
+
+Read the left panel as five contracts the compiler enforced while the capstone was being written. The
+Manifold parameter keeps an arm’s joint path away from a car’s tracker; D23.1 is a type, so a curve
+without a clock cannot be executed; frames are marker types, so the map/odom mix-up that drifts a real
+robot silently never compiles; `Mode` is exhaustive, so adding the jackknife recovery broke
+every supervisor that had not thought about it; and the borrow checker refused to let the replanner
+mutate the grid the tracker was reading — the very race the D23.2 check exists to catch at run time,
+caught at compile time instead.
+
+Read the right panel with the same attention. Generic code is monomorphized once per robot, and that is
+paid at every build; this edition did not measure the cost, so it prints no number, and a number you
+should trust would need clean and incremental build times of the workspace measured on stated hardware.
+WASM has no threads, so the browser runs fifteen stages cooperatively and demonstrates throughput, never
+preemption. Chapter 22 trains with `candle` but ships a forty-line forward pass so the learned sampler
+fits in the page. Chapter 11 hand-rolls its kd-tree because nearest neighbours on a torus need periodic
+axes. And the browser port is a second implementation kept honest by hand: its supervisor is total by a
+`switch` with an `assertNever`, which is a shadow of exhaustiveness rather than the thing itself.
+
+Four further honesty items belong in the same ledger.
+
+1. **The simulator grades its own homework.** Rusty’s path ratio is measured against an optimum computed
+   on the true final world, and Hitch’s parking error against a goal pose in a simulator whose
+   kinematics are exactly the planner’s model. Both exist because we own the world. On hardware the
+   same numbers need an external reference — motion capture, surveyed markers — and Hitch would not park
+   with zero error, because no tire follows an arc exactly.
+2. **"Complete" is conditional.** Rusty’s resolution completeness holds for a localized belief and a
+   world that changes slower than F2; Reach’s probabilistic completeness says nothing about the iteration
+   budget it actually runs; Hitch’s composed guarantee is *none*, and the panels say so.
+3. **Three stacks are not a team.** The panels share a clock and nothing else.
+4. **The browser proves throughput, not scheduling.** The round-robin is deterministic by design, which
+   is what makes the regression mission reproducible — and is exactly what a preemptive real-time system
+   is not.
+
+## Where to go next
+
+The book stops here; the subject does not. Four directions follow naturally from the last chapter.
+
+- **Onto hardware.** The stage trait maps onto ROS 2 nodes almost one for one — a period, typed messages,
+  a frame on every message. Rust bindings for ROS 2 exist (`rclrs` and `r2r` were the active ones in
+  October 2026; check before you rely on either). What changes is everything this chapter could assume:
+  time is not integer milliseconds, messages are lost, and the belief can be wrong in ways a simulator
+  never invents.
+- **Coupling the robots.** Put Rusty in the Lot with Hitch and the stacks stop being independent:
+  [Chapter 14](/chapters/ch14-many-bodies)’s composite configuration spaces and prioritized planning are
+  the starting point, and the composed-guarantee rule needs a new row for the coordinator.
+- **Belief all the way down.** Rusty plans on a belief but tracks as if its pose were known. The sister
+  book’s capstone, [*A Complete Autonomous Robot*](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch26-capstone),
+  builds the stack from the estimation side — mapping, exploration and chance-constrained margins — and
+  is the natural companion to this chapter.
+- **Guarantees you can check at run time.** Every guard here is a hand-written monitor of one statistic.
+  Runtime verification turns the contracts themselves — "never execute a Path", "every post-processor
+  verifies" — into monitors generated from specifications.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="A walker in the corridor">
+    Extend F2 to an obstacle that approaches Rusty at speed $v_{obs}$ from the moment it is first trusted
+    at $d_{detect}$: during $T_{react}$ both close the gap, and then Rusty brakes. Derive the inequality,
+    then compute the fastest walker the default rates tolerate at $d_{detect} = 2.0$ m and
+    $v_{max} = 0.6$ m/s.
+
+    <CheckAnswer id="ch23.e1" prompt="Fastest walker speed the default rates tolerate (m/s)" answer={1.316} tolerance={0.01} unit="m/s">
+      $v_{max}T_{react} + v_{max}^2/2a_{max} + v_{obs}T_{react} < d_{detect}$, so
+      $v_{obs} < (2.0 - 0.750)/0.95 = 1.316$ m/s — a brisk walk. The budget function’s
+      `maxWalkerSpeed` returns the same number.
+    </CheckAnswer>
+    <Hints>
+      <p>The walker adds a third distance to the left side of F2, and it accrues only during the reaction time.</p>
+      <p>After Rusty has stopped, a walker still approaching is the walker’s problem; F2 is about Rusty’s motion.</p>
+      <p>Solve $0.750 + 0.95\,v_{obs} = 2.0$.</p>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={3} title="Three chains, three guarantees">
+    Write all three pipelines as D23.3 chains — every stage, its role, its $\mathcal{G}_i$ — and prove
+    each composed guarantee from F1’s rule. Then decide which *single* stage you would upgrade first,
+    and say what the upgrade costs. (For Rusty, the cost is measured in $T_{react}$; for Hitch it is
+    measured in expansions per tick, because Hitch has no moving obstacles and therefore no F2.)
+
+    <details>
+      <summary>A sketch of one answer</summary>
+      Rusty: one rejecting stage, D\* Lite, resolution-complete; the composed guarantee is that, *given*
+      a localized belief and a world that changes slower than F2 allows. Reach: RRT-Connect,
+      probabilistically complete, preserved because CHOMP is verified. Hitch: the trailer filter rejects
+      without searching, so the composed guarantee is none. The obvious first upgrade is Hitch’s: put the
+      hitch angle into the search state (Chapter 21’s CAR GRID SEARCH with a fourth axis and jackknife
+      pruning), which makes the filter a verifier of a property the planner already guarantees and lifts
+      the composed guarantee to resolution-complete — at roughly a hundred times the expansions, so the
+      search must be sliced across many ticks.
+    </details>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="How slow may the replanner be?">
+    <Predict
+      id="ch23.e3"
+      question="In the Failure Tour, tick ‘throttle replanner’ (0.5 Hz, Rusty at 0.6 m/s). Before you watch it: does the stack still satisfy F2?"
+      options={[
+        { label: 'Yes — the stopping distance grows but stays under 2 m', correct: true, because: 'T_react = 0.10 + 0.10 + 0.20 + 2.00 + 0.05 = 2.45 s, and 0.6 × 2.45 + 0.18 = 1.65 m < 2.0 m. What grows past comfort is L_valid = 0.6 × 2.2 = 1.32 m: the D23.2 check, not the planner, ends up braking Rusty.' },
+        { label: 'No — at 0.5 Hz the planner is too slow and Rusty reaches the door', because: 'Put the numbers in: the reaction distance is 1.47 m and braking adds 0.18 m, still inside the 2 m at which the door is trusted.' },
+        { label: 'It depends on the furniture the seed picked', because: 'F2 is a worst case over the schedule; it does not depend on where the obstacle is, only on when it is first trusted.' },
+      ]}
+    >
+      Now compute the slowest replanner F2 allows if Rusty drove at 1.0 m/s, everything else at its
+      default rate.
+    </Predict>
+    <CheckAnswer id="ch23.e3b" prompt="Slowest replanner rate F2 allows at v_max = 1.0 m/s (Hz)" answer={0.952} tolerance={0.02} unit="Hz">
+      Braking takes 0.5 m, leaving 1.5 m, so $T_{react} \le 1.5$ s. The other four terms are
+      0.45 s, so $\tau_{plan} \le 1.05$ s, i.e. $f_{plan} \ge 0.952$ Hz. The planner’s period is the
+      dominant term — which is why the throttle is the knob the Failure Tour gives you.
+    </CheckAnswer>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Switch the filter off">
+    <Predict
+      id="ch23.e4"
+      question="In Stack Anatomy, switch off Hitch’s trailer filter. What happens to the 𝒢 printed under Hitch’s row?"
+      options={[
+        { label: 'It drops further, from none to something worse', because: 'There is nothing below none in the order; and removing a rejecting stage can only remove a term from the minimum.' },
+        { label: 'It rises to resolution-complete', correct: true, because: 'The filter was the rejecting stage with 𝒢 = none. Without it the minimum is hybrid A*’s, resolution-complete for the car — completeness bought by giving up every claim about the trailer.' },
+        { label: 'It stays at none', because: 'D23.3 is a minimum over rejecting stages; the remaining one is hybrid A*, which is resolution-complete w.r.t. its primitives.' },
+      ]}
+    >
+      Completeness and soundness are different promises: an unfiltered planner answers more queries,
+      and some of its answers jackknife.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="Add Mode::ReturnHome">
+    After `Done`, Rusty should plan back to $q_{start}$ and drive there. Add the variant and its
+    transitions, touching only `supervisor.rs` and `mission.rs`. Let the compiler find every `match`
+    that now fails with E0004 — the fourth vignette of the Retrospective Scorecard, firsthand — and
+    decide for each whether `ReturnHome` behaves like `Execute`, like `Plan`, or like neither.
+    <Hints>
+      <p>Start with `supervisor_step`: which events should `ReturnHome` accept, and which mode does `Arrived` lead to now?</p>
+      <p>The planner stage needs a goal that depends on the mode; that is a change to the stage’s input type, not to D* Lite.</p>
+      <p>D* Lite’s goal is fixed at construction; returning home is a new search with start and goal swapped, not a repair.</p>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Swap Hitch’s planner behind the same contract">
+    Replace hybrid A\* plus the trailer filter with Chapter 21’s CAR GRID SEARCH with the hitch angle in
+    the state and jackknife pruning at $\phi_{plan}$, behind the same `Stage` trait and the same
+    jackknife guard; slice it so that one tick does at most a few thousand pops. Re-run seed 7 and the
+    *Jackknife* tour. Does `composed_guarantee` change? What happened to the parking error, and why?
+    <Hints>
+      <p>The new planner is a rejecting stage whose guarantee covers the trailer; the filter becomes a verifier of a property the planner already guarantees.</p>
+      <p>CAR GRID SEARCH stops in a goal *region*; finish with a Reeds–Shepp shot only if the trailer filter accepts it.</p>
+      <p>Resolution-complete for the trailer, and a parking error of the order of the goal region’s tolerance instead of zero.</p>
+    </Hints>
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E. and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 1’s taxonomy, the offline/online distinction of the epigraph, and the path–trajectory distinction this chapter turns into types; the book has no systems chapter, which is why this one exists."
+  />
+  <Reference
+    authors="Şucan, I. A., Moll, M. and Kavraki, L. E."
+    year={2012}
+    title="The Open Motion Planning Library"
+    venue="IEEE Robotics & Automation Magazine 19(4)"
+    doi="10.1109/MRA.2012.2205651"
+    note="The planner / state-space / validity-checker separation that the Stage contract mirrors, and the OMPL column of the library map."
+  />
+  <Reference
+    authors="Koenig, S. and Likhachev, M."
+    year={2005}
+    title="Fast Replanning for Navigation in Unknown Terrain"
+    venue="IEEE Transactions on Robotics 21(3)"
+    doi="10.1109/TRO.2004.838026"
+    note="D* Lite, the repair Rusty runs twice a second; Chapter 6 derives it."
+  />
+  <Reference
+    authors="Kuffner, J. J. and LaValle, S. M."
+    year={2000}
+    title="RRT-Connect: An Efficient Approach to Single-Query Path Planning"
+    venue="IEEE International Conference on Robotics and Automation"
+    doi="10.1109/ROBOT.2000.844730"
+    note="Reach’s first feasible path, and the source of its pipeline’s probabilistic completeness."
+  />
+  <Reference
+    authors="Karaman, S. and Frazzoli, E."
+    year={2011}
+    title="Sampling-based Algorithms for Optimal Motion Planning"
+    venue="International Journal of Robotics Research 30(7)"
+    doi="10.1177/0278364911406761"
+    note="RRT*, the anytime improver inside Reach’s planning budget."
+  />
+  <Reference
+    authors="Gammell, J. D., Srinivasa, S. S. and Barfoot, T. D."
+    year={2014}
+    title="Informed RRT*: Optimal Sampling-based Path Planning Focused via Direct Sampling of an Admissible Ellipsoidal Heuristic"
+    venue="IEEE/RSJ International Conference on Intelligent Robots and Systems"
+    doi="10.1109/IROS.2014.6942976"
+    note="The informed sampler Chapter 13 implements and Reach runs."
+  />
+  <Reference
+    authors="Pham, H. and Pham, Q.-C."
+    year={2018}
+    title="A New Approach to Time-Optimal Path Parameterization Based on Reachability Analysis"
+    venue="IEEE Transactions on Robotics 34(3)"
+    doi="10.1109/TRO.2018.2819195"
+    note="TOPP-RA, the modern counterpart of the Time-Scaling Algorithm Chapter 18 uses for Reach, and the kind of stage MoveIt’s time-parameterization adapters run."
+  />
+  <Reference
+    authors="Zucker, M., Ratliff, N., Dragan, A. D., Pivtoraiko, M., Klingensmith, M., Dellin, C. M., Bagnell, J. A. and Srinivasa, S. S."
+    year={2013}
+    title="CHOMP: Covariant Hamiltonian Optimization for Motion Planning"
+    venue="International Journal of Robotics Research 32(9–10)"
+    doi="10.1177/0278364913488805"
+    note="The smoother that F1 shows must be verified before it can be trusted with a guarantee."
+  />
+  <Reference
+    authors="Dolgov, D., Thrun, S., Montemerlo, M. and Diebel, J."
+    year={2010}
+    title="Path Planning for Autonomous Vehicles in Unknown Semi-structured Environments"
+    venue="International Journal of Robotics Research 29(5)"
+    doi="10.1177/0278364909359210"
+    note="Hybrid A* with analytic Reeds–Shepp expansions — Hitch’s planner, and the ancestor of Nav2’s Smac Hybrid-A*."
+  />
+  <Reference
+    authors="LaValle, S. M. and Kuffner, J. J."
+    year={2001}
+    title="Randomized Kinodynamic Planning"
+    venue="International Journal of Robotics Research 20(5)"
+    doi="10.1177/02783640122067453"
+    note="Forward propagation on a control system — the lineage of Hitch’s planners (Choset §7.5.1) and of Chapter 21’s kinodynamic trees."
+  />
+  <Reference
+    authors="Nav2 contributors"
+    year={2026}
+    title="Nav2 Documentation"
+    url="https://docs.nav2.org/"
+    note="The navigation-system column of the library map: costmap layers, planner and controller servers, behavior-tree recoveries. Accessed October 2026; component names change between releases."
+  />
+  <Reference
+    authors="MoveIt contributors"
+    year={2026}
+    title="MoveIt Motion Planning Framework"
+    url="https://moveit.ros.org/"
+    note="The manipulation column of the library map: planning scene, planner plugins, time parameterization and smoothing adapters. Accessed October 2026."
+  />
+</References>

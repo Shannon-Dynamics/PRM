@@ -10,7 +10,7 @@ import { clear, label, type Palette, type Viewport } from '@/lib/sim/draw';
 import { Rng } from '@/lib/prob/rng';
 import type { BitGrid } from '@/lib/manifold/torus';
 import { Prm, StraightLine, Uniform, chartPanel, paintArmMapped, paintChartPath, paintDot, paintGeodesic, paintPanelFrame, paintPolyWorld, paintRaster, rasterTorusCObstacle, rectMapper, torusLab, type ChartPanel, type Sampler, type TorusLab } from '@/lib/sampling';
-import { CELLS_N, LearnedSampler, loadModels, makeWorldCase, mixtureSampler, randomQuery, type WorldCase, type WorldGenerator } from '@/lib/learn';
+import { CELLS_N, LearnedSampler, connectedQuery, loadModels, makeWorldCase, mixtureSampler, randomQuery, type WorldCase, type WorldGenerator } from '@/lib/learn';
 
 /**
  * w22.1 — Learned Sampler vs Uniform.
@@ -22,8 +22,10 @@ import { CELLS_N, LearnedSampler, loadModels, makeWorldCase, mixtureSampler, ran
  * Derivation 1 still applies. Right: the Workbench, with Reach walking whichever
  * path is found first. The planner, the local planner and the collision
  * checker are identical on both sides — only the proposal differs — and the
- * success-vs-n curves below are accumulated over further seeds in the
- * background, one pair at a time.
+ * success-at-budget curves below are accumulated over further seeds in the
+ * background, one pair at a time. Budgets are in collision checks, the book's
+ * cost unit: on Reach's torus a query joins within a handful of nodes, so the
+ * node count hides what the proposal saves and the check count shows it.
  */
 
 const N_MAX = 1500;
@@ -32,13 +34,15 @@ const ARENA = { minX: 0, minY: 0, maxX: 3.3, maxY: 1 };
 const PANEL_U = { x0: 0, y0: 0, x1: 1, y1: 1 };
 const PANEL_L = { x0: 1.12, y0: 0, x1: 2.12, y1: 1 };
 const PANEL_W = { x0: 2.24, y0: 0, x1: 3.3, y1: 1 };
-const CURVE_N = [25, 50, 75, 100, 150, 200, 300, 400, 500, 650, 800, 1000, 1250, 1500];
+const CURVE_C = [25, 50, 100, 150, 200, 300, 400, 600, 800, 1200, 1600, 2400, 3200];
 const EXTRA_SEEDS = 10;
 
 interface Lane {
   prm: Prm<number[]>;
   lab: TorusLab;
   joinedAt: number | null;
+  /** Collision checks spent when start and goal first shared a component. */
+  joinedChecks: number | null;
   path: number[][] | null;
 }
 
@@ -58,6 +62,7 @@ interface State {
   extra: Pair | null;
   extraSeed: number;
   extraDone: number;
+  /** Checks at which each background pair's lanes joined (null: not within N_MAX nodes). */
   results: { u: number | null; l: number | null }[];
 }
 
@@ -74,7 +79,8 @@ function makeLane(wc: WorldCase, start: number[], goal: number[], sampler: Sampl
   prm.connectNode(s, prm.candidates(s));
   const g = prm.addNode(goal);
   prm.connectNode(g, prm.candidates(g));
-  return { prm, lab, joinedAt: prm.roadmap.sameComponent(0, 1) ? 2 : null, path: null };
+  const joined = prm.roadmap.sameComponent(0, 1);
+  return { prm, lab, joinedAt: joined ? 2 : null, joinedChecks: joined ? lab.free.checks : null, path: null };
 }
 
 function makePair(wc: WorldCase, start: number[], goal: number[], lambda: number, seed: number): Pair {
@@ -86,19 +92,21 @@ function makePair(wc: WorldCase, start: number[], goal: number[], lambda: number
   };
 }
 
-function queryFor(wc: WorldCase, seed: number): [number[], number[]] {
+/** A blocked query whose endpoints share a component of the C-space raster, so the race has a finish line. */
+function queryFor(wc: WorldCase, seed: number, raster: BitGrid): [number[], number[]] {
   const rng = new Rng(seed ^ 0x5bd1e995);
-  return randomQuery(wc.lab, rng) ?? randomQuery(wc.lab, rng, 1.5, false) ?? [[0.8, 1.6], [-2.2, -1.2]];
+  return connectedQuery(wc.lab, raster, rng) ?? randomQuery(wc.lab, rng) ?? randomQuery(wc.lab, rng, 1.5, false) ?? [[0.8, 1.6], [-2.2, -1.2]];
 }
 
 function build(seed: number, prms: Params): State {
   const wc = makeWorldCase(seed, prms.gen);
-  const [start, goal] = queryFor(wc, seed);
+  const raster = rasterTorusCObstacle(wc.lab, 48);
+  const [start, goal] = queryFor(wc, seed, raster);
   return {
     wc,
     start,
     goal,
-    raster: rasterTorusCObstacle(wc.lab, 48),
+    raster,
     live: makePair(wc, start, goal, prms.lambda, seed),
     extra: null,
     extraSeed: seed + 1,
@@ -114,7 +122,10 @@ function growLane(lane: Lane, want: number, batch: number): void {
   while (added < batch && lane.prm.n < want && attempts++ < 200) {
     if (lane.prm.addSample() !== null) {
       added++;
-      if (lane.joinedAt === null && lane.prm.roadmap.sameComponent(0, 1)) lane.joinedAt = lane.prm.n;
+      if (lane.joinedAt === null && lane.prm.roadmap.sameComponent(0, 1)) {
+        lane.joinedAt = lane.prm.n;
+        lane.joinedChecks = lane.lab.free.checks;
+      }
     }
   }
 }
@@ -143,7 +154,7 @@ export function LearnedSamplerRace() {
     if (s.extraDone >= EXTRA_SEEDS) return s;
     if (!s.extra) {
       const wc = makeWorldCase(s.extraSeed, s.wc.gen);
-      const [a, b] = queryFor(wc, s.extraSeed);
+      const [a, b] = queryFor(wc, s.extraSeed, rasterTorusCObstacle(wc.lab, 48));
       s.extra = makePair(wc, a, b, lambdaRef.current, s.extraSeed);
     }
     const ex = s.extra;
@@ -152,7 +163,7 @@ export function LearnedSamplerRace() {
     const uDone = ex.uniform.joinedAt !== null || ex.uniform.prm.n >= N_MAX;
     const lDone = ex.learned.joinedAt !== null || ex.learned.prm.n >= N_MAX;
     if (uDone && lDone) {
-      s.results.push({ u: ex.uniform.joinedAt, l: ex.learned.joinedAt });
+      s.results.push({ u: ex.uniform.joinedChecks, l: ex.learned.joinedChecks });
       s.extra = null;
       s.extraSeed++;
       s.extraDone++;
@@ -160,7 +171,7 @@ export function LearnedSamplerRace() {
     return { ...s };
   }, []);
 
-  const sim = useSimulation<State>({ init, step: stepFn, fps: 30, initialSeed: 22 });
+  const sim = useSimulation<State>({ init, step: stepFn, fps: 30, initialSeed: 21 });
   const resetRef = useRef(sim.reset);
   resetRef.current = sim.reset;
   useEffect(() => {
@@ -229,7 +240,7 @@ export function LearnedSamplerRace() {
         paintDot(ctx, panel.X(cg[0]), panel.Y(cg[1]), 6, p.goal);
         label(ctx, title, panel.px + 4, panel.py - 9, p.ink, { size: 11, weight: 600 });
         label(ctx, `n = ${shown}`, panel.px + panel.w - 4, panel.py - 9, p.ink, { size: 10, align: 'right' });
-        if (lane.joinedAt !== null && shown >= lane.joinedAt) label(ctx, `joined at n = ${lane.joinedAt}`, panel.px + 4, panel.py + panel.h + 11, p.path, { size: 11, weight: 700 });
+        if (lane.joinedAt !== null && shown >= lane.joinedAt) label(ctx, `joined at n = ${lane.joinedAt} · ${lane.joinedChecks} checks`, panel.px + 4, panel.py + panel.h + 11, p.path, { size: 11, weight: 700 });
         else label(ctx, `${lane.lab.free.checks} checks`, panel.px + 4, panel.py + panel.h + 11, p.ink, { size: 10 });
       };
 
@@ -260,13 +271,13 @@ export function LearnedSamplerRace() {
     [s, shownU, shownL, pathU, pathL, space, lambda, sim.tick],
   );
 
-  // Success-vs-n: live pair plus the finished background pairs.
+  // Success at budget (collision checks): live pair plus the finished background pairs.
   const curves = useMemo(() => {
-    const all = [{ u: s.live.uniform.joinedAt, l: s.live.learned.joinedAt }, ...s.results];
-    const frac = (key: 'u' | 'l') => CURVE_N.map((n) => ({ x: n, y: all.filter((r) => r[key] !== null && (r[key] as number) <= n).length / all.length }));
+    const all = [{ u: s.live.uniform.joinedChecks, l: s.live.learned.joinedChecks }, ...s.results];
+    const frac = (key: 'u' | 'l') => CURVE_C.map((b) => ({ x: b, y: all.filter((r) => r[key] !== null && (r[key] as number) <= b).length / all.length }));
     return { uniform: frac('u'), learned: frac('l'), seeds: all.length };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.results.length, s.live.uniform.joinedAt, s.live.learned.joinedAt]);
+  }, [s.results.length, s.live.uniform.joinedChecks, s.live.learned.joinedChecks]);
 
   const quadrants = s.live.learnedSampler.quadrantMasses();
   const klCells = s.live.learnedSampler.klToUniform();
@@ -285,8 +296,9 @@ export function LearnedSamplerRace() {
           proposal differs. The grey heat under the middle pane is the learned categorical over 12 × 12 cells of
           Reach&rsquo;s torus, conditioned on the table&rsquo;s 8 × 8 occupancy raster and the query&rsquo;s endpoints;
           it is mixed with uniform at weight λ so that Derivation 1&rsquo;s bound still holds. Below: the four-quadrant
-          coarsening with its KL divergence from uniform, and success-vs-<em>n</em> curves that fill in as further
-          seeds run in the background. Switch to the <em>held-out generator</em> — thin bars at arbitrary angles, a
+          coarsening with its KL divergence from uniform, and success-at-budget curves — the budget in collision checks,
+          the book&rsquo;s cost unit — that fill in as further seeds run in the background. Queries are drawn so that start
+          and goal share a component of the C-space raster: every one has an answer. Switch to the <em>held-out generator</em> — thin bars at arbitrary angles, a
           family the training set never contained — and watch the heat land where the training worlds had corridors.
         </>
       }
@@ -301,8 +313,8 @@ export function LearnedSamplerRace() {
       />
       <div className="border-t border-fd-border px-3 py-3">
         <Dashboard columns={4}>
-          <StatTile label="uniform joined at n" value={s.live.uniform.joinedAt ?? '—'} precision={0} role="graph" trend={s.live.uniform.lab.free.checks} trendLabel="collision checks" />
-          <StatTile label="learned joined at n" value={s.live.learned.joinedAt ?? '—'} precision={0} role="path" trend={s.live.learned.lab.free.checks} trendLabel="collision checks" />
+          <StatTile label="uniform: checks to join" value={s.live.uniform.joinedChecks ?? '—'} precision={0} role="graph" trend={s.live.uniform.joinedAt ?? undefined} trendLabel={s.live.uniform.joinedAt !== null ? 'samples n at the join' : undefined} />
+          <StatTile label="learned: checks to join" value={s.live.learned.joinedChecks ?? '—'} precision={0} role="path" trend={s.live.learned.joinedAt ?? undefined} trendLabel={s.live.learned.joinedAt !== null ? 'samples n at the join' : undefined} />
           <StatTile label="D(p̂‖u), 144 cells" value={klCells} precision={3} unit="nats" role="robot" trend={Number((klCells / Math.LN2).toFixed(2))} trendLabel="bits" />
           <StatTile label="seeds in the curves" value={curves.seeds} precision={0} role="obstacle" trend={s.live.learnedSampler.inferenceMs} trendLabel="ms inference" />
         </Dashboard>
@@ -326,15 +338,15 @@ export function LearnedSamplerRace() {
               { id: 'uniform', role: 'graph', data: curves.uniform },
               { id: `learned, λ = ${lambda.toFixed(2)}`, role: 'path', data: curves.learned },
             ]}
-            xLabel="samples n"
+            xLabel="collision checks"
             yLabel="fraction of seeds joined"
             height={190}
             legend
             curve="stepAfter"
             yMin={0}
             yMax={1}
-            caption={<>Success at budget over {curves.seeds} seed{curves.seeds === 1 ? '' : 's'} on the {s.wc.gen === 'train' ? 'training' : 'held-out'} generator (more accumulate while the widget runs).</>}
-            ariaLabel="Fraction of seeds whose roadmap joined start and goal, against the number of samples, for the uniform and the learned proposal."
+            caption={<>Success at a collision-check budget over {curves.seeds} seed{curves.seeds === 1 ? '' : 's'} on the {s.wc.gen === 'train' ? 'training' : 'held-out'} generator (more accumulate while the widget runs).</>}
+            ariaLabel="Fraction of seeds whose roadmap joined start and goal, against the collision checks spent, for the uniform and the learned proposal."
           />
         </div>
       </div>

@@ -13,6 +13,8 @@
     "ch06-graph-search",
     "ch07-potential-functions",
     "ch08-roadmaps-i",
+    "ch09-roadmaps-ii",
+    "ch10-cell-decompositions",
     "---Part III · Sampling-Based Planning---",
     "ch11-prm",
     "ch12-tree-planners",
@@ -25,6 +27,10 @@
     "ch17-robot-dynamics",
     "ch18-trajectory-planning",
     "ch19-trajectory-optimization",
-    "ch20-nonholonomic-i"
+    "ch20-nonholonomic-i",
+    "ch21-nonholonomic-ii",
+    "---Part VI · Frontiers---",
+    "ch22-learning-and-planning",
+    "ch23-capstone"
   ]
 }

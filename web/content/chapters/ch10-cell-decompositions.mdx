@@ -1,0 +1,1213 @@
+---
+title: Cell Decompositions and Coverage
+description: Carving the free space into cells simple enough to sweep — the trapezoidal decomposition by a vertical sweep with Choset's four event types, the boustrophedon and Morse decompositions whose walls sit only at critical points, Euler's count and the coverage path-length bound, sensor-based coverage with the cycle algorithm and an incrementally built Reeb graph, and pursuit–evasion as a decomposition by information.
+chapter: 10
+part: PART II
+partTitle: Classical Planners — Search, Potentials, Roadmaps, Cells
+difficulty: Intermediate
+readingTime: 65 min
+quote: A coverage path planner determines a path that passes an effector (e.g., a robot, a detector, etc.) over all points in a free space.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 6
+---
+
+import { MissedSofaHook } from '@/components/ch/ch10/missed-sofa-hook';
+import { BoustrophedonMower } from '@/components/ch/ch10/boustrophedon-mower';
+import { TrapezoidSweep } from '@/components/ch/ch10/trapezoid-sweep';
+import { PursuitEvasion } from '@/components/ch/ch10/pursuit-evasion';
+import { SliceGallery } from '@/components/ch/ch10/slice-gallery';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Define an exact cell decomposition and its adjacency graph, and reduce planning to graph search and coverage to an exhaustive walk (Choset Ch. 6 introduction)',
+    'Build the trapezoidal decomposition by a vertical sweep: the four event types of Choset Fig. 6.4, the list L of crossed edges, extensions only into free space, O(n log n) — and count its cells, V + N_ob − 1 for any polygonal free space in general position',
+    'Prove midpoint–centroid paths through trapezoids are collision-free, and plan with Chapter 6\'s A* on the adjacency graph',
+    'Define critical points of a slice function on the obstacle boundary, Morse decompositions (Def. 6.2.1) and their duals, Reeb graphs; prove Euler\'s count N_ce = N_cp + N_ob − 1 and see where it stops applying (brushfire)',
+    'Cover a cell decomposition with laps of width 2r, bound the area a lawnmower misses and Choset\'s path length Δ²/2r + 4ΔN_ce + 5P_total, and measure both',
+    'Sense critical points from a range ring while covering an unknown space, explain why a raster scan misses them, and run the cycle algorithm that does not',
+    'State the pursuit–evasion problem, compute visibility polygons and gap-edge labels, and search the information graph for a strategy',
+  ]}
+  prerequisites={[
+    'Polygonal worlds, the Apartment and the Workbench, Rusty\'s range ring (Chapter 2); the curve tracer and the offset follower (Chapter 3)',
+    'Disc C-obstacles by inflation (Chapter 4)',
+    'A*, BFS and DFS on a graph (Chapter 6); brushfire and wave-front (Chapter 7)',
+    'The Morse box — critical points, index, Euler characteristic (Chapter 8); Lemma 5.5.2 and slices (Chapter 9)',
+  ]}
+>
+Every planner so far answered "how do I get *there*?" This chapter asks "how do I visit
+*everywhere*?" — the question of a vacuum cleaner, a demining robot, a lawnmower, a wiping pad on
+a bench. One object answers both. Carve $\Qfree$ into **cells** simple enough that a back-and-forth
+motion sweeps each one, and record which cells touch in an **adjacency graph**: planning is then a
+search on that graph (Chapter 6), and coverage is a walk that visits every node.
+
+The interesting question is *where the cell walls go*. The trapezoidal decomposition puts one at
+every vertex — correct, simple, and over-chopped. The boustrophedon decomposition puts one only
+where a sweeping slice changes connectivity: at the **critical points of the slice function on the
+obstacle boundary**, which is the Morse vocabulary of Chapter 8 read by the rank condition of
+Chapter 9. Those critical points can be *sensed* — the range ring's shortest ray lines up with the
+sweep — so coverage becomes an online algorithm that explores an unknown room while it mows it,
+with a completeness guarantee and a path length linear in the area, the number of critical points,
+and the perimeter. A short coda carves the plane by *visibility* instead, and uses the cells to
+find an evader.
+
+Everything on the page runs. The sweep on the chapter's micro-world produces the 12 trapezoids
+and 13 adjacencies the design promises and its list of crossed edges matches a brute-force re-sort
+at every event; Euler's count holds on 300 seeded worlds, convex and star-shaped; the online
+coverer re-discovers the six critical points of the offline sweep from range data alone, with its
+shortest ray horizontal to within a hundredth of a degree; and the information-graph search
+proves — by exhausting it — that one pursuer cannot clear three pockets.
+</Overview>
+
+## The problem: Rusty mows the living room
+
+Room C of the Apartment, furnished for this chapter with a sofa against the north wall and a
+coffee table, is the free space of disc-Rusty: the room shrunk by Rusty's radius, the furniture
+grown by it (Chapter 4's inflation). Rusty's effector — the brush — is its own diameter,
+$2r = 0.44$ m. Put it down in the south-west corner of the room and ask it to cover the room twice, from the same start,
+knowing nothing about the room but what its range ring tells it.
+
+<Figure caption="Left: a conventional raster scan — lap until contact, follow whichever boundary the lap ended on for one lap width, lap back — senses critical points only on the boundary it happens to follow. It finds the room's first and last points, concludes the room is one cell, and stops after 21.7 m with 79.7 % covered; the hatched strip behind the sofa, the floor between the coffee table and the south wall, and a sliver along the east wall were never visited. Right: the cycle algorithm closes a loop around every gap between laps, senses all six critical points (blue dots), and covers 100 % in 85.7 m. Purple is covered ground, at the 3 cm resolution of the chapter's checks.">
+  <Deferred minHeight={380} label="the missed-sofa hook">
+    <MissedSofaHook />
+  </Deferred>
+</Figure>
+
+The raster scan *looked* done. Every lap it drove was a full lap, every turn was neat, and the
+algorithm terminated by its own rule — no unexplored openings in the cell it thought it was
+covering. But it never followed the bottom of the sofa at the moment the sofa ended, so it never
+learned that the free space split there; the strip behind the sofa was another cell, and nothing
+told the robot it existed. That is Choset Fig. 6.22 in a living room, and the rest of the chapter
+is the machinery that makes the failure impossible: cells, the points where cells begin and end,
+how to sense those points, and a motion pattern that cannot walk past one.
+
+## Building intuition
+
+### Cells, walls, and a graph
+
+<KeyIdea title="Definitions — exact cell decomposition, adjacency graph, coverage (Choset Ch. 6 introduction)">
+An **exact cell decomposition** of $\Qfree$ is a partition into simple regions — **cells** $c_i$ —
+whose union is exactly $\Qfree$. Two cells are **adjacent** if they share a boundary; the
+**adjacency graph** has a node per cell and an edge per shared boundary. **Planning** with a
+decomposition is two steps: locate the cells containing $\qstart$ and $\qgoal$, then search the
+adjacency graph. A **coverage path** passes an effector of width $2r$ over every point of
+$\Qfree$; with cells it is an **exhaustive walk** through the adjacency graph (every node visited)
+plus a pattern inside each cell.
+</KeyIdea>
+
+The cells have to be "simple" in a specific sense: something a robot can cover without thinking.
+A cell bounded left and right by vertical segments and above and below by obstacle boundary — a
+*floor* and a *ceiling* that never double back in $x$ — is covered by vertical laps one effector
+width apart, stepping over along the floor or ceiling between laps. That is the boustrophedon
+("ox-turning") pattern of a plough, and it is why every decomposition in this chapter is built by
+sweeping a vertical line.
+
+### Where the walls go: the trapezoidal sweep
+
+<Deferred>
+  <TrapezoidSweep />
+</Deferred>
+
+The chapter's micro-world — the **bench** — is a convex quadrilateral plot
+$B = (0, 0.2), (10, 0), (10.4, 6), (0.3, 6.2)$ with a triangle $T = (2,2), (4,1.5), (3,4)$ and a
+quadrilateral $K = (6,1), (8,0.8), (8.6,4), (6.5,4.4)$; its eleven vertex abscissae are distinct.
+A vertical line sweeps it from left to right and stops only at vertices. Between stops nothing can
+happen: the edges the line crosses stay in the same vertical order, and the free intervals between
+them only stretch or shrink. The widget's strip is that ordered list, $L$. At a stop, the two edges
+meeting at the vertex are inserted into $L$, deleted from it, or one replaces the other — Choset's
+four event types — and the vertex shoots a **vertical extension** up to the next edge of $L$ above
+it and down to the next below, *if free space lies there*.
+
+Watch the totals. The eleven vertices do not produce twenty-two extensions; they produce thirteen,
+because most vertices have obstacle on one side. The pass-through vertices — $(0.3, 6.2)$ on the
+plot's upper chain, $T$'s top $(3,4)$, $K$'s $(6.5, 4.4)$, $(8, 0.8)$, and the plot's corner
+$(10, 0)$ — each get one. The leftmost and rightmost vertices of $T$ and $K$ get two. The plot's
+own leftmost and rightmost vertices get none. Cells: twelve trapezoids (some degenerate into
+triangles), and the adjacency graph has thirteen edges, one per extension.
+
+### Fewer walls: the boustrophedon decomposition
+
+<Deferred minHeight={520}>
+  <BoustrophedonMower />
+</Deferred>
+
+Now keep only the extensions that go *both* up and down. There are four — at the leftmost and
+rightmost points of $T$ and of $K$ — and with the slice's birth at $(0, 0.2)$ and death at
+$(10.4, 6)$ they are the six places where the free part of the sweep line changes its number of
+pieces: one interval, then two (above and below $T$), then one, two (around $K$), one, none. Merge
+the trapezoids that the other extensions separated and you have seven cells. The Reeb graph docked
+beside the canvas is the dual picture: a node per critical point, an edge per cell. Six nodes,
+seven edges, two holes:
+
+$$
+N_{ce} = N_{cp} + N_{ob} - 1, \qquad 7 = 6 + 2 - 1,
+$$
+
+and the widget re-prints it live while you drag any vertex — Euler's count is a theorem, not a
+coincidence of this world.
+
+Then Rusty mows. With a $0.5$ m effector, the first cell (from $x = 0$ to the triangle's tip at
+$x = 2$) takes $\lceil 2/0.5 \rceil = 4$ laps. From a start at $(1.5, 3)$ the boustrophedon mower
+finishes the bench in $158.4$ m; switch to the trapezoidal decomposition and the same mower needs
+$174.4$ m — one more lap and $14$ m more of transits, because twelve cells mean twelve entries and
+twelve exits. In the living room the gap is wider: $45.9$ m against $79.1$ m, because the
+octagonal corners of Rusty's C-obstacles shatter the room into 29 trapezoids. **More cells is not
+finer coverage; it is more turnarounds.**
+
+### Six slices, one definition
+
+Nothing in the boustrophedon decomposition depends on the slices being vertical lines. Sweep
+circles out from a centre, or diamonds, or rays, or the fronts of a brushfire, and the same rule —
+a cell wall wherever the swept slice splits or merges — gives a different decomposition and a
+different pattern of laps (Choset Figs. 6.12–6.18). The gallery computes all six on the bench by
+one raster algorithm.
+
+<Figure id="f10.4" caption="The slice-function gallery on the bench (8 cm pixels). Cells are tinted, the critical slices I* are dark, critical points are blue dots, and thin purple curves are a few level sets h = λ — the laps a robot would drive. Boustrophedon, spike (rays from a centre off the plot, below left), and wave-front (path length from the green point) each give 6 critical points and 7 cells; the spiral and squarel slices about (5, 3) give 12 and 13, and 15 and 16 — all obeying N_ce = N_cp + N_ob − 1. The brushfire slice gives a tree: 6 critical points, 5 cells. Hover a panel for what to notice.">
+  <SliceGallery />
+</Figure>
+
+Two things in the gallery are worth a second look. The spiral's circles touch the outer wall many
+times, yet not every touch is a critical point: the first touch turns a closed circle into an arc
+— one piece before, one piece after — and *connectivity* is what Definition 6.2.1 counts. And the
+brushfire decomposition is a tree, not a graph with a loop per obstacle: its slices are fronts
+*around* each obstacle, so each obstacle is itself a critical set where a cell is born, and Euler's
+count takes a different form (Derivation 5).
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: 'c_i', meaning: 'a cell; the adjacency graph has a node per cell and an edge per shared boundary' },
+    { sym: 'e_{lower},\\; e_{upper};\\; e_{LOWER},\\; e_{UPPER};\\; L', meaning: 'the two edges at an event vertex v (e_lower is the one whose other end is lower); the edges of L just below and above v; the sweep line\'s list of crossed edges, bottom to top (C §6.1)' },
+    { sym: 'Q_\\lambda,\\; Q_{free\\,\\lambda},\\; Q^j_{free\\,\\lambda}', meaning: 'a slice h⁻¹(λ), its free part, and the free part\'s j-th connected interval (a slice interval)' },
+    { sym: 'I^\\star', meaning: 'the slice intervals that contain a critical point; cells are the components of Q_free \\ I*' },
+    { sym: 'h : \\Q \\to \\mathbb{R};\\; m', meaning: 'the slice function (x for boustrophedon; |q − c| spiral; |x| + |y| squarel; D brushfire); an implicit function whose zero set is the obstacle boundary' },
+    { sym: 'N_{cp},\\; N_{ce},\\; N_{ob};\\; V', meaning: 'numbers of critical points, cells, obstacles (holes); number of polygon vertices' },
+    { sym: '\\Delta,\\; 2r,\\; P_{total}', meaning: 'diameter of the smallest disk containing Q_free; effector width = interlap spacing; perimeter of the obstacles plus the outer boundary' },
+    { sym: 'V(x),\\; B(x);\\; H(\\W_{free})', meaning: 'visibility polygon of x; the vector of gap-edge labels (0 clear, 1 contaminated); the least number of pursuers that guarantees capture' },
+  ]}
+/>
+
+### Cell decompositions by sweeping
+
+<KeyIdea title="Definition — the trapezoidal decomposition (Choset §6.1)">
+Let $\Qfree$ be bounded by a polygon, with polygonal holes, in **general position**: no two
+vertices share an $x$-coordinate. At every vertex $v$ draw the **upper vertical extension** from
+$v$ up to the first edge above it and the **lower vertical extension** down to the first edge
+below — each only if it lies in $\Qfree$. The extensions cut $\Qfree$ into trapezoids (some with a
+zero-length side: triangles). Two trapezoids are adjacent iff they share an extension.
+</KeyIdea>
+
+<Derivation title="The trapezoidal sweep: four event types, O(n log n)" result="L changes only at vertices; each event is an insertion, a deletion or a replacement next to e_LOWER, e_UPPER">
+**Statement** (Choset §6.1). Sort the $n$ vertices by $x$. Sweep a vertical line through them
+keeping the list $L$ of edges it crosses, ordered by height. With $L$ in a balanced tree, each
+event updates $L$ and finds $e_{LOWER}, e_{UPPER}$ in $O(\log n)$, so the whole decomposition costs
+$O(n \log n)$ — against the naive $O(n^2)$ of intersecting a vertical line through each vertex
+with every edge.
+
+**Step 1 — nothing happens between vertices.** Edges do not cross (the polygons are simple and
+disjoint), so two edges both crossing the line keep their vertical order until one of them ends,
+which happens at a vertex. Between events $L$ is frozen.
+
+**Step 2 — at an event, only the two edges at $v$ change.** Let $e_{lower}, e_{upper}$ be the
+edges containing $v$, labelled so that the other end of $e_{lower}$ is lower. Four cases (Choset
+Fig. 6.4): both to the right of the line — insert both between $e_{LOWER}$ and $e_{UPPER}$; both
+to the left — delete both; $e_{lower}$ left, $e_{upper}$ right — $e_{upper}$ takes $e_{lower}$'s
+slot; $e_{lower}$ right, $e_{upper}$ left — $e_{lower}$ takes $e_{upper}$'s slot. Every update
+happens *at the position of $v$ in $L$*, so finding $e_{LOWER}$ and $e_{UPPER}$ is one search.
+
+**Step 3 — the extensions.** The extension from $v$ upward ends on $e_{UPPER}$ at height
+$e_{UPPER}(v_x)$, the downward one on $e_{LOWER}$; each exists exactly when the direction
+$\pm\hat y$ at $v$ points into free space, which the angular sector of free space at $v$ decides in
+$O(1)$.
+
+**Step 4 — the count.** $O(n \log n)$ to sort, $n$ events at $O(\log n)$ each. $\blacksquare$
+
+*The bench's trace.* Number the edges $e_0, \dots, e_3$ around the plot, $e_4, e_5, e_6$ around
+$T$ and $e_7, \dots, e_{10}$ around $K$, each counter-clockwise from the first listed vertex. The
+sweep's list is
+
+$$
+\emptyset \to \{e_0, e_3\} \to \{e_0, e_2\} \to \{e_0, e_4, e_6, e_2\} \to \{e_0, e_4, e_5, e_2\} \to \{e_0, e_2\} \to \{e_0, e_7, e_{10}, e_2\} \to \{e_0, e_7, e_9, e_2\} \to \{e_0, e_8, e_9, e_2\} \to \{e_0, e_2\} \to \{e_1, e_2\} \to \emptyset,
+$$
+
+the same shape as Choset's $L: \emptyset \to \{e_8, e_{13}\} \to \{e_8, e_0, e_3, e_{13}\} \to \dots$
+for his Fig. 6.1. The check re-sorts the crossed edges by brute force between every pair of events
+and finds no disagreement. *Two honesty items.* The TypeScript port keeps $L$ as a sorted array —
+$O(n)$ per update, which changes the constant and not the idea. And general position is an
+assumption: the Apartment's rectilinear walls violate it on every wall, so the port shears
+rectilinear worlds by $x \leftarrow x + \sigma y$ with $\sigma = \sqrt 2 \cdot 10^{-3}$, which
+keeps every edge straight and every polygon simple, moves nothing by more than six millimetres in
+these rooms, and turns each vertical wall's two corners into one critical point and one
+pass-through. *Point location* (C §6.1, end): vertical lines through all events cut the plane into
+slabs; a binary search finds a query's slab and a second search its floor and ceiling, $O(\log n)$
+per query [C ref. 124].
+</Derivation>
+
+How many trapezoids? Each event opens new cells: a vertex with extensions both ways (a **split**)
+closes one cell and opens two; a vertex where two edges leave and free space lies *between* them
+(a **birth**) opens one; a pass-through closes one and opens one; a vertex where two edges arrive
+with obstacle between (a **merge**) closes two and opens one; a vertex where two edges arrive with
+free space between (a **death**) only closes. Counting cells opened per vertex gives
+
+$$
+\#\text{trapezoids} = V + \#\text{split} - \#\text{death}.
+$$
+
+For a convex $m$-gon boundary with convex $k_i$-gon holes, each hole has one split and no death
+and the boundary has one death and no split, so the count is $(m - 1) + \sum_i (k_i + 1)$ — on the
+bench, $3 + 4 + 5 = 12$. The surprise is that the closed form survives non-convexity:
+$\#\text{split} - \#\text{death} = N_{ob} - 1$ for *every* polygonal free space in general position
+(Exercise 1 proves it from Euler's count), so
+
+$$
+\#\text{trapezoids} = V + N_{ob} - 1, \qquad \#\text{adjacencies} = V + 2N_{ob} - 2,
+$$
+
+which the check confirms on 200 convex and 100 star-shaped seeded worlds — 69 of the latter have a
+notch tip that opens or closes a slice — and which gives the living room's $28 + 2 - 1 = 29$ and
+the Workbench top's $16 + 3 - 1 = 18$.
+
+<Derivation title="Midpoint–centroid paths are collision-free" result="a path in the adjacency graph ⇒ a polyline in Q_free">
+**Statement** (Choset §6.1). Let $c_0, c_1, \dots, c_k$ be a path in the adjacency graph from the
+cell containing $\qstart$ to the cell containing $\qgoal$. The polyline $\qstart$ → midpoint of
+the extension $c_0|c_1$ → centroid of $c_1$ → midpoint of $c_1|c_2$ → … → midpoint of
+$c_{k-1}|c_k$ → $\qgoal$ lies in $\Qfree$.
+
+**Step 1 — trapezoids are convex.** A trapezoid is the region between two non-crossing segments
+over a common $x$-interval: an intersection of four half-planes.
+
+**Step 2 — each piece joins two points of one cell.** $\qstart$ and the first midpoint lie in
+$c_0$ (the midpoint is on its right or left wall); the midpoint of $c_{i-1}|c_i$ and the centroid
+of $c_i$ lie in $c_i$; and so on. By convexity each segment stays in its cell.
+
+**Step 3 — consecutive pieces meet on shared walls**, which are in $\Qfree$. $\blacksquare$
+
+*In practice* the adjacency graph is a Chapter 6 `Graph`, costed by the length of each
+centroid–midpoint–centroid hop, and A\* with the centroid-to-centroid straight line as heuristic
+(admissible by the triangle inequality) finds the route; the check plans 120 random queries over
+the bench, the living room and the Workbench top and samples every path at 1 cm — all inside
+$\Qfree$. The argument fails for the non-convex cells of the next section, which is why the coverage
+code routes its *transits* between boustrophedon cells through the trapezoids, which refine them.
+</Derivation>
+
+### Morse decompositions
+
+<KeyIdea title="Definitions — slices, critical points, Morse decomposition (Choset §6.2.2, Def. 6.2.1 [C ref. 12])">
+Let $h : \Q \to \mathbb{R}$ be a **slice function** and $Q_\lambda = h^{-1}(\lambda)$ a **slice**;
+$Q_{free\,\lambda} = Q_\lambda \cap \Qfree$ is its free part, whose connected components
+$Q^j_{free\,\lambda}$ are the **slice intervals**. A **critical point** is a point of
+$\partial\Qfree$ where $Q_{free\,\lambda}$ changes connectivity as $\lambda$ passes $h$ of it — for
+$h = x$, a vertex with extensions both up and down, or the slice's birth or death. Let $I^\star$
+be the set of slice intervals containing a critical point. A **Morse decomposition** is the exact
+cell decomposition whose cells are the connected components of $\Qfree \setminus I^\star$; the
+**boustrophedon decomposition** [C ref. 110] is the case $h(x, y) = x$.
+</KeyIdea>
+
+<Derivation title="Between critical slices the free slice keeps its topology" result="Q_free,λ₁ ≅ Q_free,λ₂ when no critical value lies between λ₁ and λ₂">
+**Statement** (Choset §6.2.2; the Morse box of [Chapter 8](/chapters/ch08-roadmaps-i); Lemma 5.5.2
+of [Chapter 9](/chapters/ch09-roadmaps-ii)). If $h$ restricted to $\partial\Qfree$ is Morse,
+then for $\lambda_1 < \lambda_2$ with no critical value between them a diffeomorphism carries
+$Q_{free\,\lambda_1}$ onto $Q_{free\,\lambda_2}$: slice intervals stretch or shrink, but never
+split, merge, appear or vanish. Hence each cell is swept by a *single* interval that varies
+continuously — exactly what a lawnmower needs.
+
+**Step 1 — connectivity changes only at tangency.** An interval's endpoints lie on
+$\partial\Qfree$. Moving $\lambda$, an endpoint slides along the boundary as long as the slice
+crosses the boundary transversally; intervals can only be created, destroyed, cut or joined where
+the slice is *tangent* to $\partial\Qfree$.
+
+**Step 2 — tangency is a rank condition.** With $\partial\Qfree = m^{-1}(0)$, the slice is tangent
+at $x$ iff $\nabla h(x) \parallel \nabla m(x)$, i.e. the stacked differential $D(h, m)(x)$ loses
+rank — Lemma 5.5.2.
+
+**Step 3 — those are the critical points of $h|_{\partial\Qfree}$.** On the one-dimensional
+boundary, rank loss of $D(h, m)$ means the derivative of $h$ along the boundary vanishes.
+
+**Step 4 — Morse theory between critical values.** For a Morse function the topology of the level
+sets changes only across critical values [C ref. 315] — the Chapter 8 box applied to
+$h|_{\partial\Qfree}$, with the interior of each slice interval carried along. $\blacksquare$
+
+*Consequences.* A critical point lies at an *endpoint* of a slice interval, never inside one —
+inside, the slice meets free space on both sides and is not tangent to anything (Exercise 2). *Not
+every tangency is critical.* A circle centred in free space first touches the outer wall from
+inside: a closed loop becomes an arc, one piece before and one after. That is a topology change of
+the slice but not a *connectivity* change, and Definition 6.2.1 counts connectivity — which is why
+the spiral panel of the gallery has fewer critical points than its circles have tangencies.
+*Nonsmooth slices* — $|x| + |y|$, the distance $D$ — use Chapter 9's generalized gradient: for the
+squarel a corner of the diamond is critical when the obstacle's normal lies in the convex hull of
+the two flat sides meeting there (C §6.2.3). *Degenerate critical points* — a vertical wall seen by
+$h = x$ — are what rectilinear rooms are made of; Butler et al. [C ref. 86] cover them directly,
+and this book shears them away offline and merges them online (Derivation 4).
+</Derivation>
+
+<Figure caption="Choset's boustrophedon cell as Definition 6.2.1 sees it, with the bench's numbers: the first cell is swept by one slice interval from its birth at (0, 0.2) to the critical slice through T's tip at x = 2, where the interval splits around the triangle. Four laps at 2r = 0.5 cover x ∈ [0, 2]; the abscissae are 0.25, 0.75, 1.25, 1.75 — the outer laps r inside the cell's ends, so every point is within r of a lap horizontally.">
+  <div className="not-prose grid grid-cols-4 gap-2 font-mono text-[0.72rem] tabular-nums">
+    <div className="rounded-sm border border-fd-border px-2 py-1">lap 1 · x = 0.25</div>
+    <div className="rounded-sm border border-fd-border px-2 py-1">lap 2 · x = 0.75</div>
+    <div className="rounded-sm border border-fd-border px-2 py-1">lap 3 · x = 1.25</div>
+    <div className="rounded-sm border border-fd-border px-2 py-1">lap 4 · x = 1.75</div>
+  </div>
+</Figure>
+
+### Sensing a critical point
+
+Choset's observation (§6.2.4) is that a critical point can be *felt*. A robot following an
+obstacle boundary at standoff $\delta$ knows the direction to the nearest obstacle point — its
+range ring's shortest ray — and that direction is $-\nabla D$, the negative of the distance
+gradient ([Chapter 7](/chapters/ch07-potential-functions), Derivation 2). The boundary normal is
+$\nabla m \parallel \nabla D$ there. So the rank condition of Derivation 3 becomes one angle
+comparison.
+
+<Derivation title="Critical points are sensed as 'shortest ray parallel to the sweep'" result="for h = x: the range ring's minimum ray points straight ahead or straight behind">
+**Statement.** While boundary-following, the robot is at a critical point of $h$ exactly when its
+range ring's global minimum ray points along $\pm\nabla h$ — for $h = x$, along $\pm\hat x$.
+
+**Step 1 — the ray is the normal.** The nearest obstacle point $c$ satisfies
+$x - c = D(x)\,\nabla D(x)$, and $\nabla D(x)$ is the outward normal of the boundary at $c$ (the
+offset curve's normal too).
+
+**Step 2 — rank loss is parallelism.** $D(h, m)$ loses rank iff $\nabla h \parallel \nabla m$
+(Lemma 5.5.2), i.e. iff the normal at $c$ is horizontal when $h = x$.
+
+**Step 3 — one comparison.** The minimum ray is $-\nabla D$, so the test is whether its bearing is
+$0$ or $\pi$. Equivalently: the follower's tangent is vertical, so its $x$-velocity changes sign —
+the boundary *turns back* in the sweep direction. $\blacksquare$
+
+*Classification from the same ray.* Moving $+x$, a turn-back with the shortest ray pointing *back*
+(obstacle behind, $\nabla D = +\hat x$) is a convex extremity bulging into the robot's path — a
+**merge**; with the ray pointing ahead it is a corner that pinches the slice off — a **death**.
+Moving $-x$ the same two cases are a **split** and a **birth**. *The port's sensing* (`online.rs`)
+watches the follower's $x$-progress and declares an event once it has fallen back by $0.3\delta$
+after a maximum; on a convex extremity it then steps along the arc of radius $\delta$ to the point
+level with the obstacle vertex, where the minimum ray is exactly horizontal, and re-reads the ring.
+The check finds the minimum ray within $0.01°$ of $\pm\hat x$ at every split and merge on the bench,
+and within a tenth of a degree — the general-position shear — in the sheared living room. *Degenerate critical
+points* are where Choset's sensing fails: along an axis-aligned wall the shortest ray is horizontal
+for the wall's whole length. The port's **merged-event rule** — beyond Choset — reports the
+stretch where the maximum $x$ was attained once, at its middle, so a vertical wall's two corner
+critical points become one event. *Why a raster scan misses them* (C Fig. 6.22): the test fires only
+on the boundary being followed, and a raster follows the ceiling only on every other gap.
+</Derivation>
+
+### The Reeb graph and Euler's count
+
+<KeyIdea title="Definitions — Reeb graph, closing critical point (Choset §6.2.4 [C ref. 154])">
+The **Reeb graph** of a Morse decomposition is its dual: a node per critical point, an edge per
+cell, joining the critical point where the cell opens to the one where it closes. It is connected
+and planar. While a robot covers a cell it starts from one of the cell's defining critical points;
+the other one — whose discovery completes the cell — is the cell's **closing critical point**.
+</KeyIdea>
+
+<LinkedMath>
+$$
+\htmlClass{term-graph}{N_{ce}} = \htmlClass{term-graph}{N_{cp}} + \htmlClass{term-obstacle}{N_{ob}} - 1
+\qquad\Longleftarrow\qquad
+\htmlClass{term-graph}{v} - \htmlClass{term-graph}{e} + f = 2,\quad v = N_{cp},\; e = N_{ce},\; f = \htmlClass{term-obstacle}{N_{ob}} + 1.
+$$
+</LinkedMath>
+
+<Derivation title="Euler's count: N_ce = N_cp + N_ob − 1" result="cells = critical points + obstacles − 1 (boustrophedon); a tree for brushfire">
+**Statement** (Choset §6.2.5). For a boustrophedon decomposition of a bounded planar free space,
+$N_{ce} = N_{cp} + N_{ob} - 1$, where the outer boundary's leftmost and rightmost points count as
+critical points (the slice's birth and death).
+
+**Step 1 — the Reeb graph is connected and planar**, with $v = N_{cp}$ and $e = N_{ce}$: draw each
+node at its critical point and each edge through its cell.
+
+**Step 2 — its faces are the obstacles plus the outside.** Each hole is encircled by the cells that
+pass above and below it, so it is a face; the unbounded face is the outside. $f = N_{ob} + 1$.
+
+**Step 3 — Euler's formula** for a connected plane graph [C ref. 57]: $v - e + f = 2$.
+
+**Step 4 — rearrange:** $N_{cp} - N_{ce} + N_{ob} + 1 = 2$. $\blacksquare$
+
+*Checks.* Choset Fig. 6.25: $21 + 2 - 1 = 22$ cells. The bench: $6 + 2 - 1 = 7$, with Reeb nodes at
+$x = 0, 2, 4, 6, 8.6, 10.4$. The check runs the sweep on 200 convex and 100 star-shaped seeded
+worlds and the identity never fails; cells grow *linearly* in the critical points discovered. *The
+same fact from the Morse side.* Chapter 8's box counts critical points with signs: for a manifold
+with boundary and $h = x$, $\chi(\Qfree)$ is the sum of $(-1)^{\mathrm{index}}$ over the boundary
+critical points where $\nabla h$ points *into* $\Qfree$ — births (index 0) and merges (index 1).
+On the bench that is $1 - 2 = -1 = 1 - N_{ob}$, and the check computes it with Chapter 8's
+`eulerCharacteristicFromCriticalPoints`. *Where the count changes form.* For the brushfire slice
+$h = D$ every obstacle boundary is a whole critical set at $D = 0$ — the fronts start *around* each
+obstacle rather than passing on both sides of it — so the obstacles are nodes, not faces, and the
+Reeb graph is a tree: $N_{ce} = N_{cp} - 1$ with each obstacle counted once among the critical
+points. The gallery's brushfire panel (6 critical points, 5 cells) is exactly that.
+</Derivation>
+
+### The complexity of coverage
+
+<Derivation title="Coverage path length is linear in area, critical points and perimeter" result="length < Δ²/2r + 4ΔN_ce + 5P_total = Δ²/2r + 4Δ(N_cp + N_ob) + 5P_total − 4Δ">
+**Statement** (Choset §6.2.5). The sensor-based boustrophedon coverage path is shorter than
+$\Delta^2/(2r) + 4\Delta N_{ce} + 5 P_{total}$, where $\Delta$ is the diameter of the smallest disk
+containing the space and $P_{total}$ the perimeter of the obstacles and the outer boundary.
+
+**Step 1 — laps.** Each lap is at most $\Delta$ long. At spacing $2r$ the laps across the space
+need about $\lceil \Delta/2r \rceil$ slice positions, plus one extra first lap per cell (C Fig.
+6.26): lap length $\le \Delta\lceil \Delta/2r \rceil + \Delta N_{ce}$, which is at most
+$\Delta^2/2r + \Delta N_{ce}$ up to the rounding Choset drops.
+
+**Step 2 — boundary following.** The cycle algorithm follows the whole floor and ceiling of each
+cell, and undoing a reverse follow retraces part of it: between $1.5 P_{cell}$ and $2 P_{cell}$ per
+cell (C Fig. 6.27), less than $2 P_{total}$ in all.
+
+**Step 3 — backtracking** to the closing critical point of a cell with uncovered neighbours: at
+most $P_{cell} + \Delta$ each, $P_{total} + \Delta N_{ce}$ in all (C Fig. 6.28).
+
+**Step 4 — discovery and traversal.** Discovering a cell's defining critical point costs at most
+$P_{cell}$ more ($P_{total}$ in all); a depth-first search over the Reeb graph traverses each
+covered cell at most once on the way to an uncovered one [C ref. 118], at most $P_{cell} + 2\Delta$
+each — $P_{total} + 2 N_{ce}\Delta$ in all (C Figs. 6.29–6.30).
+
+**Step 5 — sum:** $\Delta^2/2r + \Delta N_{ce} + 2P_{total} + P_{total} + \Delta N_{ce} + P_{total} +
+P_{total} + 2N_{ce}\Delta = \Delta^2/2r + 4\Delta N_{ce} + 5P_{total}$, and Euler's count turns
+$N_{ce}$ into $N_{cp} + N_{ob} - 1$. $\blacksquare$
+
+*How loose is it?* The bench has $\Delta = 11.908$ m and $P_{total} = 49.955$ m; at $2r = 0.5$ and
+$N_{ce} = 7$ the bound is $866.8$ m. The offline mower needs $158.4$ m and the online cycle
+algorithm $272.4$ m. In the living room ($\Delta = 4.899$, $P_{total} = 23.434$, $2r = 0.44$) the
+bound is $308.9$ m against $45.9$ m offline and $85.7$ m online. The bound is a guarantee of
+*linearity*, not an estimate. *One caution the port taught us:* the lap *count*
+$\lceil \Delta/2r \rceil + N_{ce}$ is not a bound when cells are stacked — the bench's mower uses 32
+laps where the formula allows 31, because the cells above and below each obstacle each need their
+own laps at the same abscissae. What the argument needs, and what holds, is the lap *length*:
+stacked laps share one slice, whose total length is at most $\Delta$.
+</Derivation>
+
+How much can a lawnmower *miss*? Inside a cell with floor $f(x)$ and ceiling $c(x)$, the laps sit
+at most $r$ apart horizontally from every point, so a point $(x, y)$ escapes its nearest lap at
+$x_j$ only if $y < f(x_j)$ or $y > c(x_j)$ — a sliver under a dip of the floor or over a bump of the
+ceiling, of height at most the variation of $f$ or $c$ between $x_j$ and $x$. Integrating over the
+half-gaps gives a bound that is *not* in Choset, and that the check holds the mower to:
+
+$$
+\text{missed area} \;\le\; r \sum_{\text{cells}} \big( \mathrm{TV}(f) + \mathrm{TV}(c) \big) \;\le\; r\, P_{total},
+$$
+
+with $\mathrm{TV}$ the total vertical variation of a chain. On the bench it is $6.150$ m², and the
+mower misses $0.67$ m² (98.7 % covered on a 3 cm raster) — all of it under the slanted edges of
+the plot and of $T$ and $K$. In the rectilinear living room the bound is $2.350$ m² and the mower
+misses almost nothing ($99.87$ %, the octagonal corners of the furniture). The online coverer,
+which follows *both* floor and ceiling of every gap, covers $100.0$ % in all three worlds.
+
+### Coda: decomposing by information — pursuit and evasion
+
+The last decomposition in Choset Chapter 6 is carved by visibility, not by a sweep, and it is a
+workspace problem: the pursuers and the evader are points in $\W_{free}$, not configurations of a
+robot (C Problem 7).
+
+<KeyIdea title="Definitions — visibility polygon, gap edges, information state (Choset §6.3, after Suzuki & Yamashita [C ref. 403] and LaValle, Guibas et al. [C refs. 172, 273])">
+The **visibility polygon** $V(x) \subset \W_{free}$ is the star-shaped set of points in line of
+sight of $x$. An evader $e(t)$ is caught at the first $t$ with $e(t) \in V(\gamma_i(t))$ for some
+pursuer path $\gamma_i$. A region that may contain the evader is **contaminated**, otherwise
+**clear**; cleared and then contaminated again is **recontaminated**. Edges of $V(x)$ that lie in
+free space are **gap edges**, labelled 0 if they bound a clear region and 1 if contaminated; $B(x)$
+is the vector of labels and $(x, B(x))$ the **information state**. A connected set on which the gap
+structure — hence $B(x)$ — cannot change is **conservative**; conservative regions form an exact
+cell decomposition. $H(\W_{free})$ is the least number of pursuers that guarantees capture.
+</KeyIdea>
+
+Crossing from one conservative region to another changes the gaps in one of four ways, and the
+labels follow (Choset §6.3): a gap edge **disappears** — do nothing; a gap edge **appears** —
+label it 0, since what it now hides was just visible; gap edges **merge** — the new label is the OR
+of the old; a gap edge **splits** — the pieces inherit its label. The **information graph** $G_i$
+has a node per (conservative region, label vector) and an edge per transition the rules allow; a
+pursuer strategy is a path in $G_i$ to any node whose labels are all zero.
+
+<Derivation title="How many pursuers: O(log n), and O(√h + log n) with holes" result="H(W_free) ≤ k + 1 when a chord held by one static pursuer splits W_free into parts needing k">
+**Statement** (Choset §6.3). A simply connected polygonal $\W_{free}$ with $n$ edges can be cleared
+by $O(\log n)$ pursuers; with $h$ holes, by $O(\sqrt h + \log n)$.
+
+**Step 1 — a static pursuer splits the problem.** If a chord between two boundary vertices splits
+$\W_{free}$ into $\W_1$ and $\W_2$ with $H(\W_1), H(\W_2) \le k$, then $H(\W_{free}) \le k + 1$:
+park one "static pursuer" on the chord and clear $\W_1$, then $\W_2$, with the same $k$.
+
+**Step 2 — balanced chords give logarithmic depth.** A simple polygon has a chord leaving at least a
+third of the edges on each side, so recursive splitting reaches triangles (clearable by one
+pursuer) after $O(\log n)$ levels, each holding one static pursuer.
+
+**Step 3 — holes.** Triangulate; remove the $O(h)$ trichromatic triangles (those touching three
+boundary components), which leaves simply connected pieces; the dual graph of the trichromatic
+triangles is planar, so the planar separator theorem splits it with $O(\sqrt h)$ static pursuers.
+
+**Step 4 — recurse:** $O(\sqrt h + \sqrt{2h/3} + \dots) = O(\sqrt h)$ static pursuers, plus
+$O(\log n)$ for the simply connected pieces. $\blacksquare$
+
+*The U-worlds of C Fig. 6.40* make the logarithm tight: a 12-edge U needs one pursuer, three U's
+joined at a hub (36 edges) need two, and so on by threes. The coda's worlds are miniatures of that
+construction — a square hub with two or three U-shaped pockets (20 and 28 edges) — and the widget
+below runs the information-graph search on them.
+</Derivation>
+
+<Deferred>
+  <PursuitEvasion />
+</Deferred>
+
+The port computes $V(x)$ by an angular sweep — one exact ray through every vertex and one a hair to
+either side — and the check compares it with 1 800 brute-force rays at each of 24 random points in
+three worlds: the largest disagreement is below $10^{-13}$ m. Contamination is kept on an
+$12.5$ cm raster: what the pursuers see is cleared, and contamination then floods every hidden
+pixel connected to a contaminated one, because the evader is arbitrarily fast. The four transition
+rules are not coded; they *emerge* from the flood, and the gap labels are read off it. The
+conservative regions are computed by grouping pixels by which polygon vertices they cannot see (plus,
+with a static pursuer, the corners of its view) — a refinement of Choset's regions, since $B(x)$
+cannot change while that set is fixed — and labels are
+carried across a region boundary by overlap: a shadow on the far side is contaminated iff it
+overlaps a contaminated shadow on the near side. Breadth-first search on the resulting $G_i$ finds
+a strategy for the two-pocket world after 286 information states, and the replay through the flood
+leaves nothing contaminated. In the three-pocket world it exhausts all 693 reachable states without
+an all-zero node — one pursuer *cannot* do it — while a second pursuer parked at the hub (the static
+pursuer of Step 1) brings a solution after 2 480 states, which the replay confirms. The naive patrol
+the widget shows instead — visit each pocket's far leg in turn — leaves 10.25 m² contaminated: every
+pocket it clears is recontaminated through the hub while it clears the next.
+
+## The algorithm
+
+<Algorithm
+  name="TRAPEZOIDAL SWEEP  —  Choset §6.1, Fig. 6.4"
+  inputs="a polygonal free space in general position (boundary and holes)"
+  outputs="trapezoids, the adjacency graph with one edge per vertical extension"
+  complexity="O(n log n) with L a balanced tree (the port: a sorted array, O(n) per update)"
+>
+1. sort the vertices by $x$; $L \leftarrow \emptyset$; open cells keyed by their floor edge
+2. **for** each vertex $v$ in order **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;$e_{lower}, e_{upper}$ ← the edges at $v$; $e_{LOWER}, e_{UPPER}$ ← the edges of $L$ just below and above $v$
+4. &nbsp;&nbsp;&nbsp;&nbsp;**if** both edges go right: insert both; **if** free above and below — *split*: close the cell between $e_{LOWER}$ and $e_{UPPER}$, open two — **else** *birth*: open one between them
+5. &nbsp;&nbsp;&nbsp;&nbsp;**if** both edges go left: delete both; **if** free above and below — *merge*: close two, open one — **else** *death*: close the cell between them
+6. &nbsp;&nbsp;&nbsp;&nbsp;**else** replace the leaving edge by the arriving one; close the cell whose floor or ceiling it was and open its continuation
+7. &nbsp;&nbsp;&nbsp;&nbsp;draw the extensions from $v$ to $e_{UPPER}$ and $e_{LOWER}$ that lie in free space; each joins the closed cell to the opened one
+8. **end for**
+
+*Boustrophedon* is the same loop with one change: at a pass-through (step 6) the cell is not closed
+— the vertex is appended to its floor or ceiling chain — so walls appear only at births, splits,
+merges and deaths, the critical points of $h = x$.
+</Algorithm>
+
+<Algorithm
+  name="BOUSTROPHEDON COVERAGE (OFFLINE)  —  Choset §6.2.1, Fig. 6.10"
+  inputs="a boustrophedon decomposition, effector width 2r, a start point"
+  outputs="a coverage path: laps, boundary steps, transits"
+  complexity="O(V + E) for the walk; one A* per transit; O(laps) per cell"
+>
+1. exhaustive walk: depth-first search of the adjacency graph from the start cell, with backtracking — on the bench $0-1-3-2-3-4-6-5-6-4-3-1-0$; cover cells in first-visit order
+2. **for** each cell $c = [x_l, x_r]$ in that order **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;laps at $\lceil (x_r - x_l)/2r \rceil$ abscissae, the outer ones $r$ inside the ends, the rest evenly spaced
+4. &nbsp;&nbsp;&nbsp;&nbsp;enter at the corner nearest the robot; transit there by A\* on the *trapezoids* with midpoint–centroid chaining
+5. &nbsp;&nbsp;&nbsp;&nbsp;lap floor → ceiling, step along the ceiling to the next lap, lap ceiling → floor, step along the floor, …
+6. **end for**
+</Algorithm>
+
+<Algorithm
+  name="CYCLE ALGORITHM (SENSOR-BASED COVERAGE)  —  Choset §6.2.4, Fig. 6.23 [C ref. 11]"
+  inputs="a robot with a contact sensor, a boundary follower at standoff δ, a range ring; effector width 2r"
+  outputs="a coverage path and the Reeb graph, built incrementally"
+  complexity="online; path length within the bound of Derivation 6"
+>
+1. **seek**: move −x to contact, follow the boundary −x until a turn-back — the first critical point; push it on the DFS stack
+2. **while** some node on the stack has an unexplored side **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;travel to it over covered ground (A\* on the robot's own trail plus range-ring line-of-sight shortcuts); step $r - \delta$ into the new cell
+4. &nbsp;&nbsp;&nbsp;&nbsp;**repeat** for each gap between laps $x_k$ and $x_{k+1} = x_k + 2r$:
+5. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*forward*: follow the boundary the last lap ended on, forward, one lap width (stop at a turn-back event)
+6. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;lap to the other boundary; *reverse*: follow it backward one lap width (stop at an event)
+7. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*closing*: if that did not return to the previous lap's far end, lap toward it and follow forward to the critical point that explains why
+8. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*undo*: retrace the reverse follow; **until** an event closes the cell
+9. &nbsp;&nbsp;&nbsp;&nbsp;classify the event from the range ring (split, merge, birth, death); match it to a known node or add one; mark the arriving side explored; for a split or merge, drive one full lap through it (the closing lap)
+10. **end while**
+
+A *raster scan* is steps 5 and the first half of 6 alone — lap, follow forward, lap, follow
+forward on the other side — which is why it never follows a ceiling backward and never sees a split.
+</Algorithm>
+
+<Algorithm
+  name="INFORMATION-GRAPH SEARCH  —  Choset §6.3, Figs. 6.38–6.39"
+  inputs="a polygonal W_free, a pursuer start (optionally a static second pursuer)"
+  outputs="a pursuer path whose information state reaches all zeros, or proof that none exists"
+  complexity="BFS over (region, labels): O(regions · 2^gaps) nodes in the worst case"
+>
+1. conservative regions: group free points by the set of vertices they cannot see; regions are the connected components
+2. start node: the start's region, every label 1 (everything unseen is contaminated)
+3. **for** each crossing $A \to B$: compute the shadows (hidden components) just inside $A$ and just inside $B$; a shadow in $B$ is contaminated iff it overlaps a contaminated shadow in $A$ — rules 1–4 of §6.3
+4. breadth-first search to any node with all labels 0; replay the region path through the contamination flood to confirm
+</Algorithm>
+
+## Implementation in Rust
+
+The `cells` crate is introduced here. Its spine is a decomposition — cells with floor and ceiling
+chains, and the adjacency graph as a `petgraph` graph whose edges carry the shared wall — and every
+algorithm above produces or consumes one.
+
+```rust title="crates/cells/src/lib.rs"
+use nalgebra::Point2;
+use petgraph::graph::UnGraph;
+
+/// A planar polygonal free space: Choset §6.1's standing assumption. For disc-Rusty the
+/// polygons are Chapter 4 C-obstacles; for Reach's pad they are the Workbench's objects.
+#[derive(Clone, Debug)]
+pub struct PolyWorld {
+    pub boundary: Vec<Point2<f64>>,       // counter-clockwise
+    pub obstacles: Vec<Vec<Point2<f64>>>, // holes, counter-clockwise, disjoint
+}
+
+/// The wall two adjacent cells share: a vertical extension from an event vertex.
+#[derive(Clone, Copy, Debug)]
+pub struct Boundary {
+    pub segment: (Point2<f64>, Point2<f64>),
+}
+
+/// A cell: everything between a floor chain and a ceiling chain over an x-interval.
+/// Trapezoids have two-point chains; boustrophedon cells bend at pass-through vertices.
+#[derive(Clone, Debug)]
+pub struct Cell {
+    pub floor: Vec<Point2<f64>>,
+    pub ceiling: Vec<Point2<f64>>,
+    pub x_range: (f64, f64),
+}
+
+pub struct Decomposition {
+    pub cells: Vec<Cell>,
+    pub adjacency: UnGraph<usize, Boundary>,
+}
+
+impl Decomposition {
+    /// Faces of the planar adjacency graph by Euler, f = 2 − V + E: the holes plus the outside.
+    pub fn euler_faces(&self) -> i64 {
+        2 - self.adjacency.node_count() as i64 + self.adjacency.edge_count() as i64
+    }
+}
+
+impl PolyWorld {
+    /// Choset assumes distinct vertex abscissae; a rectilinear room violates that on every wall.
+    /// The shear x ← x + σy keeps edges straight and polygons simple, and moves nothing by more
+    /// than σ·height — a few millimetres in a room of the Apartment.
+    pub fn in_general_position(mut self) -> Self {
+        const SIGMA: f64 = 1.0e-3 * std::f64::consts::SQRT_2;
+        let mut xs: Vec<f64> = self.vertices().map(|p| p.x).collect();
+        xs.sort_by(f64::total_cmp);
+        if xs.windows(2).all(|w| w[1] - w[0] > 1e-7) {
+            return self;
+        }
+        for p in self.vertices_mut() {
+            p.x += SIGMA * p.y;
+        }
+        self
+    }
+}
+```
+
+The sweep keeps $L$ as a vector sorted by height at the current abscissa — the bookkeeping is
+easier to read than a tree keyed by a moving comparator, and the event logic is the same. The
+interesting part is the `match`, which is Choset Fig. 6.4.
+
+```rust title="crates/cells/src/trapezoid.rs" {24-48}
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind { BothRight, BothLeft, LowerLeftUpperRight, LowerRightUpperLeft }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rule { Trapezoidal, Boustrophedon }
+
+pub fn sweep(world: &PolyWorld, rule: Rule) -> Decomposition {
+    let edges = world.edges();
+    let mut events: Vec<Vertex> = world.vertex_list();
+    events.sort_by(|a, b| a.p.x.total_cmp(&b.p.x));
+    assert!(events.windows(2).all(|w| w[1].p.x > w[0].p.x), "general position: distinct x");
+
+    let mut l: Vec<usize> = Vec::new();                     // crossed edges, bottom to top
+    let mut open: HashMap<usize, OpenCell> = HashMap::new(); // open cells keyed by floor edge
+    let mut out = Builder::new(rule);
+
+    for v in &events {
+        let (e_prev, e_next) = world.incident_edges(v);
+        let rest: Vec<usize> = l.iter().copied().filter(|&e| e != e_prev && e != e_next).collect();
+        // e_LOWER and e_UPPER: one search at v's height, because every update happens there.
+        let i = rest.partition_point(|&e| edges[e].y_at(v.p.x) < v.p.y);
+        let (lo, up) = (i.checked_sub(1).map(|j| rest[j]), rest.get(i).copied());
+        let (free_up, free_down) = world.free_vertical(v); // the extensions that exist
+        match world.event_kind(v) {
+            EventKind::BothRight => {
+                let (a, b) = world.order_rightward(v, e_prev, e_next); // lower edge first
+                l = [&rest[..i], &[a, b], &rest[i..]].concat();
+                if free_up && free_down {
+                    // Split: the slice interval (lo, up) is cut by the new obstacle.
+                    let c = open.remove(&lo.unwrap()).unwrap();
+                    out.close(c, v.p.x);
+                    out.open_two(&mut open, (lo.unwrap(), a), (b, up.unwrap()), v, true);
+                } else {
+                    out.open(&mut open, a, b, v); // birth: free space starts between a and b
+                }
+            }
+            EventKind::BothLeft => {
+                let (a, b) = world.order_leftward(v, e_prev, e_next);
+                l = rest;
+                if free_up && free_down {
+                    let (below, above) = (open.remove(&lo.unwrap()).unwrap(), open.remove(&b).unwrap());
+                    out.merge(below, above, &mut open, lo.unwrap(), up.unwrap(), v); // merge
+                } else {
+                    out.close(open.remove(&a).unwrap(), v.p.x); // death
+                }
+            }
+            _ => {
+                // One edge leaves the line, the other arrives in its slot.
+                let (leaving, arriving) = world.left_right(v, e_prev, e_next);
+                for e in l.iter_mut() {
+                    if *e == leaving { *e = arriving; }
+                }
+                let floor_side = free_up; // v lies on the floor of the cell above it
+                out.pass_through(&mut open, v, leaving, arriving, floor_side, lo, rule);
+            }
+        }
+    }
+    out.finish()
+}
+```
+
+The Morse layer adds the slice function and the Reeb graph. For $h = x$ the boustrophedon
+decomposition *is* the sweep with `Rule::Boustrophedon`; the trait is there so that the variable
+slices of §6.2.3 share one interface (the raster construction behind the gallery implements it for
+the curved ones).
+
+```rust title="crates/cells/src/morse.rs · src/reeb.rs"
+use nalgebra::{Point2, Vector2};
+use petgraph::graph::UnGraph;
+
+pub trait SliceFn {
+    fn h(&self, q: Point2<f64>) -> f64;
+    fn grad_h(&self, q: Point2<f64>) -> Vector2<f64>;
+}
+pub struct Vertical;
+impl SliceFn for Vertical {
+    fn h(&self, q: Point2<f64>) -> f64 { q.x }
+    fn grad_h(&self, _: Point2<f64>) -> Vector2<f64> { Vector2::x() }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind { Birth, Split, Merge, Death }
+
+#[derive(Clone, Copy, Debug)]
+pub struct CriticalPoint { pub q: Point2<f64>, pub kind: Kind }
+
+/// Nodes are critical points, edges are cells (the dual of the adjacency graph).
+pub struct ReebGraph { pub graph: UnGraph<CriticalPoint, usize> }
+
+impl ReebGraph {
+    /// Euler's count for a boustrophedon decomposition: e = v + N_ob − 1.
+    pub fn euler_check(&self, n_obstacles: usize) -> bool {
+        self.graph.edge_count() + 1 == self.graph.node_count() + n_obstacles
+    }
+
+    /// χ(Q_free) from Chapter 8's Morse count with boundary: births (index 0) and merges
+    /// (index 1) are the boundary critical points where ∇h points into the free space.
+    pub fn morse_chi(&self) -> i64 {
+        self.graph.node_weights().map(|c| match c.kind {
+            Kind::Birth => 1,
+            Kind::Merge => -1,
+            Kind::Split | Kind::Death => 0,
+        }).sum()
+    }
+}
+
+pub fn boustrophedon(world: &PolyWorld) -> (Decomposition, ReebGraph) {
+    let d = sweep(world, Rule::Boustrophedon);
+    let reeb = ReebGraph::from_cells(&d); // one node per critical event, one edge per cell
+    (d, reeb)
+}
+```
+
+Coverage: the exhaustive walk is a DFS, the laps are a closed-form set of abscissae, and the
+transits are Chapter 6's A\* on the trapezoids.
+
+```rust title="crates/cells/src/coverage.rs" {7-15}
+pub struct CoveragePath {
+    pub points: Vec<Point2<f64>>,
+    pub laps: usize,
+    pub lap_len: f64, pub boundary_len: f64, pub transit_len: f64,
+}
+
+/// ⌈width/2r⌉ laps, the outer ones r inside the cell's ends: every point of the cell is
+/// within r of a lap horizontally, which is what the missed-area bound needs.
+pub fn lap_xs(x_l: f64, x_r: f64, two_r: f64) -> Vec<f64> {
+    let n = ((x_r - x_l) / two_r - 1e-9).ceil().max(1.0) as usize;
+    if n == 1 { return vec![0.5 * (x_l + x_r)]; }
+    let r = 0.5 * two_r;
+    let step = (x_r - x_l - two_r) / (n - 1) as f64;
+    (0..n).map(|k| x_l + r + k as f64 * step).collect()
+}
+
+pub fn coverage_path(d: &Decomposition, world: &PolyWorld, two_r: f64, start: Point2<f64>) -> CoveragePath {
+    let trapezoids = sweep(world, Rule::Trapezoidal); // convex: safe transits (Derivation 2)
+    let order = dfs_first_visits(&d.adjacency, d.locate(start).unwrap_or(0));
+    let mut path = PathBuilder::at(start);
+    for c in order {
+        let cell = &d.cells[c];
+        let xs = lap_xs(cell.x_range.0, cell.x_range.1, two_r);
+        let pattern = Lawnmower::new(cell, &xs).entered_nearest(path.here());
+        path.transit(&trapezoids, pattern.first()); // A* + midpoint–centroid chaining
+        path.extend(pattern);
+    }
+    path.finish()
+}
+
+/// Δ²/2r + 4ΔN_ce + 5P_total — Choset §6.2.5.
+pub fn bound(world: &PolyWorld, two_r: f64, n_cells: usize) -> f64 {
+    let delta = world.min_enclosing_circle().radius * 2.0;
+    delta * delta / two_r + 4.0 * delta * n_cells as f64 + 5.0 * world.total_perimeter()
+}
+```
+
+The online coverer is a state machine around Chapter 3's follower. Its `tick` advances one motion
+primitive and returns the phase, so the widget and a test harness drive the same code.
+
+```rust title="crates/cells/src/online.rs" {20-38}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase { Forward, Reverse, Closing, Backtrack, Done }
+
+pub struct Coverer<'r> {
+    pub robot: &'r mut sim::Rusty,
+    pub reeb: ReebGraph,
+    pub two_r: f64,
+    pub phase: Phase,
+    gap_start: Point2<f64>,   // where the current gap's first lap began
+    far_end: Point2<f64>,     // the previous lap's other end, T_k
+    best_progress: f64,       // max x-progress along the current follow
+}
+
+impl Coverer<'_> {
+    /// One step of the cycle algorithm. Critical points come from the range ring alone.
+    pub fn tick(&mut self, scan: &bugs::RangeScan, dt: f64) -> Phase {
+        let progress = self.sweep_dir() * (self.robot.pose().x - self.gap_start.x);
+        self.best_progress = self.best_progress.max(progress);
+        // Derivation 4: the boundary turned back ⇔ the tangent went vertical ⇔ the minimum
+        // ray was parallel to the sweep. Classify by where that ray points.
+        if self.following() && progress < self.best_progress - 0.3 * self.standoff() {
+            let g = scan.gradient();                        // ∇D = −(minimum ray)
+            let convex = g.x * self.moving_dir() > 0.3;
+            let node = self.reeb.add_or_match(self.robot.position(), self.classify(convex));
+            self.close_cell(node);
+            self.phase = Phase::Backtrack;                  // DFS picks the next unexplored edge
+            return self.phase;
+        }
+        self.phase = match self.phase {
+            Phase::Forward if progress >= self.two_r => { self.lap_to_other_side(); Phase::Reverse }
+            Phase::Reverse if progress <= 0.0 => {
+                if (self.robot.position() - self.far_end).norm() > self.close_tol() {
+                    self.lap_toward(self.far_end);          // an obstacle lies between: find why
+                    Phase::Closing
+                } else {
+                    self.undo_reverse();                    // retrace, then the next gap
+                    Phase::Forward
+                }
+            }
+            Phase::Backtrack => self.travel_to_next_unexplored(),
+            p => { self.robot.follow_boundary(dt); p }
+        };
+        self.phase
+    }
+}
+```
+
+Pursuit is short once visibility is exact: a polygon from rays, and a BFS whose transitions carry
+labels by overlap.
+
+```rust title="crates/cells/src/pursuit.rs"
+pub fn visibility_polygon(world: &PolyWorld, x: Point2<f64>) -> Vec<Point2<f64>> {
+    const EPS: f64 = 1e-5;
+    let mut bearings: Vec<f64> = world.vertices()
+        .flat_map(|v| { let a = (v.y - x.y).atan2(v.x - x.x); [a - EPS, a, a + EPS] })
+        .collect();
+    bearings.sort_by(f64::total_cmp);
+    bearings.into_iter().map(|a| x + world.ray_cast(x, a) * Vector2::new(a.cos(), a.sin())).collect()
+}
+
+pub struct InfoState { pub cell: usize, pub labels: Vec<u8> }
+
+/// BFS on G_i from (start region, all ones) to any all-zero node — Choset Fig. 6.39.
+pub fn clear(world: &PolyWorld, start: Point2<f64>, static_pursuer: Option<Point2<f64>>) -> Option<Vec<usize>> {
+    let regions = conservative_regions(world, static_pursuer);
+    let s0 = InfoState { cell: regions.locate(start)?, labels: regions.all_contaminated(start) };
+    bfs(s0, |s| regions.crossings(s.cell).map(|t| t.carry(&s.labels)), |s| s.labels.iter().all(|&b| b == 0))
+}
+```
+
+### The worked example, and its printed output
+
+```rust title="crates/cells/examples/workbench_counts.rs"
+fn main() {
+    let bench = PolyWorld::bench(); // B, T, K of the §3 micro-example
+    let t = sweep(&bench, Rule::Trapezoidal);
+    println!("trapezoidal: {} cells, {} adjacency edges, euler faces = {}",
+             t.cells.len(), t.adjacency.edge_count(), t.euler_faces());
+    let (b, reeb) = boustrophedon(&bench);
+    println!("boustrophedon: {} critical points, {} cells, reeb nodes = {}, reeb edges = {}, euler_check = {}",
+             reeb.graph.node_count(), b.cells.len(), reeb.graph.node_count(),
+             reeb.graph.edge_count(), reeb.euler_check(bench.obstacles.len()));
+    println!("morse chi = {}", reeb.morse_chi());
+    println!("laps in cell 0 at 2r = 0.5: {}", lap_xs(0.0, 2.0, 0.5).len());
+}
+
+#[test]
+fn workbench_counts_match_text() {
+    let bench = PolyWorld::bench();
+    let t = sweep(&bench, Rule::Trapezoidal);
+    assert_eq!((t.cells.len(), t.adjacency.edge_count(), t.euler_faces()), (12, 13, 3));
+    let (b, reeb) = boustrophedon(&bench);
+    assert_eq!((reeb.graph.node_count(), b.cells.len()), (6, 7));
+    assert!(reeb.euler_check(2));
+    assert_eq!(lap_xs(0.0, 2.0, 0.5), vec![0.25, 0.75, 1.25, 1.75]);
+}
+```
+
+```text title="cargo run -p cells --example workbench_counts"
+trapezoidal: 12 cells, 13 adjacency edges, euler faces = 3
+boustrophedon: 6 critical points, 7 cells, reeb nodes = 6, reeb edges = 7, euler_check = true
+morse chi = -1
+laps in cell 0 at 2r = 0.5: 4
+```
+
+```rust title="crates/cells/examples/mow_apartment.rs · pursue_u.rs"
+fn main() {
+    let room = PolyWorld::living_room().in_general_position(); // Room C, sofa and coffee table
+    let (d, _) = boustrophedon(&room);
+    let start = Point2::new(9.0, 0.8);
+    let off = coverage_path(&d, &room, 0.44, start);
+    println!("offline: length {:.2} m, covered {:.2} %", off.length(), 100.0 * covered(&room, &off.points, 0.22, 0.03));
+    for policy in [Policy::Cycle, Policy::Raster] {
+        let run = Coverer::run(&room, start, 0.44, policy);
+        println!("{policy:?}: length {:.2} m, covered {:.2} %, {} critical points, bound {:.1} m",
+                 run.length(), 100.0 * covered(&room, &run.points, 0.22, 0.03),
+                 run.reeb.graph.node_count(), bound(&room, 0.44, run.reeb.graph.edge_count()));
+    }
+}
+```
+
+```text title="cargo run -p cells --example mow_apartment  ·  --example pursue_u"
+offline: length 45.86 m, covered 99.87 %
+Cycle: length 85.74 m, covered 100.00 %, 6 critical points, bound 308.9 m
+Raster: length 21.70 m, covered 79.66 %, 2 critical points, bound 191.3 m
+
+two pockets (20 edges), 1 pursuer: cleared after 286 information states
+three pockets (28 edges), 1 pursuer: no all-zero node in 693 states
+three pockets (28 edges), 2 pursuers (one static at the hub): cleared after 2480 states
+```
+
+The tests pin all of these: `workbench_counts_match_text` as above; `euler_holds_on_random_worlds`
+asserts $N_{ce} = N_{cp} + N_{ob} - 1$ and $V + N_{ob} - 1$ trapezoids on 300 seeded worlds;
+`coverage_is_complete` asserts `covered == 100 %` at a 3 cm raster and `length <= bound` for the
+cycle algorithm in the living room, on the Workbench top and on the bench. Every number above is
+reproduced by the TypeScript port that runs this page, and the chapter's checks hold it to the
+printed digits.
+
+## Putting it together: three free spaces, three mowers
+
+The integration lab covers three free spaces three ways: **offline** (the map is known: sweep,
+walk, mow), **online** with the cycle algorithm (the map is unknown: sense, mow, build the Reeb
+graph), and online with a conventional **raster** scan. The living room is mowed by disc-Rusty
+with its own diameter as effector; the Workbench top is wiped by Reach's end-effector pad, 20 cm
+wide, around the block, the post and the shelf (reachability is ignored here — Chapter 4 maps it);
+the bench is the §3 micro-world.
+
+| world, effector | method | length | covered | critical points / cells | bound |
+|---|---|---|---|---|---|
+| living room, $2r = 0.44$ | offline | 45.86 m | 99.87 % | 6 / 7 | 308.9 m |
+| | cycle | 85.74 m | 100.00 % | 6 / 7 | 308.9 m |
+| | raster | 21.70 m | 79.66 % | 2 / 1 | — |
+| Workbench top, $2r = 0.2$ | offline | 170.21 m | 99.98 % | 8 / 10 | 631.2 m |
+| | cycle | 264.41 m | 100.00 % | 8 / 10 | 631.2 m |
+| | raster | 212.86 m | 99.95 % | 4 / 5 | — |
+| bench, $2r = 0.5$ | offline | 158.44 m | 98.70 % | 6 / 7 | 866.8 m |
+| | cycle | 272.40 m | 100.00 % | 6 / 7 | 866.8 m |
+| | raster | 190.09 m | 86.36 % | 4 / 5 | — |
+
+Three things to read off the table. *Knowing the map is worth a factor of 1.5 to 1.9 in length*:
+the cycle algorithm follows both boundaries of every gap and retraces its reverse follows, drives a
+closing lap through every split and merge, and travels between cells over ground it has already
+covered rather than along the shortest route. *Not knowing it costs
+nothing in coverage* — the cycle algorithm is the only method at 100 % everywhere, because it
+follows both the floor and the ceiling of every gap, while the offline lawnmower misses the slivers
+the missed-area bound allows. *A raster scan's failure is not a constant*: on the Workbench its
+lucky phase finds the merges that matter and it misses 0.05 %; in the living room it misses a
+fifth of the room. A method whose completeness depends on the phase of its laps is not complete.
+
+Part II closes here, and its scorecard is worth stating. Every planner in Chapters 6–10 is
+**complete** — it finds a path when one exists and says so when none does — and most are
+**exact**: the visibility graph, the GVD, Canny's roadmap, the cell decompositions represent
+$\Qfree$ without approximation. The price is dimension. A trapezoidal sweep is $O(n \log n)$ in
+the plane; Canny's roadmap is singly exponential in the dimension of $\Q$; the decompositions of
+this chapter have no practical analogue for Reach's six-joint cousins. [Chapter 11](/chapters/ch11-prm)
+gives the guarantee up for a probabilistic one and gets the dimension back: it will measure its
+roadmaps against exactly the kind of decomposition built here, on spaces small enough for both.
+[Chapter 14](/chapters/ch14-many-bodies) reuses the adjacency graph as the discrete layer of task
+planning, and the sister book's [exploration chapter](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch24-exploration)
+replaces the coverage of a *known-to-be-there* space with the coverage of an unknown one under a
+belief — frontiers instead of critical points.
+
+<Callout type="info">
+Two modern pointers, both surveys. Galceran and Carpin (2013) organize coverage path planning since
+Choset's survey of 2001 — cellular decompositions, grid-based methods, multi-robot coverage — and
+are the place to start for anything beyond this chapter. Choset's own 2001 survey is the bridge from
+the boustrophedon decomposition to the Morse decompositions and sensor-based coverage of §6.2.
+</Callout>
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="Counting trapezoids, convex or not">
+    (a) Derive the trapezoid count $(m - 1) + \sum_i (k_i + 1)$ for a convex $m$-gon boundary with
+    convex $k_i$-gon holes in general position, by counting the cells each vertex opens. (b) Now
+    notch $K$: replace it by $(6, 1), (8.6, 0.8), (7.3, 2.4), (8.8, 4), (6.5, 4.4)$, whose vertex
+    $(7.3, 2.4)$ is reflex and is the tip of a notch opening to the right. Classify every vertex
+    of the notched $K$ (split, merge, birth, death, pass) and count again. (c) Prove the general
+    rule: trapezoids $= V + \#\text{split} - \#\text{death}$, and
+    $\#\text{split} - \#\text{death} = N_{ob} - 1$ for every polygonal free space in general
+    position, so the count is always $V + N_{ob} - 1$ — reflex vertices do not break it.
+    <CheckAnswer
+      id="ch10.e1"
+      prompt="How many trapezoids does the bench have with the notched K (five vertices)? (The sweep in this chapter's code agrees with your count.)"
+      answer={13}
+      tolerance={0}
+    >
+    $V = 4 + 3 + 5 = 12$, $N_{ob} = 2$: $12 + 2 - 1 = 13$. Per vertex, the notched $K$ has a split
+    at $(6, 1)$ (+2), a pass-through at $(6.5, 4.4)$ (+1), a *birth* at the notch tip $(7.3, 2.4)$
+    (+1: free space starts between two edges that both leave to the right), and *merges* at both
+    lips $(8.6, 0.8)$ and $(8.8, 4)$ (+1 each) — six, the same as a convex pentagon's $k + 1$. The
+    boustrophedon decomposition changes more: $N_{cp} = 8$, $N_{ce} = 9 = 8 + 2 - 1$.
+    </CheckAnswer>
+    <Hints>
+      <>Count cells *opened* at each event: split 2, birth 1, pass 1, merge 1, death 0. So trapezoids = V + #split − #death.</>
+      <>Along one closed boundary loop the local minima and maxima of x alternate, so #split + #birth = #merge + #death on every loop.</>
+      <>Derivation 5's Morse count says #birth − #merge = χ(Q_free) = 1 − N_ob. Combine with the previous hint summed over loops.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Where a critical point can sit">
+    Prove that a critical point cannot lie in the interior of a slice interval (Choset §6.2.2): at
+    an interior point the slice meets $\Qfree$ on both sides. Then, for the squarel
+    $h = |x| + |y|$, show that a corner of the diamond $\{h = \lambda\}$ touching an obstacle
+    vertex is a critical point exactly when the obstacle's normal cone at that vertex meets the
+    convex hull of the normals of the two flat sides meeting at the corner (C §6.2.3) — the
+    generalized-gradient condition of Chapter 9.
+    <Hints>
+      <>A point of ∂Q_free cannot be in the interior of an interval of Q_free,λ: intervals are open in the slice, and their endpoints are where the slice leaves the free space.</>
+      <>At a corner of the diamond the generalized gradient of h is the convex hull of the two one-sided gradients, e.g. (1, 1) and (1, −1) at the right corner.</>
+      <>Criticality is "0 in the generalized gradient of h restricted to the boundary", i.e. some element of ∂h is parallel to some normal of the obstacle at the point.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict, then drag">
+    <Predict
+      id="ch10.e3"
+      question="In the Boustrophedon Mower (bench), drag the triangle's top vertex from (3, 4) down to (3, 1.6), just below the chord from (2, 2) to (4, 1.5). Before releasing: what happens to the two cell counts, trapezoidal 12 and boustrophedon 7?"
+      options={[
+        { label: 'Trapezoidal drops to 11, boustrophedon stays 7', because: 'The vertex does not lose its extension: it still has free space on one side. What changes is which side — its extension now points down instead of up.' },
+        { label: 'Both unchanged: 12 and 7', correct: true, because: 'The triangle is still a triangle in general position. (3, 1.6) is a pass-through on the lower hull now instead of the upper, so its single extension flips from up to down; V + N_ob − 1 = 12 and N_cp + N_ob − 1 = 7 do not move.' },
+        { label: 'Boustrophedon rises to 8, because (3, 1.6) becomes critical', because: 'A critical point needs free space both above and below, i.e. both incident edges on the same side of the sweep. One edge of (3, 1.6) goes left and one goes right: it is a pass-through.' },
+      ]}
+    >
+    Now drag $K$'s vertex $(8.6, 4)$ to $(7.0, 2.6)$. It becomes a reflex vertex, and the counts
+    *still* do not move — but one critical point does: $K$'s merge jumps from $(8.6, 4)$ to
+    $(8, 0.8)$, the new rightmost vertex. Which vertices are critical depends on the shape; how
+    many cells there are depends only on how many.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Three pockets, one pursuer">
+    <Predict
+      id="ch10.e4"
+      question="In the Pursuit-Evasion widget, pick three pockets with one pursuer. The search exhausts G_i without an all-zero node. Which statement explains why no strategy exists?"
+      options={[
+        { label: 'The pockets are too deep to see into from the hub', because: 'Depth alone is not the obstacle: in the two-pocket world the pursuer also has to walk into each pocket, and it succeeds.' },
+        { label: 'While the pursuer clears one pocket, the hub is unwatched and the third pocket recontaminates the one already cleared', correct: true, because: 'That is the recontamination cycle in G_i: every path that drives one pocket\'s gap label to 0 passes through states where the hub\'s gap labels return to 1. A static pursuer at the hub holds those labels at 0, and the search then succeeds.' },
+        { label: 'One pursuer can never clear a polygon with more than 20 edges', because: 'Edge count is not the criterion; a convex polygon with a thousand edges is cleared by one pursuer standing anywhere.' },
+      ]}
+    >
+    Turn on the second pursuer and replay the solution. Watch which gap labels the static pursuer
+    keeps at 0: the openings of the pockets the mobile pursuer is not in. That is Step 1 of
+    Derivation 7, and the reason three U's need two pursuers and nine need three.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="Spiral and squarel critical points on polygons">
+    Implement `Radial` and `Squarel` slice functions for polygons in `morse.rs`: the critical
+    points of $|q - c|$ restricted to an edge are its endpoints and the foot of the perpendicular
+    from $c$ (if inside the edge); for $|x - c_x| + |y - c_y|$, the endpoints and the points where
+    the edge crosses $x = c_x$ or $y = c_y$. Keep only the candidates where the free slice's
+    *number of intervals* changes (a circle first touching the outer wall does not count), build the
+    Reeb graph by sweeping $\lambda$, and assert Euler's count. Render Choset Figs. 6.12 and 6.14 for
+    the bench with $c = (5, 3)$ and compare your counts with the gallery's raster ones (12 and 15
+    critical points at 8 cm pixels).
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="The brushfire decomposition, end to end">
+    Build the brushfire decomposition (C §6.2.3) from Chapter 7's `brushfire` and Chapter 8's GVD:
+    cells are born at each obstacle, and change where fronts first collide — at saddles of $D$ on
+    the GVD (C Fig. 6.16). Cover each cell by following the obstacle boundary at increasing offsets
+    $D = r, 3r, 5r, \dots$ with Chapter 3's offset follower, switching to the GVD where the robot
+    becomes doubly equidistant (C Fig. 6.17). Assert that the Reeb graph is a tree with
+    $N_{ce} = N_{cp} - 1$, and compare the path length with the boustrophedon mower's on the
+    living room. Which pattern would you choose for a robot whose odometry drifts?
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 6 is this chapter's source: the trapezoidal sweep and its four events (Figs. 6.1–6.8), Morse decompositions (Def. 6.2.1) and the variable slices of Figs. 6.12–6.18, sensor-based coverage and the cycle algorithm (§6.2.4), Euler's count and the path-length bound (§6.2.5), and pursuit–evasion after Suzuki and Yamashita and LaValle, Guibas et al. (§6.3)."
+  />
+  <Reference
+    authors="Choset, H."
+    year={2000}
+    title="Coverage of Known Spaces: The Boustrophedon Cellular Decomposition"
+    venue="Autonomous Robots 9(3), 247–253"
+    doi="10.1023/A:1008958800904"
+    note="The boustrophedon decomposition and its coverage path: cells only where the sweep line changes connectivity, and the comparison with the trapezoidal decomposition that the Boustrophedon Mower reproduces."
+  />
+  <Reference
+    authors="Acar, E. U., Choset, H., Rizzi, A. A., Atkar, P. N., and Hull, D."
+    year={2002}
+    title="Morse Decompositions for Coverage Tasks"
+    venue="International Journal of Robotics Research 21(4), 331–344"
+    doi="10.1177/027836402320556359"
+    note="Definition 6.2.1 in full: critical points of a slice function on the obstacle boundary, and the spiral, spike, squarel and brushfire patterns of the gallery."
+  />
+  <Reference
+    authors="Acar, E. U. and Choset, H."
+    year={2002}
+    title="Sensor-Based Coverage of Unknown Environments: Incremental Construction of Morse Decompositions"
+    venue="International Journal of Robotics Research 21(4), 345–366"
+    doi="10.1177/027836402320556368"
+    note="Critical-point sensing from range data, the incremental Reeb graph, and the cycle algorithm whose forward, reverse and closing phases the online coverer implements."
+  />
+  <Reference
+    authors="Choset, H."
+    year={2001}
+    title="Coverage for Robotics — A Survey of Recent Results"
+    venue="Annals of Mathematics and Artificial Intelligence 31, 113–126"
+    doi="10.1023/A:1016639210559"
+    note="The survey that frames coverage as exhaustive walks on cell decompositions and places the boustrophedon and Morse decompositions among heuristic, approximate and exact methods."
+  />
+  <Reference
+    authors="Galceran, E. and Carpin, S."
+    year={2013}
+    title="A Survey on Coverage Path Planning for Robotics"
+    venue="Robotics and Autonomous Systems 61(12), 1258–1276"
+    doi="10.1016/j.robot.2013.09.004"
+    note="The modern map of the field: cellular decompositions, grid-based and graph-based coverage, multi-robot coverage, and coverage on 3-D surfaces — where to go after this chapter."
+  />
+  <Reference
+    authors="LaValle, S. M."
+    year={2006}
+    title="Planning Algorithms"
+    venue="Cambridge University Press"
+    url="http://lavalle.pl/planning/"
+    note="Chapter 6 treats cell decompositions (vertical decomposition, cylindrical decomposition) and §12.4 visibility-based pursuit–evasion with information spaces — the decomposition by information of this chapter's coda, at full length."
+  />
+</References>

@@ -21,6 +21,7 @@ import { Scene } from '../collide/scene';
 import { WORKBENCH, type NamedPolygon, type PolyWorld } from '../robots/worlds';
 import { torusLab, type TorusLab } from '../sampling/worlds';
 import { StraightLine } from '../sampling/steer';
+import { cellOf, labelComponents, type BitGrid } from '../manifold/torus';
 
 export type WorldGenerator = 'train' | 'heldout';
 
@@ -150,6 +151,29 @@ export function randomQuery(lab: TorusLab, rng: Rng, minDist = 2.0, requireBlock
     if (lab.space.dist(s, g) < minDist) continue;
     if (requireBlocked && steer.steer(lab.space, lab.free, s, g) !== null) continue;
     return [s, g];
+  }
+  return null;
+}
+
+/**
+ * A blocked query whose endpoints share a connected component of the C-space
+ * raster (4-connected, wrapping on T²) — solvable at the raster's resolution.
+ * Reach's free space on a cluttered table is often split into pieces; a widget
+ * whose default query has no answer teaches nothing about proposals, so the
+ * demos draw their queries here. Returns null if `tries` blocked queries all
+ * straddle two components.
+ */
+export function connectedQuery(lab: TorusLab, raster: BitGrid, rng: Rng, tries = 40): [number[], number[]] | null {
+  const { labels } = labelComponents(raster, true);
+  const label = (q: readonly number[]) => {
+    const [i, j] = cellOf(raster, [q[0], q[1]]);
+    return labels[j * raster.n1 + i];
+  };
+  for (let t = 0; t < tries; t++) {
+    const q = randomQuery(lab, rng);
+    if (!q) continue;
+    const a = label(q[0]);
+    if (a >= 0 && a === label(q[1])) return q;
   }
   return null;
 }

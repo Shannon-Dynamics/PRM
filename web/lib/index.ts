@@ -26,11 +26,16 @@ export * from './mapping/edt';
 
 // @chapter-exports-start
 export * as bugs from './bugs';
+export * as capstone from './capstone';
+export * as cells from './cells';
 export * as collide from './collide';
 export * as cspace from './cspace';
 export * as dynamics from './dynamics';
 export * as estimate from './estimate';
+export * as learn from './learn';
 export * as manifold from './manifold';
+export * as multi from './multi';
+export * as nonholonomic from './nonholonomic';
 export * as potential from './potential';
 export * as roadmap from './roadmap';
 export * as robots from './robots';

@@ -5,6 +5,8 @@
  * worlds, the ε audit and Derivation 3's bound on the audit set, Derivation 3
  * as a property test, the proposal + verifier never returning a colliding
  * path, the toy diffuser's verifier, and the recorded Board's invariants.
+ * The last check pins every number the chapter prose quotes from these runs,
+ * the recorded training log and the recorded Board, so the text cannot drift.
  */
 
 import type { CheckResult } from '../__checks__';
@@ -19,8 +21,9 @@ import { MpnetLike } from './neural-planner';
 import { DIFF_K, denoise, linearSchedule, trajectoryValid } from './diffusion';
 import { pathCellHistogram, worldCases } from './data';
 import { randomQuery } from './worlds';
-import { PLANNERS, runQuery, successCurve, summarize } from './bench';
+import { PLANNERS, breakEvenQueries, runQuery, successCurve, summarize } from './bench';
 import { BENCH, EPSILON_VALIDATION, TRAINING_META, loadModels } from './models';
+import type { PlannerName } from './bench';
 
 const fmt = (x: number, d = 4) => (Number.isFinite(x) ? x.toFixed(d) : String(x));
 
@@ -28,6 +31,8 @@ export function runCh22Checks(): CheckResult[] {
   const out: CheckResult[] = [];
   const push = (name: string, pass: boolean, detail?: string) => out.push({ name, pass, detail });
   const models = loadModels();
+  /** Readouts the prose quotes, filled in by the checks below and compared at the end. */
+  const quoted: Record<string, string> = {};
 
   // -------------------------------------------------------------------------
   // §3(a): KL between a learned and a uniform sampler on four cells
@@ -73,6 +78,7 @@ export function runCh22Checks(): CheckResult[] {
       gradientCheck(new Mlp([4, 6, 1], 'sigmoid', 'sigmoid', rng.fork()), [0.1, 0.2, -0.3, 0.9], [0.7]),
       gradientCheck(new Mlp([2, 9, 3], 'softplus', 'tanh', rng.fork()), [-0.4, 0.6], [0.1, -0.2, 0.3]),
     );
+    quoted.gradWorst = worst.toExponential(0);
     push('ch22 MLP backprop matches finite differences (tanh, sigmoid, softplus nets) to 1e-6 relative', worst < 1e-6, `worst relative discrepancy ${worst.toExponential(2)}`);
   }
 
@@ -143,6 +149,7 @@ export function runCh22Checks(): CheckResult[] {
     // Every cell within 5σ of its mixture expectation (Poisson), so a starved raw cell still shows the floor.
     const expected = mixtureMasses(ls, lambda).masses;
     const within5Sigma = counts.every((c, i) => c >= expected[i] * draws - 5 * Math.sqrt(expected[i] * draws));
+    quoted.rawZero = `${rawZeroCells}/${cases.length * CELLS}`;
     let threw = false;
     try {
       mixtureSampler(ls, 0);
@@ -186,6 +193,8 @@ export function runCh22Checks(): CheckResult[] {
     };
     const a = aim(cases);
     const h = aim(held);
+    quoted.aimIn = `${a.better}/${a.total} ${fmt(a.meanHat, 3)} ${fmt(a.meanUni, 3)}`;
+    quoted.aimHeld = `${h.better}/${h.total} ${fmt(h.meanHat, 3)} ${fmt(h.meanUni, 3)}`;
     push(
       'ch22 aim: D(p*‖p_λ) < D(p*‖u) on average and on a majority of fresh in-distribution worlds (λ = 0.1, one fresh PRM path per world as p*)',
       a.total >= 6 && a.better > 0.5 * a.total && a.meanHat < a.meanUni,
@@ -232,6 +241,7 @@ export function runCh22Checks(): CheckResult[] {
         }
       }
     }
+    quoted.audit = `${fmt(rep.epsilon, 3)} ${searches} ${fmt(worstRatio)} ${fmt(expLearned / Math.max(1, expOctile), 3)}`;
     push(
       'ch22 ε audit: on 8 audit worlds × 2 goals the learned ĥ has measured ε; every A* run there returns cost ≤ (1 + ε)C*; octile A* equals Dijkstra',
       boundOk && octileOk && searches >= 20 && rep.epsilon > 0,
@@ -268,6 +278,7 @@ export function runCh22Checks(): CheckResult[] {
         if (!withinEpsBound(t.cost, hStar[start], eps)) ok = false;
       }
     }
+    quoted.property = `${runs} ${fmt(worst)} ${anyReopen}`;
     push(
       'ch22 Derivation 3 property test: random ε-inflated heuristics (ε = 0.3) on 50 lattice queries return cost ≤ 1.3 C* with reopening',
       ok && runs >= 30,
@@ -305,6 +316,7 @@ export function runCh22Checks(): CheckResult[] {
         if (!wc.lab.space.equals(p[0], q[0], 1e-9) || !wc.lab.space.equals(p[p.length - 1], q[1], 1e-9)) endpointsOk = false;
       }
     }
+    quoted.mpnet = `${planned} ${returned} ${verified} ${fellBack} ${rawOk.train}/${rawTotal.train} ${rawOk.heldout}/${rawTotal.heldout}`;
     push(
       'ch22 proposal + verifier: every path the MPNet-style planner returned passes an independent dense recheck (step 0.005) and joins the query endpoints',
       planned >= 10 && returned === verified && endpointsOk,
@@ -322,6 +334,7 @@ export function runCh22Checks(): CheckResult[] {
     const noiseIsNoise = sch.alphaBar[DIFF_K] < 0.01;
     const bimodal = run.above > 0 && run.below > 0;
     const finalMatchesVerifier = run.steps[DIFF_K].every((t, i) => trajectoryValid(t) === run.valid[i]);
+    quoted.diffuser = `${sch.alphaBar[DIFF_K].toExponential(2)} ${Math.round(100 * run.validFraction)} ${run.above} ${run.below} ${Math.round(100 * guided.validFraction)}`;
     push(
       'ch22 toy diffuser: ᾱ_K < 0.01; 64 denoised trajectories are ≥ 50% valid, go both ways around the slab, and the recorded validity is the hard checker\'s',
       noiseIsNoise && run.validFraction >= 0.5 && bimodal && finalMatchesVerifier && run.steps.length === DIFF_K + 1,
@@ -358,6 +371,60 @@ export function runCh22Checks(): CheckResult[] {
       'ch22 Board invariants: every solved cost ≥ its query\'s incumbent, success monotone in budget for all 7 planners × 2 suites, suite sizes as recorded; a live run obeys the budget',
       ratiosOk && monotoneOk && sizesOk && liveOk,
       `${BENCH.meta.worldsPerSuite} queries per suite, budgets {${BENCH.budgets.join(', ')}}; at 2000 checks in-distribution: learned ${(100 * learned.success).toFixed(0)}% vs uniform ${(100 * uniform.success).toFixed(0)}%; live run: ${live.runs.map((r) => `${r.planner} ${r.solved ? `@${r.checks}` : 'x'}`).join(', ')}`,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Prose readouts: every number the chapter quotes from the runs above, the
+  // recorded training log and the recorded Board, compared as printed strings
+  // -------------------------------------------------------------------------
+  {
+    const pct = (x: number) => String(Math.round(100 * x));
+    const row = (suite: 'train' | 'heldout', budget: number, planner: PlannerName) => summarize(BENCH.suites[suite], budget).find((r) => r.planner === planner)!;
+    const succ = (suite: 'train' | 'heldout', budget: number, planners: PlannerName[]) => planners.map((p) => pct(row(suite, budget, p).success)).join(' ');
+    const M = BENCH.maxBudget;
+    const lu = row('train', M, 'learned');
+    const uu = row('train', M, 'uniform');
+    const mp = row('train', M, 'mpnet');
+    const T = TRAINING_META;
+    const actual: Record<string, string> = {
+      ...quoted,
+      suite: `${BENCH.meta.worldsPerSuite} ${BENCH.budgets[0]} ${M} ${BENCH.lambda}`,
+      at100: `${succ('train', 100, ['learned', 'uniform', 'rrt-connect'])} | ${succ('heldout', 100, ['learned', 'uniform'])}`,
+      at400: `${succ('train', 400, ['learned', 'uniform', 'bridge', 'rrt-connect'])} | ${succ('heldout', 400, ['learned', 'uniform', 'bridge', 'rrt-connect'])}`,
+      atMax: `${succ('train', M, ['learned', 'uniform', 'mpnet'])} | ${succ('heldout', M, ['learned', 'uniform', 'mpnet'])}`,
+      ratios: `${fmt(lu.costRatio, 2)} ${fmt(uu.costRatio, 2)} ${fmt(row('train', M, 'rrt-connect').costRatio, 2)} | ${fmt(row('heldout', M, 'learned').costRatio, 2)} ${fmt(row('heldout', M, 'uniform').costRatio, 2)}`,
+      clock: `${fmt(lu.inferenceMs, 2)} ${fmt(lu.ms, 0)} ${fmt(uu.ms, 0)} ${fmt(mp.inferenceMs, 1)} ${fmt(mp.ms, 0)} ${Number.isFinite(breakEvenQueries(lu, uu, BENCH.trainingMs.sampler)) ? 'finite' : 'never'}`,
+      training: `${T.trainWorlds} ${T.pathQueriesSolved}/${T.pathQueriesAttempted} ${T.samplerTargets} ${T.policyTargets} ${T.heuristicLabels} ${T.heuristicWorlds} ${T.epochs.sampler}`,
+      xent: `${fmt(T.finalLoss.sampler, 3)} ${fmt(Math.log(CELLS), 3)} ${fmt(Math.log(CELLS) - T.finalLoss.sampler, 3)}`,
+      seconds: `${fmt(T.ms.pathData / 1000, 0)} ${fmt(T.ms.sampler / 1000, 0)} ${fmt(BENCH.trainingMs.sampler / 1000, 0)}`,
+      epsilon: `${fmt(T.epsilon.validation.epsilon, 3)} ${T.epsilon.validation.violations}/${T.epsilon.validation.audited} ${T.epsilon.validation.worlds} ${fmt(T.epsilon.validation.meanRatio, 3)} ${fmt(T.epsilon.validation.meanOctileRatio, 3)} ${fmt(T.epsilon.heldout.epsilon, 3)}`,
+    };
+    const expected: Record<string, string> = {
+      gradWorst: '3e-8',
+      rawZero: '188/3456',
+      aimIn: '6/7 1.946 2.729',
+      aimHeld: '8/10 2.186 2.770',
+      audit: '0.327 43 1.0000 0.994',
+      property: '30 1.0711 13',
+      mpnet: '16 12 12 4 0/8 4/8',
+      diffuser: '4.06e-3 58 30 34 83',
+      suite: '30 100 12800 0.1',
+      at100: '60 47 57 | 63 60',
+      at400: '77 90 80 93 | 90 90 80 100',
+      atMax: '100 100 93 | 100 100 93',
+      ratios: '1.28 1.33 1.07 | 1.23 1.43',
+      clock: '0.10 12 10 1.1 53 never',
+      training: '600 954/1800 21508 44553 71848 240 50',
+      xent: '3.393 4.970 1.576',
+      seconds: '147 93 241',
+      epsilon: '0.662 5584/12830 16 0.959 0.917 0.387',
+    };
+    const off = Object.keys(expected).filter((k) => actual[k] !== expected[k]);
+    push(
+      'ch22 prose readouts: every number the chapter quotes from the checks, the training log and the Board matches its source',
+      off.length === 0,
+      off.length ? off.map((k) => `${k}: prose "${expected[k]}" vs computed "${actual[k] ?? 'missing'}"`).join('; ') : `${Object.keys(expected).length} readout groups match`,
     );
   }
 

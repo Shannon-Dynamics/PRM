@@ -10,7 +10,7 @@ import { clear, label, type Palette, type Viewport } from '@/lib/sim/draw';
 import { Rng } from '@/lib/prob/rng';
 import type { BitGrid } from '@/lib/manifold/torus';
 import { chartPanel, paintArmMapped, paintChartPath, paintDot, paintGeodesic, paintPanelFrame, paintPolyWorld, paintRaster, paintTreeEdges, rasterTorusCObstacle, rectMapper } from '@/lib/sampling';
-import { MpnetLike, loadModels, makeWorldCase, randomQuery, type NeuralPlan, type WorldCase, type WorldGenerator } from '@/lib/learn';
+import { MpnetLike, connectedQuery, loadModels, makeWorldCase, randomQuery, type NeuralPlan, type WorldCase, type WorldGenerator } from '@/lib/learn';
 
 /**
  * w22.3 — Neural Planner Autopsy.
@@ -49,11 +49,13 @@ interface Params {
 function build(seed: number, prms: Params): State {
   const wc = makeWorldCase(seed, prms.gen);
   const rng = new Rng(seed ^ 0x5bd1e995);
-  const q = randomQuery(wc.lab, rng) ?? randomQuery(wc.lab, rng, 1.5, false) ?? [[0.8, 1.6], [-2.2, -1.2]];
+  const raster = rasterTorusCObstacle(wc.lab, 48);
+  // A query with an answer at raster resolution: a planner that fails an unsolvable query proves nothing.
+  const q = connectedQuery(wc.lab, raster, rng) ?? randomQuery(wc.lab, rng) ?? randomQuery(wc.lab, rng, 1.5, false) ?? [[0.8, 1.6], [-2.2, -1.2]];
   const planner = new MpnetLike(loadModels().policy, wc, { repairAttempts: 300, fallbackAttempts: 1500 });
   const raw = planner.plan(q[0], q[1], new Rng(seed + 1), { repair: false });
   const plan = prms.repair ? planner.plan(q[0], q[1], new Rng(seed + 1)) : raw;
-  return { wc, start: q[0], goal: q[1], raster: rasterTorusCObstacle(wc.lab, 48), plan, raw, total: plan.hops.length + plan.repairs.length + 1, step: 0 };
+  return { wc, start: q[0], goal: q[1], raster, plan, raw, total: plan.hops.length + plan.repairs.length + 1, step: 0 };
 }
 
 export function NeuralPlannerAutopsy() {
@@ -68,7 +70,7 @@ export function NeuralPlannerAutopsy() {
     return { ...s, step: s.step + 1 };
   }, []);
 
-  const sim = useSimulation<State>({ init, step: stepFn, fps: 4, initialSeed: 3 });
+  const sim = useSimulation<State>({ init, step: stepFn, fps: 4, initialSeed: 11 });
   const resetRef = useRef(sim.reset);
   resetRef.current = sim.reset;
   useEffect(() => {

@@ -1,0 +1,1198 @@
+---
+title: Learning and Planning
+description: Where machine learning belongs in a motion planner, said without hype. Learned samplers, learned heuristics, neural planners and diffusion models all replace the proposal and never the verifier, so completeness and optimality are inherited from the classical stage and speed is bought from the learner at a measurable exchange rate.
+chapter: 22
+part: PART VI
+partTitle: Frontiers and Integration
+difficulty: Advanced
+readingTime: 85 min
+quote: The framework presented in this section enables a rigorous treatment of asymmetric reachability, nonmanifold configuration spaces, and sampling from arbitrary distributions.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §7.4.3
+---
+
+import { LearnedSamplerRace } from '@/components/ch/ch22/learned-sampler-race';
+import { HeuristicCalibration } from '@/components/ch/ch22/heuristic-calibration';
+import { NeuralPlannerAutopsy } from '@/components/ch/ch22/neural-planner-autopsy';
+import { DenoisingTrajectory } from '@/components/ch/ch22/denoising-trajectory';
+import { HonestBenchmarkBoard } from '@/components/ch/ch22/honest-benchmark-board';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'State the one rule that organizes every use of learning in this chapter — learning replaces the proposal, never the verifier — and say for each of four learned components what the proposal is and what the verifier is',
+    'Prove that a learned sampler mixed with a uniform floor of weight λ keeps Choset\'s probabilistic-completeness bound with p replaced by λp, and that λ = 0 voids it',
+    'Show that maximum-likelihood training of a sampler is minimization of D_KL(p* ‖ p̂_θ), and compute the four-cell example by hand: D_KL(p̂ ‖ u) = 0.2442 nats, D_KL(p* ‖ p̂) = 0.0119, D_KL(p* ‖ u) = 0.3162',
+    'Prove that A* with reopening and an ε-admissible heuristic returns a path of cost at most (1 + ε)C*, and audit a three-node heuristic to ε = 0.1333 and a bound of 5.667',
+    'Explain why a neural planner with a classical fallback inherits the fallback\'s guarantee and nothing else, and why a diffusion planner is a proposal that still needs a collision checker',
+    'Read a benchmark honestly: fixed budgets in collision checks, held-out worlds from a different generator, wall-clock including inference, and training time amortized over the queries that pay for it',
+  ]}
+  prerequisites={[
+    'A* with admissibility, consistency and reopening; backward Dijkstra as a cost-to-go oracle (Chapter 6)',
+    'PRM, the Sampler and Steer traits, the Hybrid mixture sampler, and the three completeness analyses of Choset §7.4 (Chapter 11)',
+    'RRT-Connect as a single-query planner (Chapter 12); the cost functional of trajectory optimization (Chapter 19)',
+    'Reach on the Workbench and its torus of configurations (Chapters 2, 4 and 5)',
+  ]}
+>
+Every planner in Parts II through V was designed by hand. Uniform samples, Euclidean heuristics,
+Gaussian and bridge biases a person reasoned out from the geometry of narrow passages. This chapter
+asks the question every planning group asks in 2026, and tries to answer it without hype: where does
+machine learning belong in a motion planner?
+
+The answer that organizes everything is one sentence. **Learning replaces the *proposal*, never the
+*verifier*.** A learned sampler changes *where* a PRM looks, never *whether* an edge is collision
+checked. A learned heuristic changes the *order* in which A\* expands nodes, never the test that
+declares a path valid. A neural planner that emits waypoints is only as complete as the classical
+repair behind it, and a diffusion model that emits whole trajectories produces candidates that a
+checker still has to accept. In every case the guarantee — completeness, optimality, collision
+freedom — is *inherited from the verifier*, the speed is *bought from the learner*, and the
+exchange rate is a number you can measure.
+
+Choset's abstract path-tiling theorem (§7.4.3, which the epigraph introduces) never needed uniform
+samples. We carry one constant $\lambda$ through its proof, then measure what the learner actually
+buys on Reach's Workbench — less than the abstracts suggest, and more than nothing.
+</Overview>
+
+## The problem: a sampler that learned the bench
+
+[Chapter 11](/chapters/ch11-prm)'s PRM draws configurations uniformly from Reach's torus. On a
+cluttered Workbench most of those samples land where the eventual path never goes, and each costs a
+collision check plus a dozen more for every edge tried. Someone who has watched a thousand roadmaps
+grow knows roughly where paths go; Chapter 11's Gaussian, bridge and OBPRM samplers were three
+attempts to write that knowledge down as a rule.
+
+The modern move is not to write it down at all. Generate six hundred random Workbenches, run
+Chapter 11's planner on three queries in each, record every node of every path it found, and train a
+small network to predict, from the table's occupancy raster and the query's two endpoints, *where on
+the torus the path nodes will be*. Then sample from the network. The data is real: every recorded node
+passed Chapter 2's collision checker, every path was certified edge by edge. Nothing in the planner
+changes except the line that draws the next sample.
+
+Here is what that buys, measured on thirty solvable queries on fresh Workbenches from the same random
+generator, every planner stopped at a fixed number of collision checks. At a budget of 100 checks the
+learned proposal — mixed with ten percent uniform, for a reason the mathematics will make
+non-negotiable — solves 60% of the queries and the uniform PRM solves 47%. At 400 checks the order
+*reverses*: the learned sampler solves 77% and uniform 90%. At 12,800 checks both solve every one.
+The paths the learned sampler finds are shorter (1.28 times the best known path against uniform's
+1.33), and every millisecond of that is spent on a network that took 241 seconds of data generation
+and training before the first query, which no realistic number of queries on this suite pays back.
+
+That is the chapter in miniature: the learner moved where the samples fell, could not change what the
+planner was able to find, and whether the move paid depends on budget, world and bookkeeping.
+
+## Building intuition: the scout and the surveyor
+
+The chapter's picture in one line: *the learner is a scout who says "look here"; the planner is the
+surveyor who still measures every edge.* Each widget below puts a different scout in front of the
+same surveyor. Read them as a set — they are four instances of one design and one honest scoreboard.
+
+### Where the samples fall
+
+Two Chapter 11 PRMs grow side by side on the same randomized Workbench, seed and query. The left
+pane draws uniformly; the middle pane draws from the learned proposal
+$\hat p_\theta(q \mid \mathcal{E}, \qstart, \qgoal)$ — the grey heat under the amber C-obstacle
+raster — mixed with uniform at weight $\lambda$; the right pane is the Workbench.
+
+<Deferred minHeight={940}>
+  <LearnedSamplerRace />
+</Deferred>
+
+On the default world the learned pane joins start and goal after about half the collision checks the
+uniform pane spends: the heat sits on the band of the torus the path actually uses, and the samples
+follow it. Now press **held-out generator**. The world is replaced by one built from long thin bars at
+arbitrary angles — a family of shapes the training generator never produced — and on this seed the
+learned pane needs more than twice the checks uniform does. The heat still lands in confident blobs;
+they are just in the wrong place, because the network learned what blocks do to Reach's torus and is
+now looking at bars. Three things to notice, in order of importance.
+
+**Both panes connect.** Slide the sample budget up and both roadmaps join on every solvable query you
+try, on both generators, at every $\lambda$ the slider allows. The learner moves *where* the planner looks.
+It does not move what the planner can find — that is the content of Derivation 1, and the reason the
+$\lambda$ slider stops at 0.02 instead of reaching zero.
+
+**The currency is collision checks.** On Reach's torus a query is usually joined within a handful of
+nodes, so "samples until the join" hides the difference. The check count — the book's cost unit since
+Chapter 11 — shows it. The success-at-budget curves below the canvas accumulate over further seeds in
+the background, and they are the honest summary: on some worlds the learner wins big, on others it
+loses, and the curve is the average of both.
+
+**The bar chart is the chapter's first formula.** It prints $D_{\KL}(\hat p \,\|\, u)$ on the four
+quadrants of the torus, live: how *concentrated* the proposal is — not whether the concentration is
+in the right place, which takes a second divergence. The four-cell example computes both by hand.
+
+### A heuristic that knows too much
+
+[Chapter 6](/chapters/ch06-graph-search)'s A\* on a 24 × 24 lattice of Reach's torus, with the
+admissible octile distance, a learned cost-to-go $\hat h_\theta$, or $\hat h_\theta / (1 + \epsilon_{val})$.
+Left: explored set (blue), path (purple), a red mark wherever $\hat h$ exceeds the true cost-to-go
+$h^*$ from backward Dijkstra. Right: every reachable cell at $(h^*(v), \hat h(v))$ against the diagonal.
+
+<Deferred minHeight={760}>
+  <HeuristicCalibration />
+</Deferred>
+
+On the default world the learned heuristic does exactly what the folklore says a better heuristic
+does: it expands fewer nodes than octile. And it returns a *longer path* — the cost-ratio tile reads
+above one. The scatter shows why: a cloud of red points above the diagonal, cells where the net
+guessed high. The measured $\epsilon$ is the worst of those ratios on this world, and the fourth tile
+prints the guarantee $(1 + \epsilon)\,C^*$ that Derivation 3 proves the realized cost can never
+exceed. It never does — on this world, on any world you re-roll to, at any scale.
+
+Then try the other two settings. Slide the scale above 1 and even the octile heuristic becomes
+inadmissible (that is weighted A\*, which Chapter 6 introduced): expansions fall, the path stays at or
+above $C^*$, and the bound line rises with the scale. Switch to the deflated heuristic and the red
+cloud vanishes, the path becomes optimal again — and the expansion count balloons to nearly three times
+octile's. Dividing by $1 + \epsilon_{val}$ buys admissibility on the validation worlds by throwing
+away most of what the net knew.
+
+Across many worlds the summary is less flattering: on the audit worlds the learned heuristic and
+octile expand almost the same number of nodes (ratio 0.994). Octile is already good on this lattice —
+its mean ratio to $h^*$ on the validation worlds is 0.917, against the net's 0.959. What does *not*
+vary is the bound: the learned heuristic cannot hurt you by more than its measured $\epsilon$.
+
+### The net that hops
+
+An MPNet-style policy proposes Reach's next configuration a hop $\eta = 0.35$ rad away. Each hop goes
+to the verifier — Chapter 11's `Steer`, fulfilled by Chapter 2's *sound* swept check — and is drawn
+blue if certified, red and dashed if not. Rejected stretches are bridged by
+[Chapter 12](/chapters/ch12-tree-planners)'s RRT-Connect (the thin blue mini-tree); if local repairs
+run out, RRT-Connect runs on the whole original query.
+
+<Deferred minHeight={700}>
+  <NeuralPlannerAutopsy />
+</Deferred>
+
+On the training tab most of the hops pass. The policy learned the shape of paths on block-shaped
+Workbenches, and on this one it walks most of the way by itself; one short repair splices over the
+stretch where it clipped a block. Switch to the held-out tab: fewer than two-thirds of the hops pass,
+and the tile that splits the path into *by net* and *by repair* tips the other way — the repair
+planner supplies most of the length. Now turn **repair off**. The tile labelled *net alone* reads
+*failed* on both tabs. A path is only a path if every hop is certified and the last one reaches the
+goal; one clipped corner is enough to have nothing. The network did not learn to plan; it learned the
+training distribution of paths — valuable, since on a good day it proposes most of the answer — and
+with the repair planner behind it the composition is exactly as complete as RRT-Connect (Derivation 4).
+
+### Noise into paths
+
+Diffusion models generate by running a noising process backward. The smallest example: a trajectory
+$\tau \in \mathbb{R}^{16}$ is a configuration per time step, pinned to 0 at both ends; a slab blocks
+$\lvert q \rvert < 0.3$ during steps 5 through 10; demonstrations swing around it, half above and half
+below. Thirty-two samples start as pure noise and are denoised for $K = 40$ steps by a small net, then
+checked: purple is clear, red went through the slab.
+
+<Deferred minHeight={640}>
+  <DenoisingTrajectory />
+</Deferred>
+
+Scrub the step slider slowly from 0. For the first half of the steps nothing recognizable happens; then the
+swing appears, *both* swings, as the samples commit to going over or under. At step 40 a good
+fraction are red: plausible-looking trajectories that dip into the slab for a time step or two. Turn
+on cost guidance — each step also descends the gradient of a smooth cost that penalizes coming near
+the slab — and the red fraction drops a great deal. It does not reach zero, on any seed you try. A
+soft penalty is not a hard constraint, which is why Chapter 2's checker runs on every sample and why
+a diffusion planner is a *proposal* in exactly the sense of the sampler above.
+
+### The board
+
+Seven planners — four hand-designed PRM samplers, the learned sampler at $\lambda = 0.1$,
+RRT-Connect, and the MPNet-style planner — on thirty solvable queries from each generator, same world,
+query and seed, stopped at 12,800 collision checks; smaller budgets are read off the same runs.
+
+<Deferred minHeight={1080}>
+  <HonestBenchmarkBoard />
+</Deferred>
+
+Toggle the suite and move the budget. The learned rows (tinted orange) win at the smallest budgets in
+distribution and then fall behind; their first paths are consistently shorter; their wall-clock is
+*worse*. RRT-Connect, which nobody trained, beats every PRM row at almost every budget on both suites.
+Drag the amortization slider to $10^4$ queries and the learned rows still do not overtake uniform on
+wall-clock: they were never faster per query. *Putting it together* reads this board line by line.
+
+<KeyIdea title="The one sentence version">
+A learned component in a motion planner is a proposal — where to sample, which node to expand, which
+waypoint to try, which trajectory to check — and the planner's guarantees survive exactly when a
+classical verifier still certifies every candidate and a classical fallback still runs on the original
+query; the learner's contribution is then a change in cost, which must be measured at fixed budgets,
+on worlds it was not trained on, with its own inference and training time on the bill.
+</KeyIdea>
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: '\\mathcal{E}', meaning: 'environment encoding fed to a net — here an 8 × 8 occupancy raster of the Workbench, each cell the fraction of four probe points inside an obstacle' },
+    { sym: 'u(q) = 1/\\mu(\\mathcal{Q})', meaning: 'the uniform density on 𝒬 — Chapter 11\'s default proposal', note: 'Choset §7.4.1' },
+    { sym: '\\hat p_\\theta(q \\mid \\mathcal{E}),\\; p^*(q \\mid \\mathcal{E})', meaning: 'the learned proposal; the target — the empirical distribution of nodes on Chapter 11 roadmap paths' },
+    { sym: 'p_\\lambda = (1 - \\lambda)\\hat p_\\theta + \\lambda u', meaning: 'the bounded-below mixture, λ ∈ (0, 1]' },
+    { sym: 'D_{\\KL}(p \\,\\|\\, q) = \\sum_i p_i \\ln(p_i/q_i)', meaning: 'Kullback–Leibler divergence on a partition, in nats (bits in parentheses); H(p) = −Σ p_i ln p_i is the entropy' },
+    { sym: 'h^*(v),\\; \\hat h_\\theta(v),\\; \\epsilon', meaning: 'true cost-to-go; learned heuristic; the smallest ε with ĥ ≤ (1 + ε) h* on the audited nodes' },
+    { sym: '\\pi_\\theta,\\; \\eta', meaning: 'a waypoint policy (neural planner); its hop length on T²' },
+    { sym: '\\beta_k,\\; \\bar\\alpha_k,\\; \\epsilon_\\theta(\\tau^k, k, \\mathcal{E}),\\; J(\\tau)', meaning: 'diffusion noise schedule and its cumulative product; the noise predictor over a trajectory τ ∈ 𝒬^T; the guidance cost', note: 'Chapter 19 for J' },
+  ]}
+/>
+
+### Proposals and verifiers
+
+Everything in this chapter is an instance of two definitions and one composition.
+
+<KeyIdea title="Definition 22.1 — sampling proposal">
+A **sampling proposal** is any probability density on $\Q$ from which a sampling-based planner draws
+candidate configurations. The **verifier** — the node collision test and the local planner $\Dist$
+(`Steer`) that certifies edges — is not part of the proposal and is unchanged by it. Chapter 11's
+uniform, Gaussian, bridge and OBPRM samplers are proposals; so is the learned
+$\hat p_\theta(q \mid \mathcal{E}, \qstart, \qgoal)$.
+</KeyIdea>
+
+<KeyIdea title="Definition 22.2 — completeness-preserving proposal">
+A proposal $p$ is **completeness-preserving** if there is a fixed $\lambda > 0$ with
+$p(q) \ge \lambda\, u(q)$ for every $q \in \Q$. Every mixture
+$p_\lambda = (1-\lambda)\hat p_\theta + \lambda u$ is one, whatever $\hat p_\theta$ is. A raw network
+output generally is not: decoders emit exact zeros, and a softmax that is technically positive
+everywhere can put $10^{-6}$ of uniform's mass on the one corridor that matters.
+</KeyIdea>
+
+The constant in Definition 22.2 is the constant in the failure bound. The shipped sampler's raw
+softmax leaves 188 of 3,456 cells, across 24 audited worlds, below a thousandth of the uniform mass:
+positive, and useless as a guarantee. The mixture replaces that unknowable minimum by $\lambda$.
+
+### Completeness survives a floor
+
+Recall [Chapter 11](/chapters/ch11-prm)'s statement of Choset's Theorem 7.4.3: if PRM with local
+planner relation $R$ and sampling measure $\mu$ is probabilistically complete, there are $\ell$ sets
+$A_1, \dots, A_\ell \subset \Qfree$, each of positive measure, such that *any* choice
+$x_j \in A_j$ chains into a path $x \mathrel{R} x_1 \mathrel{R} \cdots \mathrel{R} x_\ell \mathrel{R} y$;
+and with $p = \min_j \mu(A_j)$ the failure probability after $n$ samples is at most
+$\ell(1-p)^n \le \ell e^{-pn}$. Choset introduces the section by saying the framework covers
+"sampling from arbitrary distributions", and the proof bears it out: the only property of $\mu$ it
+uses is a *lower bound* on the mass of each tile.
+
+<LinkedMath>
+$$
+\Pr\big[\text{FAILURE after } n \text{ samples from } p_\lambda\big]
+\;\le\; \ell\,\big(1 - \lambda\, p_u\big)^n \;\le\; \ell\, e^{-\lambda\, p_u\, n},
+\qquad p_u = \min_j u(A_j).
+$$
+</LinkedMath>
+
+<Derivation title="Derivation 1 — probabilistic completeness survives any bounded-below proposal" result="\Pr[\text{FAILURE}] \le \ell\,(1-\lambda p_u)^n \le \ell\, e^{-\lambda p_u n}">
+**Step 1 — take the uniform tiles.** Suppose uniform PRM with relation $R$ is probabilistically
+complete on the query $(x, y)$ (Chapter 11 proved this for the straight-line planner on any space
+with a clearance-positive path). Theorem 7.4.3 supplies tiles $A_1, \dots, A_\ell$ with
+$p_u = \min_j u(A_j) > 0$ and the chaining property. The chaining property is a statement about $R$
+alone — it does not mention the sampling measure.
+
+**Step 2 — failure needs an empty tile.** If every $A_j$ receives at least one of the $n$ roadmap
+nodes, the roadmap contains a path from $x$ to $y$ (the nodes chain by Step 1, and PRM's connection
+rule finds the chain under the same hypotheses as in Chapter 11). So
+$\{\text{FAILURE}\} \subseteq \bigcup_j \{A_j \text{ empty}\}$.
+
+**Step 3 — each draw hits a tile with probability at least $\lambda p_u$.** Under the mixture,
+$p_\lambda(A_j) = (1-\lambda)\hat p_\theta(A_j) + \lambda u(A_j) \ge \lambda u(A_j) \ge \lambda p_u$,
+because $\hat p_\theta(A_j) \ge 0$ — the only thing we know about the network. The learned sampler is
+conditioned on the query, which is fixed before sampling begins, so the $n$ draws are independent and
+identically distributed. Rejection of colliding draws only helps: the tiles lie in $\Qfree$, so
+conditioning on acceptance can only raise their probability.
+
+**Step 4 — union bound.** $\Pr[A_j \text{ empty}] \le (1 - \lambda p_u)^n$, and
+$\Pr[\text{FAILURE}] \le \sum_j \Pr[A_j \text{ empty}] \le \ell (1-\lambda p_u)^n \le \ell e^{-\lambda p_u n}$,
+using $1 - t \le e^{-t}$.
+
+**Step 5 — what was used, and what $\lambda = 0$ does.** Only the lower bound
+$p_\lambda \ge \lambda u$ was used; the network could be anything, including adversarial. The price is
+visible in the exponent: the sample count for a given confidence is at most $1/\lambda$ times
+uniform's. Setting $\lambda = 0$ removes Step 3, and with it the bound: if the proposal puts zero
+mass on a corridor every path must cross, the failure probability is 1 for every $n$. The theorem
+survives a learner. It does not survive a learner with no floor — which is why the Rust constructor
+refuses $\lambda \le 0$ and the widget's slider stops at 0.02. $\blacksquare$
+</Derivation>
+
+### Hitting times, divergences, and maximum likelihood
+
+Derivation 1 is a worst-case statement — the learner can only *lose* a factor $1/\lambda$. What it can
+*win* is a statement about where its mass is.
+
+<Derivation title="Derivation 2 — hitting time, KL as concentration and aim, and maximum likelihood" result="\arg\max_\theta \E_{p^*}[\ln \hat p_\theta] = \arg\min_\theta D_{\KL}(p^* \,\|\, \hat p_\theta)">
+**Step 1 — geometric waiting time.** The number of independent draws until the first one lands in a
+region $A$ is geometric with success probability $p(A)$, so its mean is $1/p(A)$. If the proposal
+puts $\hat p(A) = a\, u(A)$ on a corridor $A$, it hits the corridor $a$ times sooner than uniform.
+
+**Step 2 — the mixture caps the loss.** Under $p_\lambda$,
+$p_\lambda(A) \ge \lambda u(A)$, so the mean wait is at most $1/(\lambda u(A))$ — never more than
+$1/\lambda$ times uniform's, however wrong $\hat p$ is about $A$. At $\lambda = 0.1$ that is a factor
+of ten — the regime the Board's 400-check column shows, where the queries on which the proposal
+aimed elsewhere are still waiting for their corridor.
+
+**Step 3 — concentration.** Coarsen $\Q$ into $N$ cells with $u_i = 1/N$. Then
+$D_{\KL}(\hat p \,\|\, u) = \sum_i \hat p_i \ln(N \hat p_i) = \ln N - H(\hat p)$: zero for the uniform
+proposal, $\ln N$ for a proposal that puts everything in one cell. It measures how peaked the
+proposal is, and nothing else.
+
+**Step 4 — aim.** Let $p^*$ be the distribution of path nodes on the same partition. Then
+$D_{\KL}(p^* \,\|\, \hat p)$ is small exactly when $\hat p$ has mass wherever paths go. The direction
+matters: $p^*$ in the first slot makes the divergence infinite if $\hat p_i = 0$ for any cell a path
+uses, and indifferent to mass that $\hat p$ wastes elsewhere — the "forward" divergence penalizes the
+sampler's one catastrophic failure, missing the corridor, and forgives its mild one, sampling where
+paths do not go.
+
+**Step 5 — maximum likelihood.** Training data are path nodes $q_1, \dots, q_M \sim p^*$. The
+log-likelihood per sample is $\frac{1}{M}\sum_j \ln \hat p_\theta(q_j)$, whose expectation is
+$\sum_i p^*_i \ln \hat p_{\theta,i} = -H(p^*) - D_{\KL}(p^* \,\|\, \hat p_\theta)$. The entropy
+$H(p^*)$ does not depend on $\theta$, so maximizing the likelihood — equivalently, minimizing the
+cross-entropy loss the network is trained on — *is* minimizing the aim divergence. Conditioning on
+$\mathcal{E}$ and the query changes nothing but the subscripts. $\blacksquare$
+
+*The training curve in these units.* Uniform's cross-entropy on 144 cells is $\ln 144 = 4.970$ nats.
+The shipped sampler's final training cross-entropy is 3.393 nats, so by Step 5 it sits 1.576 nats
+closer to the path distribution, in $D_{\KL}(p^* \,\|\, \cdot)$, than uniform does — on its own
+training worlds. On fresh worlds from the same generator the check `ch22 aim` measures it directly:
+with $\lambda = 0.1$ and one fresh PRM path per world as $p^*$, the mixture is closer to $p^*$ than
+uniform on 6 of 7 worlds (mean 1.946 nats against 2.729). On the held-out bars it is closer on 8 of
+10 (2.186 against 2.770).
+</Derivation>
+
+<Derivation title="Collapsible — the CVAE of Ichter, Harrison and Pavone, and why this chapter uses cells">
+On Reach's two-dimensional torus a categorical over a 12 × 12 grid is a complete description of any
+density at that resolution, and it is natively multimodal: two corridors are two bright groups of
+cells. In seven dimensions a grid has $12^7 \approx 3.6 \times 10^7$ cells and the idea dies. Ichter,
+Harrison and Pavone's answer is a **conditional variational autoencoder**: a latent
+$z \sim \Normal(0, I)$ and a decoder $q = g_\theta(z, y)$ conditioned on $y = (\mathcal{E}, \qstart,
+\qgoal)$, trained by maximizing the evidence lower bound
+$$
+\ln p_\theta(q \mid y) \;\ge\; \E_{z \sim r_\phi(z \mid q, y)}\big[\ln p_\theta(q \mid z, y)\big]
+- D_{\KL}\big(r_\phi(z \mid q, y) \,\|\, \Normal(0, I)\big)
+$$
+with an encoder $r_\phi$ used only during training (Kingma and Welling's construction, with
+conditioning). The latent is what lets one network propose *both* corridors of a world: different
+regions of $z$-space decode to different modes. Maximizing the bound is maximizing a lower bound on
+the likelihood, so Step 5 applies with an inequality, and the learned proposal is used in a mixture
+with uniform exactly as here — their paper mixes in uniform samples for the same reason Derivation 1
+gives. The Rust crate keeps the categorical for $T^2$ and names the CVAE as the route to higher
+dimensions; the KL on a partition is then an estimate rather than exact.
+</Derivation>
+
+### The four-cell example, by hand
+
+Coarsen Reach's torus on one Workbench into its four quadrants. Two hundred draws of the raw learned
+sampler ($\lambda = 0$) fall $(100, 60, 30, 10)$, so
+$\hat p = (0.50, 0.30, 0.15, 0.05)$ against $u = (0.25, 0.25, 0.25, 0.25)$:
+
+$$
+D_{\KL}(\hat p \,\|\, u) = 0.5\ln 2 + 0.3\ln 1.2 + 0.15\ln 0.6 + 0.05\ln 0.2
+= 0.34657 + 0.05470 - 0.07662 - 0.08047 = \mathbf{0.2442\ \text{nats}}\ (0.352\ \text{bits}).
+$$
+
+Equivalently $\ln 4 - H(\hat p)$; the check asserts the identity to $10^{-12}$. Now the aim. The
+same world's roadmap paths put their nodes at $p^* = (0.55, 0.30, 0.10, 0.05)$, and only two terms
+survive because the other two ratios are one:
+
+$$
+D_{\KL}(p^* \,\|\, \hat p) = 0.55\ln 1.1 + 0.10\ln\tfrac{2}{3} = 0.0524 - 0.0405 = \mathbf{0.0119},
+\qquad
+D_{\KL}(p^* \,\|\, u) = \ln 4 - H(p^*) = 1.38629 - 1.07005 = \mathbf{0.3162}.
+$$
+
+The learned proposal is about $27\times$ closer to the path distribution than uniform is. Finally the
+floor: at $\lambda = 0.1$ the mixture is
+$p_\lambda = 0.9\,\hat p + 0.025 = (0.475, 0.295, 0.160, 0.070)$, whose smallest cell, $0.070$, is
+above $\lambda/4 = 0.025$ — Definition 22.2 holds, with room to spare, on the cell the raw sampler
+nearly ignored. The w22.1 bar chart runs this computation live on the current world.
+
+### Heuristics that overestimate
+
+<KeyIdea title="Definition 22.3 — ε-admissible heuristic">
+A heuristic $\hat h$ is **$\epsilon$-admissible** if $\hat h(v) \le (1 + \epsilon)\,h^*(v)$ for every
+node $v$, with $\hat h(\qgoal) = 0$. At $\epsilon = 0$ this is Choset's *optimistic* heuristic (App.
+H.2): "An optimistic, or admissible, heuristic always returns a value less than or equal to the cost
+of the shortest path from the current node to the goal node within the graph." For a learned
+$\hat h_\theta$, $\epsilon$ is not a design parameter but a *measurement*: the largest
+$\hat h_\theta / h^* - 1$ over an audited set of nodes, with $h^*$ from backward Dijkstra.
+</KeyIdea>
+
+<LinkedMath>
+$$
+\hat h \le (1+\epsilon)\, h^* \;\Longrightarrow\;
+\htmlClass{term-path}{C_{\text{A*}}} \;\le\; (1 + \epsilon)\, C^*
+$$
+</LinkedMath>
+
+<Derivation title="Derivation 3 — ε-admissible A* with reopening is (1 + ε)-optimal" result="C \le (1+\epsilon)\,C^*">
+**Step 1 — the open optimal node.** Let $P^* = (\qstart = v_0, v_1, \dots, v_m = \qgoal)$ be an
+optimal path of cost $C^*$. Before the goal is expanded, some node of $P^*$ is on OPEN with its
+optimal $g$: take the first $v_i$ on $P^*$ that is not closed with $g(v_i) = g^*(v_i)$. Its
+predecessor $v_{i-1}$ *was* expanded with $g(v_{i-1}) = g^*(v_{i-1})$, which relaxed $v_i$ to
+$g(v_i) \le g^*(v_{i-1}) + c(v_{i-1}, v_i) = g^*(v_i)$; so $g(v_i) = g^*(v_i)$, and $v_i$ is on OPEN
+— if it had been closed with a worse $g$, the relaxation *reopened* it. (This is where reopening is
+used.)
+
+**Step 2 — its key is at most $(1+\epsilon)C^*$.**
+$f(v_i) = g^*(v_i) + \hat h(v_i) \le g^*(v_i) + (1+\epsilon)\, h^*(v_i) \le (1+\epsilon)\big(g^*(v_i) + h^*(v_i)\big) = (1+\epsilon)\, C^*$,
+using $g^* \ge 0$ and $g^*(v_i) + h^*(v_i) = C^*$ on an optimal path.
+
+**Step 3 — the goal pops with key $C$.** When the goal is popped, $f(\qgoal) = g(\qgoal) + 0 = C$,
+the cost of the path A\* returns.
+
+**Step 4 — best-first order.** A\* pops the minimum key. At the moment the goal pops, $v_i$ from
+Step 1 is still on OPEN with key at most $(1+\epsilon)C^*$, so $C \le f(v_i) \le (1+\epsilon) C^*$.
+
+**Step 5 — conclusion.** The returned cost satisfies $C \le (1+\epsilon)C^*$. Nothing about *how*
+$\hat h$ was produced entered the proof: a learned heuristic, a scaled octile distance (weighted
+A\*), and a hand-tuned guess are all covered, with $\epsilon$ the measured worst ratio. $\blacksquare$
+
+*The additive form.* If instead $\hat h \le h^* + \delta$, Step 2 gives $f(v_i) \le C^* + \delta$
+and the same argument gives $C \le C^* + \delta$ (Exercise 2).
+
+*The reopening caveat.* Without reopening, Step 1 fails: an inconsistent heuristic can close a node of
+$P^*$ with a suboptimal $g$ that is never repaired, and the bound — even at $\epsilon = 0$ — no longer
+holds. Chapter 6's engine reopens, counts the reopenings, and the widget prints the count.
+
+*The measurement caveat.* The proof needs $\hat h \le (1+\epsilon)h^*$ on the nodes of *this* search.
+A validation $\epsilon$ is a maximum over the audited worlds; it is a guarantee there and an estimate
+everywhere else.
+</Derivation>
+
+**The three-node audit.** A chain $a \xrightarrow{2} b \xrightarrow{2} c \xrightarrow{1} \text{goal}$
+has true costs-to-go $h^* = (5.0, 3.0, 1.0)$, and a net outputs $\hat h = (4.6, 3.4, 0.8)$. The ratios
+are $\hat h/h^* = (0.92, 1.1333, 0.80)$: admissible at $a$ and $c$, **violated at $b$**, where
+$3.4 > 3.0$. Consistency fails at $b$ too, since $\hat h(b) = 3.4 > c(b, c) + \hat h(c) = 2.8$. So
+
+$$
+\epsilon = \max(0.92,\ 1.1333,\ 0.80) - 1 = \mathbf{0.1333},
+\qquad
+\text{any path A* returns from } a \text{ costs at most } 1.1333 \times 5.0 = \mathbf{5.667}.
+$$
+
+The audit is one function, `admissibility_audit`, and the check asserts the violation set
+$\{b\}$, the inconsistency set $\{b\}$, $\epsilon$ and the bound.
+
+**The audit of the shipped heuristic.** The net predicts $\ln(h^*/h_{oct})$, the factor by which
+obstacles stretch the empty-torus octile distance, so $\hat h = h_{oct}\,e^{\hat y}$ is inadmissible
+wherever the net guesses high. It was trained on 71,848 backward-Dijkstra labels from 240 worlds,
+with overestimates weighted six times in the squared loss. Auditing every reachable cell of 16
+validation worlds, three goals each: 5,584 of 12,830 cells over, $\epsilon_{val} = 0.662$. On 16
+held-out bar worlds, $\epsilon = 0.387$ — *smaller*: a sample maximum moves around. The check
+`ch22 ε audit` repeats this on eight fresh worlds ($\epsilon = 0.327$) and runs 43 searches: every one
+returned an optimal path. Derivation 3 is a ceiling, not a forecast.
+
+### Neural planners and what they inherit
+
+<KeyIdea title="Definition 22.4 — neural motion planner">
+A **neural motion planner** is a waypoint policy $\pi_\theta(\mathcal{E}, q, \qgoal)$ iterated from
+$\qstart$, whose output passes through a classical **repair**: each hop is certified by `Steer`; each
+failed stretch is bridged by RRT-Connect between the nearest free waypoints; and if a bridge fails,
+RRT-Connect runs on the original query.
+</KeyIdea>
+
+<Derivation title="Derivation 4 — a proposal plus a verifier inherits the verifier's guarantee" result="\text{guarantee}(\text{propose} \circ \text{verify} \circ \text{fallback}) = \text{guarantee}(\text{fallback})">
+**Step 1 — case split.** For a query $(\qstart, \qgoal)$ the composition either returns a candidate
+whose every segment the verifier certified, or hands the *original* query to a fallback planner
+$\mathcal{F}$.
+
+**Step 2 — validity.** In the first case the path is collision-free because the verifier is sound
+(the swept check of Chapter 2 cannot miss a collision; a fixed-step subdivision can, and the neural
+planner uses the former for that reason). In the second case it is collision-free because
+$\mathcal{F}$'s paths are.
+
+**Step 3 — completeness.** The composition fails only if the proposal is rejected *and*
+$\mathcal{F}$ fails on $(\qstart, \qgoal)$. So $\Pr[\text{fail}] \le \Pr[\mathcal{F} \text{ fails}]$:
+if $\mathcal{F}$ is probabilistically complete with Chapter 12's exponential rate, so is the
+composition. The guarantee $\mathcal{G}$ is a statement about the query, and the fallback answers the
+same query.
+
+**Step 4 — what does not transfer.** Time. The composition's running time is the proposal's plus the
+verification's plus, in the bad case, the whole fallback's; its worst case is worse than
+$\mathcal{F}$'s alone. Without the fallback the composition has no guarantee at all — only an
+empirical success rate measured on some distribution of worlds. $\blacksquare$
+
+*MPNet's schedule.* Qureshi and colleagues' planner proposes bidirectionally, contracts the path,
+re-plans failed segments with the network and finally with a classical planner. Ours is the
+one-directional version; Derivation 4 only needs the last resort to run on the original query.
+</Derivation>
+
+The check `ch22 proposal + verifier` runs the planner on 16 queries, eight from each generator, drawn
+without asking whether they have an answer: 12 returned a path, all 12 passed an independent dense
+recheck at a step of 0.005 rad, and 4 queries went to the whole-query fallback. The network *alone*
+solved 0 of the 8 in-distribution queries and 4 of the 8 held-out ones. Eight queries are too few to
+say more than that the success rate without repair is not a number anyone should plan on.
+
+### Diffusion planners, at the level of statements
+
+<KeyIdea title="Definition 22.5 — diffusion planner">
+A **diffusion planner** samples a trajectory $\tau \in \Q^T$ by iterated denoising from Gaussian
+noise, optionally tilted toward low cost $J(\tau)$ by guidance. It is a *proposal* in the sense of
+Definition 22.1: what it emits is checked afterwards, and a sample that fails the check is discarded.
+</KeyIdea>
+
+<Derivation title="Derivation 5 — the denoising objective and guided sampling (statement level)" result="\min_\theta \E\,\lVert \epsilon - \epsilon_\theta(\tau^k, k, \mathcal{E}) \rVert^2">
+**Step 1 — noising destroys structure.** The forward process
+$q(\tau^k \mid \tau^{k-1}) = \Normal\big(\sqrt{1-\beta_k}\,\tau^{k-1},\ \beta_k I\big)$ has the closed
+form $\tau^k = \sqrt{\bar\alpha_k}\,\tau^0 + \sqrt{1-\bar\alpha_k}\,\epsilon$ with
+$\bar\alpha_k = \prod_{i \le k}(1-\beta_i)$ and $\epsilon \sim \Normal(0, I)$. The toy model uses
+$K = 40$ steps with $\beta_k$ linear from $10^{-3}$ to $0.25$, so $\bar\alpha_K = 4.06 \times 10^{-3}$:
+less than half a percent of the demonstration survives, and $\tau^K$ is noise.
+
+**Step 2 — the net reverses one step.** A network $\epsilon_\theta(\tau^k, k, \mathcal{E})$ is trained
+to predict the noise, by minimizing $\E_{\tau^0, k, \epsilon}\lVert \epsilon - \epsilon_\theta(\tau^k, k, \mathcal{E})\rVert^2$
+over demonstrations $\tau^0$. Ho, Jain and Abbeel showed that this objective is a reweighted variational
+bound on the likelihood; at statement level it is "learn to undo one step of noise".
+
+**Step 3 — chaining samples the demonstrations.** Ancestral sampling runs
+$\tau^{k-1} = \frac{1}{\sqrt{1-\beta_k}}\big(\tau^k - \frac{\beta_k}{\sqrt{1-\bar\alpha_k}}\,\epsilon_\theta(\tau^k, k, \mathcal{E})\big) + \sqrt{\beta_k}\, z$
+from $k = K$ down to 1, with $z \sim \Normal(0, I)$ (no noise on the last step) and the start and goal
+re-pinned after every step — Janner and colleagues' inpainting of the constraints. If the
+demonstrations are bimodal, so are the samples: nothing in the procedure averages the two swings into
+one that goes through the slab.
+
+**Step 4 — guidance tilts, it does not constrain.** Subtracting $w_k \nabla_\tau J(\tau^k)$ from each
+step's mean, with $w_k \propto \beta_k$, approximately samples $p_\theta(\tau)\exp(-J(\tau))$ — the
+demonstrations reweighted toward low cost. In the toy, $J$ is Chapter 19's smoothness term plus a soft
+penalty $\sum_t \max(0, m - \lvert\tau_t\rvert)^2$ inside the slab's time window. A soft penalty can
+be outweighed and a gradient step can overshoot; collision is a hard constraint, so the checker runs
+afterwards. $\blacksquare$
+</Derivation>
+
+On 64 samples the toy diffuser produces 58% valid trajectories unguided — 30 swinging above the slab,
+34 below — and 83% with guidance. Both numbers are high, both modes survive, and neither is one. That
+last fact is the entire practical content of the section.
+
+### What an honest benchmark is
+
+<KeyIdea title="Definition 22.6 — honest benchmark">
+An **honest benchmark** of a learned planning component uses (i) held-out worlds from a generator
+*different* from the training one, alongside in-distribution worlds; (ii) success at fixed budgets in
+a planner-independent cost unit, here collision checks; (iii) path cost relative to a reference
+incumbent; (iv) wall-clock *including* inference, with training time amortized over a stated number
+of queries; and (v) classical baselines run with the same seeds, the same budget and the same care.
+</KeyIdea>
+
+For (iii) the Rust harness uses RRT\*'s incumbent after ten seconds; the web port uses the shortest
+path *any* method found, including a dense reference PRM — weaker (1.0 means "as good as anything we
+tried"), but every ratio is at least one by construction, as `ch22 Board invariants` asserts.
+
+## The algorithm
+
+Five boxes, one per learned component and one for the board. Each is a classical algorithm from an
+earlier chapter with one line replaced; the replaced line is marked.
+
+<Algorithm
+  name="LEARNED-PROPOSAL PRM  (Choset Algorithm 6, sampling line replaced)"
+  inputs="Workbench encoding 𝓔, query (q_start, q_goal), trained net θ, floor λ ∈ (0, 1], budget b in collision checks, k"
+  outputs="a roadmap path from q_start to q_goal, or FAILURE"
+  complexity="one forward pass, then BASIC PRM: per node one categorical draw (O(log N) by CDF search) plus k calls to Δ"
+>
+1. $\pi \leftarrow \mathrm{softmax}\big(f_\theta(\mathcal{E}, \qstart, \qgoal)\big)$ — the cell masses, computed **once** per query
+2. **if** $\lambda \le 0$ **then return** error — Derivation 1 needs a floor
+3. add $\qstart, \qgoal$ as nodes; connect each to its $k$ nearest
+4. **while** $\qstart, \qgoal$ are in different components **and** checks spent $< b$ **do**
+5. &nbsp;&nbsp;&nbsp;&nbsp;**with probability** $\lambda$: $q \leftarrow$ uniform on $\Q$; **otherwise** draw cell $c \sim \pi$ and $q \leftarrow$ uniform in cell $c$ ◀ *replaced line*
+6. &nbsp;&nbsp;&nbsp;&nbsp;**if** $q$ is collision-free **then** add $q$; connect to its $k$ nearest with $\Dist$ (unchanged verifier)
+7. **return** the shortest roadmap path, or FAILURE
+</Algorithm>
+
+<Algorithm
+  name="A*_ε WITH A MEASURED ε  (Choset Algorithm 24 with reopening, heuristic replaced)"
+  inputs="lattice G, start s, goal g, net θ, encoding 𝓔, audit worlds W"
+  outputs="a path of cost C ≤ (1 + ε)C* on audited worlds, and ε"
+  complexity="audit: one backward Dijkstra per audited goal plus one forward pass per cell; search: Dijkstra's worst case"
+>
+1. **audit**: **for** each world in $W$ and each sampled goal $g'$: $h^* \leftarrow$ backward Dijkstra from $g'$
+2. &nbsp;&nbsp;&nbsp;&nbsp;$\epsilon \leftarrow \max\big(\epsilon,\ \max_v \hat h_\theta(v)/h^*(v) - 1\big)$ over reachable $v$ with $h^*(v) > 0$
+3. **search**: $\hat h(v) \leftarrow h_{oct}(v)\, \exp\big(\hat y_\theta(\mathcal{E}, v, g)\big)$ for every free $v$ ◀ *replaced line*
+4. run A\* from $s$ to $g$ with key $f = g + \hat h$, **reopening** any closed node whose $g$ improves
+5. **return** path, its cost $C$, expansions, reopenings, and $\epsilon$ — the bound $(1+\epsilon)C^*$ holds on the audited worlds (Derivation 3)
+</Algorithm>
+
+<Algorithm
+  name="MPNET-STYLE PLAN WITH LAZY REPAIR  (proposal: policy; verifier: Steer; fallback: Choset Algorithm 13)"
+  inputs="encoding 𝓔, query (q_start, q_goal), policy π_θ, hop η, repair budget r, fallback budget F"
+  outputs="a certified path, or FAILURE"
+  complexity="at most H forward passes, one Steer per hop, then repair trees"
+>
+1. $w_0 \leftarrow \qstart$; **for** $i = 1, \dots, H$: $w_i \leftarrow w_{i-1} + \eta \tanh \pi_\theta(\mathcal{E}, w_{i-1}, \qgoal)$, snapping to $\qgoal$ within $\eta$; re-propose with jitter if $w_i$ collides ◀ *proposal*
+2. **for** each hop $(w_{i-1}, w_i)$: $\mathit{ok}_i \leftarrow \Dist(w_{i-1}, w_i) \ne$ NIL (swept, sound)
+3. walk the hops; at a failed hop, find the next free waypoint $w_j$ (or $\qgoal$) and run RRT-Connect from $w_{i-1}$ to $w_j$ for $r$ iterations; splice the bridge
+4. **if** any bridge failed **then** run RRT-Connect on $(\qstart, \qgoal)$ for $F$ iterations — the guarantee (Derivation 4)
+5. re-certify every segment of the result; **return** it, or FAILURE
+</Algorithm>
+
+<Algorithm
+  name="GUIDED DENOISING, THEN VERIFY  (Diffuser-style, statement level)"
+  inputs="noise predictor ε_θ, schedule β₁…β_K, guidance cost J and scale s, endpoints, sample count M"
+  outputs="the certified subset of M sampled trajectories"
+  complexity="K forward passes per sample (O(K T c_net)), then one hard check per sample"
+>
+1. **for** $m = 1, \dots, M$: $\tau \leftarrow \Normal(0, I)$; pin $\tau_0 = \qstart$, $\tau_{T-1} = \qgoal$
+2. &nbsp;&nbsp;&nbsp;&nbsp;**for** $k = K, \dots, 1$: $\mu \leftarrow \frac{1}{\sqrt{1-\beta_k}}\big(\tau - \frac{\beta_k}{\sqrt{1-\bar\alpha_k}}\epsilon_\theta(\tau, k)\big) - s\,\beta_k \nabla J(\tau)$
+3. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$\tau \leftarrow \mu + \sqrt{\beta_k}\,z$ (no noise at $k = 1$); re-pin the endpoints
+4. **return** $\{\tau : \tau$ passes the collision checker$\}$ — the verifier is not optional
+</Algorithm>
+
+<Algorithm
+  name="HONEST BENCHMARK  (Definition 22.6)"
+  inputs="two world generators, n queries per suite, planners, budgets b₁ < … < b_m, seed"
+  outputs="per planner and suite: success at each budget, cost ratio, wall-clock with and without inference"
+  complexity="O(suites × n × planners × b_m)"
+>
+1. **for** each suite and seed: build a world; draw a blocked query; keep it only if a dense reference PRM solves it
+2. &nbsp;&nbsp;&nbsp;&nbsp;**for** each planner: run once with the same seed, stopping at $b_m$ checks or at the first verified path
+3. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;record checks at the first path, its cost after shortcutting, wall-clock, inference time
+4. &nbsp;&nbsp;&nbsp;&nbsp;incumbent $\leftarrow$ the shortest cost any run, or the reference, found
+5. **report** success at $b_i$ as the fraction with checks $\le b_i$; cost ratio over the solved; time amortized over $k$ queries
+</Algorithm>
+
+## Implementation in Rust
+
+The `learn` crate trains with `candle` and infers without it. Training is native-only (`candle-core`
+and `candle-nn` build the networks, losses and optimizer); each trained network is exported to
+`safetensors` and evaluated by `infer.rs`, a forty-line forward pass on `nalgebra`, so the WebAssembly
+widgets and the native planner run identical arithmetic — a test asserts candle and `infer.rs` agree to
+$10^{-6}$ on a thousand inputs. The TypeScript port that
+runs this page goes one step further and hand-rolls a tiny MLP, backpropagation included, in
+`lib/learn/mlp.ts` — two layers, tanh, Adam — so the checks can train small networks from scratch
+(XOR, a one-dimensional function, the toy denoiser) and the whole story runs with no dependency. The
+check `ch22 MLP backprop` compares its gradients to central differences on three architectures; the
+worst relative discrepancy is $3 \times 10^{-8}$. The crate imports and never re-defines Chapter 11's
+`Sampler`, `Hybrid`, `Uniform` and `Steer`, Chapter 12's `RrtConnect` and Chapter 6's `astar`.
+
+```rust title="crates/learn/src/{infer.rs, info.rs}"
+use nalgebra::{DMatrix, DVector};
+
+/// A dense tanh MLP as exported from candle: layers (W, b), tanh between, linear out.
+/// This is the *only* inference path — native planner, WASM widgets and the TS port agree.
+pub struct MlpWeights { pub layers: Vec<(DMatrix<f32>, DVector<f32>)> }
+
+impl MlpWeights {
+    pub fn from_safetensors(bytes: &[u8]) -> Result<Self, LearnError> { /* names l0.w, l0.b, … */ }
+
+    pub fn forward(&self, x: &DVector<f32>) -> DVector<f32> {
+        let last = self.layers.len() - 1;
+        self.layers.iter().enumerate().fold(x.clone(), |h, (i, (w, b))| {
+            let z = w * h + b;
+            if i == last { z } else { z.map(f32::tanh) }
+        })
+    }
+}
+
+pub fn softmax(z: &DVector<f32>) -> DVector<f64> {
+    let m = z.max();                                   // shift: exp never overflows
+    let e = z.map(|v| f64::from(v - m).exp());
+    let s = e.sum();
+    e / s
+}
+
+/// Counts on N cells and the two divergences of Derivation 2 (nats).
+pub struct CoarseHistogram<const N: usize>(pub [u64; N]);
+
+impl<const N: usize> CoarseHistogram<N> {
+    pub fn probabilities(&self) -> [f64; N] {
+        let t = self.0.iter().sum::<u64>() as f64;
+        self.0.map(|c| c as f64 / t)
+    }
+    /// D_KL(p̂ ‖ u) = ln N − H(p̂): concentration, not aim.
+    pub fn kl_to_uniform(&self) -> f64 {
+        let u = [1.0 / N as f64; N];
+        kl(&self.probabilities(), &u)
+    }
+    /// D_KL(target ‖ p̂): aim. Infinite if p̂ misses a cell the target uses — the failure that matters.
+    pub fn kl_from(&self, target: &[f64; N]) -> f64 { kl(target, &self.probabilities()) }
+    /// p_λ = (1 − λ) p̂ + λ u, cell by cell (Definition 22.2).
+    pub fn mixture(&self, lambda: f64) -> [f64; N] {
+        self.probabilities().map(|p| (1.0 - lambda) * p + lambda / N as f64)
+    }
+}
+
+pub fn kl(p: &[f64], q: &[f64]) -> f64 {
+    p.iter().zip(q).filter(|(pi, _)| **pi > 0.0).map(|(pi, qi)| {
+        if *qi <= 0.0 { f64::INFINITY } else { pi * (pi / qi).ln() }       // 0 · ln 0 = 0
+    }).sum()
+}
+```
+
+The sampler is a categorical over a 12 × 12 coarsening of the torus, conditioned on the 8 × 8 raster
+and on $(\cos, \sin)$ of the four query angles — the wrap-aware encoding Chapter 5 recommends for
+$S^1$ factors. It implements Chapter 11's `Sampler` and nothing else; the free-space test inside
+`sample` is the one every other sampler runs. The safe version is not a new type: it is Chapter 11's
+`Hybrid`, and the constructor is where Derivation 1 is enforced.
+
+```rust title="crates/learn/src/sampler.rs" {39-44}
+use candle_core::{DType, Device, Tensor};
+use candle_nn::{linear, loss::cross_entropy, AdamW, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use manifold::{Manifold, T2};
+use rand::{rngs::SmallRng, Rng};
+use sampling::{FreeSpace, Hybrid, Sampler, Uniform};
+use crate::{encode::{query_features, EnvEncoding}, infer::{softmax, MlpWeights}, LearnError};
+
+pub const CELLS_N: usize = 12;
+pub const CELLS: usize = CELLS_N * CELLS_N;
+type Q = <T2 as Manifold>::Point;
+
+/// D22.1. The raw proposal p̂_θ(· | 𝓔, q_start, q_goal): draw a cell, then a uniform point in it.
+pub struct LearnedSampler { probs: Vec<f64>, cdf: Vec<f64> }
+
+impl LearnedSampler {
+    /// One forward pass per query — the cell masses do not depend on the samples drawn.
+    pub fn new(net: &MlpWeights, env: &EnvEncoding, start: &Q, goal: &Q) -> Self {
+        let probs: Vec<f64> = softmax(&net.forward(&query_features(env, start, goal))).iter().copied().collect();
+        let cdf = probs.iter().scan(0.0, |acc, p| { *acc += p; Some(*acc) }).collect();
+        Self { probs, cdf }
+    }
+    pub fn draw_raw(&self, rng: &mut SmallRng) -> Q {
+        let u: f64 = rng.random();
+        let c = self.cdf.partition_point(|&f| f < u).min(CELLS - 1);
+        let (i, j) = (c % CELLS_N, c / CELLS_N);
+        let w = std::f64::consts::TAU / CELLS_N as f64;
+        T2::from_angles([-std::f64::consts::PI + (i as f64 + rng.random::<f64>()) * w,
+                         -std::f64::consts::PI + (j as f64 + rng.random::<f64>()) * w])
+    }
+}
+
+impl Sampler<T2> for LearnedSampler {
+    fn sample(&mut self, _: &T2, free: &dyn FreeSpace<T2>, rng: &mut SmallRng) -> Option<Q> {
+        let q = self.draw_raw(rng);
+        free.is_free(&q).then_some(q)                  // the verifier is Chapter 11's, untouched
+    }
+}
+
+/// D22.2 by construction: Chapter 11's `Hybrid` with `Uniform` as the floor at weight λ.
+/// Derivation 1 needs λ > 0, so λ = 0 is an error here, not a warning in a README.
+pub fn safe_learned_sampler(learned: LearnedSampler, lambda: f64) -> Result<Hybrid<T2>, LearnError> {
+    if !(lambda > 0.0 && lambda <= 1.0) { return Err(LearnError::NoUniformFloor(lambda)); }
+    Ok(Hybrid { parts: vec![(Box::new(learned), 1.0 - lambda), (Box::new(Uniform), lambda)] })
+}
+
+/// Maximum likelihood on path-node cells = min D_KL(p* ‖ p̂_θ) (Derivation 2). Native only.
+pub fn train_sampler(x: &[Vec<f32>], cells: &[u32], epochs: usize) -> candle_core::Result<VarMap> {
+    let dev = Device::Cpu;
+    let vars = VarMap::new();
+    let vb = VarBuilder::from_varmap(&vars, DType::F32, &dev);
+    let (l0, l1) = (linear(x[0].len(), 64, vb.pp("l0"))?, linear(64, CELLS, vb.pp("l1"))?);
+    let mut opt = AdamW::new(vars.all_vars(), ParamsAdamW { lr: 2e-3, ..Default::default() })?;
+    let xs = Tensor::from_vec(x.concat(), (x.len(), x[0].len()), &dev)?;
+    let ys = Tensor::from_slice(cells, cells.len(), &dev)?;
+    for _ in 0..epochs {
+        let logits = l1.forward(&l0.forward(&xs)?.tanh()?)?;
+        opt.backward_step(&cross_entropy(&logits, &ys)?)?;   // full batch for brevity; the crate mini-batches
+    }
+    Ok(vars)                                                  // → safetensors → MlpWeights
+}
+```
+
+The heuristic is a closure, because that is all Chapter 6's `astar` ever asked of a heuristic. The
+$\epsilon$ is a field that starts as `None` and is filled only by an audit — the type makes it
+impossible to quote a bound that was never measured.
+
+```rust title="crates/learn/src/heuristic.rs"
+use search::{astar, Trace};
+use cspace::TorusGrid;                                // Ch. 4's raster, 8-connected with wraparound
+use crate::{encode::{heuristic_features, EnvEncoding}, infer::MlpWeights};
+
+/// Learned cost-to-go. ĥ = h_oct · exp(ŷ): at least the admissible baseline where ŷ ≥ 0.
+pub struct HeuristicNet<'a> { net: &'a MlpWeights, env: &'a EnvEncoding, grid: &'a TorusGrid,
+                              goal: usize, pub epsilon: Option<f64> }
+
+impl HeuristicNet<'_> {
+    pub fn h(&self, v: usize) -> f64 {
+        let base = self.grid.octile(v, self.goal);
+        if base == 0.0 { return 0.0; }
+        let y = self.net.forward(&heuristic_features(self.env, self.grid, v, self.goal))[0];
+        base * f64::from(y).clamp(-1.0, 3.0).exp()   // clamp: one wild guess cannot overflow
+    }
+}
+
+/// Derivation 3's hypothesis, measured: max over every reachable cell of ĥ/h* − 1.
+pub fn measure_epsilon(h: &HeuristicNet, h_star: &[f64]) -> (f64, usize) {
+    h_star.iter().enumerate()
+        .filter(|(_, hs)| hs.is_finite() && **hs > 0.0)
+        .fold((0.0, 0), |(eps, over), (v, hs)| {
+            let r = h.h(v) / hs;
+            if r > 1.0 + 1e-9 { (eps.max(r - 1.0), over + 1) } else { (eps, over) }
+        })
+}
+
+/// Ch. 6's A*, which reopens; the bound below is Derivation 3 and holds only where ε was audited.
+pub fn a_star_eps(grid: &TorusGrid, s: usize, g: usize, h: &HeuristicNet) -> Option<(Trace<usize>, f64)> {
+    let eps = h.epsilon.expect("measure ε before quoting a bound");
+    let t = astar(grid, s, g, |v| h.h(v))?;
+    let bound = (1.0 + eps) * grid.cost_to_go(g)[s];
+    debug_assert!(t.cost <= bound + 1e-9, "Derivation 3 violated on an audited world");
+    Some((t, bound))
+}
+
+pub struct Audit { pub ratios: Vec<f64>, pub violated: Vec<char>, pub inconsistent: Vec<char>,
+                   pub epsilon: f64, pub bound: f64 }
+
+/// §3(b): a chain v₀ → v₁ → … → goal with edge costs c; both heuristics are 0 at the goal.
+pub fn admissibility_audit(labels: &[char], h_star: &[f64], h_hat: &[f64], c: &[f64]) -> Audit {
+    let ratios: Vec<f64> = h_hat.iter().zip(h_star).map(|(a, b)| a / b).collect();
+    let violated = labels.iter().zip(&ratios).filter(|(_, r)| **r > 1.0 + 1e-12).map(|(l, _)| *l).collect();
+    let inconsistent = (0..labels.len())
+        .filter(|&i| h_hat[i] > c[i] + h_hat.get(i + 1).copied().unwrap_or(0.0) + 1e-12)
+        .map(|i| labels[i]).collect();
+    let epsilon = (ratios.iter().copied().fold(f64::MIN, f64::max) - 1.0).max(0.0);
+    Audit { ratios, violated, inconsistent, epsilon, bound: (1.0 + epsilon) * h_star[0] }
+}
+```
+
+The neural planner holds its repair planner as a field, not an `Option`: Derivation 4 says the
+guarantee lives there, and a planner without one has only a success rate.
+
+```rust title="crates/learn/src/neural_planner.rs"
+use manifold::T2;
+use rand::{rngs::SmallRng, Rng};
+use sampling::{tree::{Extend, RrtConnect}, FreeSpace, Steer};
+use crate::{encode::EnvEncoding, infer::MlpWeights, Q};
+
+pub struct MpnetLike<E: Extend<T2>> { policy: MlpWeights, env: EnvEncoding, repair: E,
+                                      eta: f64, max_hops: usize, local: usize, fallback: usize }
+
+pub struct NeuralPlan { pub waypoints: Vec<Q>, pub hops_ok: Vec<bool>,
+                        pub fell_back: bool, pub path: Option<Vec<Q>> }
+
+impl<E: Extend<T2> + Clone> MpnetLike<E> {
+    pub fn plan(&self, free: &dyn FreeSpace<T2>, s: &Q, g: &Q, rng: &mut SmallRng) -> NeuralPlan {
+        // D22.1: ≤ max_hops of q + η·tanh(π_θ), re-proposed with jitter where the endpoint collides.
+        let waypoints = self.propose(free, s, g, rng);
+        let hops_ok: Vec<bool> = waypoints.windows(2)          // the verifier, one hop at a time
+            .map(|w| self.repair.steer(&T2, free, &w[0], &w[1]).is_some()).collect();
+        let mut out = vec![*s];
+        let (mut i, mut failed) = (0, false);
+        let last = waypoints.len() - 1;
+        while i < last {
+            if hops_ok[i] { out.push(waypoints[i + 1]); i += 1; continue; }
+            let j = (i + 1..last).find(|&j| free.is_free(&waypoints[j])).unwrap_or(last);
+            match self.connect(free, &waypoints[i], &waypoints[j], self.local, rng) {
+                Some(bridge) => { out.extend_from_slice(&bridge[1..]); i = j; }
+                None => { failed = true; break; }
+            }
+        }
+        // Derivation 4: the last resort answers the *original* query, so its guarantee is ours.
+        let (path, fell_back) = if failed { (self.connect(free, s, g, self.fallback, rng), true) }
+                                else { (Some(out), false) };
+        let path = path.filter(|p| p.windows(2).all(|w| self.repair.steer(&T2, free, &w[0], &w[1]).is_some()));
+        NeuralPlan { waypoints, hops_ok, fell_back, path }
+    }
+
+    fn connect(&self, free: &dyn FreeSpace<T2>, a: &Q, b: &Q, iters: usize, rng: &mut SmallRng) -> Option<Vec<Q>> {
+        RrtConnect::new(T2, a.clone(), b.clone(), self.repair.clone(), self.eta, rng.random()).merge(free, iters)
+    }
+}
+```
+
+The worked example prints the two micro-examples exactly — they are arithmetic, and the test asserts
+them — and then trains on randomized Workbenches.
+
+```rust title="crates/learn/examples/learned_sampler.rs"
+use learn::{admissibility_audit, data, CoarseHistogram};
+
+fn main() -> anyhow::Result<()> {
+    // §3(a): 200 raw draws on four quadrants of one Workbench's torus.
+    let hat = CoarseHistogram([100u64, 60, 30, 10]);
+    let target = [0.55, 0.30, 0.10, 0.05];
+    println!("counts {:?}  KL(p_hat||u) = {:.4} nats ({:.3} bits)  KL(p*||p_hat) = {:.4}  KL(p*||u) = {:.4}",
+             hat.0, hat.kl_to_uniform(), hat.kl_to_uniform() / std::f64::consts::LN_2,
+             hat.kl_from(&target), learn::kl(&target, &[0.25; 4]));
+    println!("p_lambda(0.1) = {:.3?}", hat.mixture(0.1));
+
+    // §3(b): a →2→ b →2→ c →1→ goal.
+    let a = admissibility_audit(&['a', 'b', 'c'], &[5.0, 3.0, 1.0], &[4.6, 3.4, 0.8], &[2.0, 2.0, 1.0]);
+    println!("h* [5.0 3.0 1.0]  h_hat [4.6 3.4 0.8]  violated {:?}  inconsistent {:?}  epsilon {:.4}  bound {:.3}",
+             a.violated, a.inconsistent, a.epsilon, a.bound);
+
+    // The pipeline: 600 random Workbenches × 3 queries → paths → sampler, policy; Dijkstra → heuristic.
+    let seed = std::env::args().skip_while(|a| a != "--seed").nth(1).map_or(Ok(7), |s| s.parse())?;
+    let ds = data::generate_dataset(data::Generator::Blocks, 600, 3, seed);
+    println!("{}/{} PRM queries solved · {} sampler targets · {} policy targets",
+             ds.solved, ds.attempted, ds.sampler.len(), ds.policy.len());
+    Ok(())
+}
+```
+
+```text title="cargo run --release --example learned_sampler -p learn -- --seed 7"
+counts [100, 60, 30, 10]  KL(p_hat||u) = 0.2442 nats (0.352 bits)  KL(p*||p_hat) = 0.0119  KL(p*||u) = 0.3162
+p_lambda(0.1) = [0.475, 0.295, 0.160, 0.070]
+h* [5.0 3.0 1.0]  h_hat [4.6 3.4 0.8]  violated ['b']  inconsistent ['b']  epsilon 0.1333  bound 5.667
+954/1800 PRM queries solved · 21508 sampler targets · 44553 policy targets
+```
+
+The first three lines are exact and are what the tests below assert. The last is the TypeScript port's
+run of the same pipeline (`lib/learn/__train__.ts`, seed 7), which the page's numbers come from; a Rust
+run reproduces the pattern, not the digits, because the random streams differ. As recorded there: the
+sampler's cross-entropy fell to 3.393 nats in 50 epochs (uniform: 4.970); generating the paths took
+147 s and training the sampler 93 s — 241 s in all, the number the Board amortizes.
+
+```rust title="crates/learn/tests/micro.rs"
+use learn::*;
+
+#[test]
+fn kl_four_cell_matches_hand_computation() {
+    let h = CoarseHistogram([100u64, 60, 30, 10]);
+    assert!((h.kl_to_uniform() - 0.2442).abs() < 1e-4);
+    let entropy = -h.probabilities().iter().map(|p| p * p.ln()).sum::<f64>();
+    assert!((h.kl_to_uniform() - (4f64.ln() - entropy)).abs() < 1e-12);       // ln N − H(p̂)
+    assert!((h.kl_from(&[0.55, 0.30, 0.10, 0.05]) - 0.0119).abs() < 1e-4);
+}
+
+#[test]
+fn eps_admissibility_three_nodes() {
+    let a = admissibility_audit(&['a', 'b', 'c'], &[5.0, 3.0, 1.0], &[4.6, 3.4, 0.8], &[2.0, 2.0, 1.0]);
+    assert_eq!(a.violated, vec!['b']);
+    assert_eq!(a.inconsistent, vec!['b']);
+    assert!((a.epsilon - 0.13333).abs() < 1e-4 && (a.bound - 5.6667).abs() < 1e-3);
+}
+
+#[test]
+fn mixture_never_below_lambda_uniform() {
+    let h = CoarseHistogram([100u64, 60, 30, 10]);
+    for lambda in [0.05, 0.1, 0.3] { assert!(h.mixture(lambda).iter().all(|&m| m >= lambda / 4.0 - 1e-12)); }
+    assert!(safe_learned_sampler(LearnedSampler::uniform_stub(), 0.0).is_err());
+}
+```
+
+The crate's fourth test, `a_star_eps_cost_within_bound`, runs Derivation 3 as a property on 500
+seeded lattices with $\hat h = h^*(1 + 0.3\,r)$, $r \sim U[0, 1]$. The web port's checks are the same
+tests in TypeScript — its property test saw a worst realized ratio of 1.0711 over 30 searches, with
+13 reopenings — plus the mixture floor with 100,000 empirical draws, the $\epsilon$ audit, the
+proposal-plus-verifier recheck, the toy diffuser, and the Board's invariants.
+
+## Putting it together: reading the board
+
+The integration lab is the Honest Benchmark Board above, read the way Definition 22.6 says to: thirty
+solvable queries per suite, from the training generator (axis-aligned blocks, like the real
+Workbench's block, post and shelf) and the held-out one (thin bars at arbitrary angles), budgets from
+100 to 12,800 collision checks, the same world, query and seed for every planner.
+
+**Success at budget.** In distribution, at 100 checks, the learned sampler at $\lambda = 0.1$ solves
+60% against uniform's 47%; RRT-Connect solves 57%. At 400 checks the learned sampler has fallen
+behind: 77% against uniform's 90%, the bridge sampler's 80% and RRT-Connect's 93%. That shape —
+ahead early, behind later — is Derivation 2's cap in action. When the proposal aims right, it hits
+the corridor sooner than uniform; when it aims wrong, only the $\lambda$ floor keeps it searching,
+at up to ten times uniform's waiting time, and by 400 checks those queries are what the column
+counts. At 12,800 checks the learned and uniform rows both solve every query in both suites —
+Derivation 1, on the board.
+
+**The held-out suite.** We expected the learned sampler to lose its edge on the other generator. At
+$\lambda = 0.1$ it did not lose more than it had: held-out at 100 checks it solves 63% against
+uniform's 60%, and at 400 checks both solve 90% (bridge 80%, RRT-Connect 100%). Single worlds show the
+reversal — w22.1's default held-out seed costs the learner more than twice uniform's checks — but over
+thirty queries the bars were not harder for it than the blocks. Thirty queries is a small suite, and
+"did not degrade on one other generator" is not "generalizes".
+
+**Path cost.** The learned sampler's first paths are consistently shorter: 1.28 times the incumbent
+in distribution against uniform's 1.33, and 1.23 against 1.43 held-out. That is Derivation 2's aim
+paying off in a currency nobody optimized for — the targets were nodes on *shortest* roadmap paths,
+so the proposal concentrates where short paths go. RRT-Connect, at 1.07 in distribution, beats every PRM row
+on cost as well.
+
+**Wall-clock.** Here the learned row loses outright. A query's forward pass costs about 0.10 ms, so
+inference is not what makes the learned PRM's mean wall-clock in distribution 12 ms against uniform's
+10 ms; the difference is in the planning loop itself. Amortizing the 241 s of data generation and training over $k$ queries can
+only make that worse, and the break-even against uniform is *never*. The MPNet-style planner pays
+1.1 ms of inference per query and 53 ms of wall-clock, most of it in repairs, and reaches 93% at
+the full budget in both suites; on the remaining queries the fallback either ran out of iterations
+or overran the check budget.
+
+**What a fair reading concludes.** On Reach's two-dimensional torus, with these small networks, a
+learned proposal buys a better first path and a head start at the smallest budgets, and it costs
+wall-clock and four minutes of offline work before the first query. A hand-designed single-query planner,
+RRT-Connect, is better than all of it. None of that is a verdict on learning in planning — the
+literature's wins are in seven-dimensional arms and repeated queries on similar scenes, where uniform
+sampling is hopeless and a training run is amortized over many queries — but it is a verdict
+on *this* setting, and the board's purpose is that such verdicts are possible at all.
+
+### What is principled, and what is still alchemy
+
+The chapter closes with a ledger, because the field needs one more than it needs another leaderboard.
+
+**Principled.** Any completeness-preserving proposal keeps Choset's guarantee with its constant
+multiplied by $\lambda$ (Derivation 1), and a constructor that refuses $\lambda = 0$ makes that a
+property of the code. Maximum-likelihood training of a sampler is minimization of the forward KL
+divergence from the path distribution (Derivation 2), so "the sampler is aimed well" has a definition
+and a number. A heuristic's overestimate bounds the path cost exactly (Derivation 3), provided
+$\epsilon$ is *measured*, and provided one says aloud that a validation $\epsilon$ is a guarantee on
+the validation worlds and an estimate elsewhere — on this chapter's worlds the held-out $\epsilon$
+happened to be smaller than the validation one, which is luck, not a law. A proposal behind a sound
+verifier and a fallback on the original query inherits the fallback's guarantee (Derivation 4). And a
+benchmark that includes inference time, training time and held-out worlds (Definition 22.6) can
+falsify a claim, which is the only kind of benchmark worth running.
+
+**Still alchemy in 2026.** *Generalization across world generators*: our held-out suite is one other
+generator, and no theorem says what the next one does. *Validation $\epsilon$ as a deployment
+guarantee*: it is not one. *Neural planners' success rates without repair*: an empirical rate on a
+distribution of worlds, and the check that runs the net alone saw 0 of 8 in one suite and 4 of 8 in
+the other. *Diffusion guidance through a non-differentiable constraint*: collision is a set, not a
+cost; guidance raised the toy's valid fraction from 58% to 83% and no setting makes it one. *The
+circularity*: the sampler is trained on paths from the very PRM it is benchmarked against, so at best
+it reproduces PRM-with-a-large-budget, faster — it cannot find a passage the teacher never found. And
+*amortization*: a training run is paid for only by enough queries on *similar* worlds, and on this
+board the break-even never arrives.
+
+[Chapter 23](/chapters/ch23-capstone)'s planning stack will carry a "learned sampler" toggle in Reach's
+panel, wired through exactly the `Hybrid` constructor above, and cite this board in its
+retrospective. The sister book's
+[Chapter 25](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch25-learning)
+applies the same principled-or-alchemy discipline to learning inside an estimator, where the verifier
+is a likelihood rather than a collision checker and the inheritance argument has a different shape.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="λ through the whole of Chapter 11">
+    Carry $\lambda$ through Chapter 11's $(\epsilon, \alpha, \beta)$-expansiveness proof (Theorem
+    7.4.2), not only through the tiling bound of Derivation 1. Every volume in that proof is a
+    uniform measure of a reach set or a lookout; under $p_\lambda$ each is bounded below by $\lambda$
+    times itself. Name the constant of the theorem that absorbs the change. Then show that a proposal
+    with $\hat p(A) = 0$ on one tile $A$ makes the failure probability of Derivation 1 bounded below
+    by a positive constant independent of $n$.
+    <CheckAnswer id="ch22.e1" prompt="Chapter 11's ball-tiling example (path length 1.2, clearance 0.1, unit square) needs 892 uniform samples for an exponential-form failure bound of 1%. With the same tiles and a mixture at λ = 0.1, how many samples does the same bound require?" answer={8920} tolerance={100}>
+    In the exponential form the requirement is $n \ge \ln(\ell/\delta)/p$; replacing $p$ by $\lambda p$
+    multiplies it by $1/\lambda = 10$. The learned sampler may need far fewer in practice — the
+    bound is the price of knowing nothing about it.
+    </CheckAnswer>
+    <Hints>
+      <>Theorem 7.4.2's sample bound has the form of a logarithm divided by a product of the expansiveness constants.</>
+      <>ε and α are fractions of μ(𝒬_free); under p_λ both measured masses can only shrink by a factor λ, never more.</>
+      <>For the converse: if a tile has zero proposal mass and λ = 0, the probability that it stays empty is 1 for every n.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="The additive bound, and A* without reopening">
+    Prove the additive form of Derivation 3: if $\hat h \le h^* + \delta$ everywhere, A\* with
+    reopening returns $C \le C^* + \delta$. Then build a four-node graph — start, two intermediate
+    nodes, goal — with an *admissible but inconsistent* heuristic on which A\* *without* reopening
+    returns a suboptimal path, and explain which step of the derivation breaks.
+    <Hints>
+      <>Only Step 2 changes: f(v) ≤ g*(v) + h*(v) + δ.</>
+      <>You want a node on the optimal path to be closed first through an expensive edge, because the cheap route to it passes a node whose heuristic is high — but still admissible.</>
+      <>Try edges s→a 1, a→b 1, s→b 3, b→t 3 with ĥ(s) = ĥ(b) = 0 and ĥ(a) = 4. Every value is admissible (h* = 5, 4, 3, 0 for s, a, b, t), but ĥ(a) exceeds c(a, b) + ĥ(b) = 1. Trace the pops: b is closed with g = 3 before a reveals g = 2, and without reopening the goal pops at 6, not 5. Step 1's open optimal node is the one that was closed and never reopened.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the held-out sampler, then verify">
+    <Predict
+      id="ch22.e3"
+      question="In Learned Sampler vs Uniform, set λ to its minimum, 0.02, and switch to the held-out generator. Before pressing play: across the seeds the success-at-budget curve accumulates, what happens to the learned curve compared with uniform's at the largest budgets?"
+      options={[
+        { label: 'It never reaches uniform\'s level — with a tiny floor some held-out queries stay unsolved', because: 'Derivation 1 still applies at λ = 0.02: the bound decays fifty times more slowly than uniform\'s, but it decays. Given enough checks every solvable query is joined.' },
+        { label: 'It reaches the same level, later on the worlds where the net aims wrong', correct: true, because: 'Right. The floor guarantees the knee exists; at λ = 0.02 a mis-aimed proposal waits up to fifty times uniform\'s time for the corridor, so the learned curve rises later on those seeds and catches up only at large budgets.' },
+        { label: 'It is identical to uniform\'s — the net is useless on worlds it never saw', because: 'Too strong. The held-out bars still share the table, the base clearance and the arm with the training worlds; the check `ch22 aim` finds the proposal closer to p* than uniform on 8 of 10 held-out worlds. The curve differs seed by seed.' },
+      ]}
+    >
+    Now raise $\lambda$ to 0.3 and watch the gap at the larger budgets close: a heavier floor caps the
+    loss at a smaller factor, $1/\lambda \approx 3$, at the cost of diluting the head start on the
+    worlds where the network was right.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="The deflated heuristic">
+    <Predict
+      id="ch22.e4"
+      question="In Heuristic Calibration, switch from the learned ĥ to ĥ / (1 + ε_val), with ε_val = 0.662 from the validation worlds. Compared with the admissible octile heuristic, the deflated one will expand…"
+      options={[
+        { label: 'Fewer nodes — it is the learned heuristic made safe', because: 'Dividing by 1.662 shrinks every estimate, including the many where the net was accurate or low. Most of the deflated values fall well below octile\'s.' },
+        { label: 'About as many nodes', because: 'Only if the net were systematically 1.66 times too high, which it is not: its mean ratio to h* is 0.959.' },
+        { label: 'Several times as many nodes, and return an optimal path', correct: true, because: 'Right. ĥ/1.662 is admissible on the validation worlds and is a much weaker lower bound than octile almost everywhere, so A* drifts toward Dijkstra. Admissibility bought by uniform deflation throws away what the net knew.' },
+      ]}
+    >
+    The cure is a better-shaped loss — an asymmetric objective (this net already weights overestimates
+    six times), or a correction clipped at the admissible baseline. Neither has a guarantee off the
+    audited worlds; both waste less.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="A learned sampler for Rusty">
+    Implement `Sampler` on Rusty's $\mathbb{R}^2$ configurations in the Apartment for a
+    `LearnedSampler` conditioned on a $64 \times 64$ occupancy raster, trained on 500 randomized
+    floorplans (move interior walls and doorways; keep the outer walls). Wrap it with
+    `safe_learned_sampler` and add its row to the Board, with a held-out generator that moves doors to
+    walls the training generator never opened. Does the held-out gap shrink or grow with the larger
+    raster? Report success at three budgets and the break-even $k$, and say which of the two you
+    believe more.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Stretch: a learned heuristic for hybrid A*">
+    Train a heuristic for [Chapter 21](/chapters/ch21-nonholonomic-ii)'s hybrid A\* on the Lot, with
+    labels from backward Dijkstra on the $(x, y, \theta)$ lattice for Hitch. Measure $\epsilon$ on
+    held-out Lots (different parking-row layouts) with `measure_epsilon`, run the planner, and compare
+    the realized cost ratio to the bound $(1 + \epsilon)$ and to the classical
+    $\max(h_{RS}, h_{holonomic})$ — the Reeds–Shepp distance and the obstacle-aware 2-D distance. Which
+    of the three heuristics expands the fewest nodes, and which would you ship?
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="§7.1.3's hand-designed biased samplers (OBPRM, Gaussian, bridge) are this chapter's baselines; §7.4.3's abstract path tiling, whose framework covers sampling from arbitrary distributions, is the theorem Derivation 1 extends; Appendix H.2's optimistic heuristic is Definition 22.3 at ε = 0."
+  />
+  <Reference
+    authors="Ichter, B., Harrison, J., and Pavone, M."
+    year={2018}
+    title="Learning Sampling Distributions for Robot Motion Planning"
+    venue="IEEE International Conference on Robotics and Automation (ICRA)"
+    url="https://arxiv.org/abs/1709.05448"
+    note="The conditional variational autoencoder as a learned sampling distribution, mixed with uniform samples — the design this chapter's sampler simplifies to a categorical on T²."
+  />
+  <Reference
+    authors="Qureshi, A. H., Simeonov, A., Bency, M. J., and Yip, M. C."
+    year={2019}
+    title="Motion Planning Networks"
+    venue="IEEE International Conference on Robotics and Automation (ICRA)"
+    url="https://arxiv.org/abs/1806.05767"
+    note="MPNet: a learned waypoint policy with lazy states contraction, neural re-planning and a classical fallback — the instance of Derivation 4."
+  />
+  <Reference
+    authors="Bhardwaj, M., Choudhury, S., and Scherer, S."
+    year={2017}
+    title="Learning Heuristic Search via Imitation"
+    venue="Conference on Robot Learning (CoRL)"
+    url="https://arxiv.org/abs/1707.03034"
+    note="Learning which node to expand by imitating an oracle with full knowledge of the cost-to-go — the sequential-decision view of a learned heuristic."
+  />
+  <Reference
+    authors="Janner, M., Du, Y., Tenenbaum, J. B., and Levine, S."
+    year={2022}
+    title="Planning with Diffusion for Flexible Behavior Synthesis"
+    venue="International Conference on Machine Learning (ICML)"
+    url="https://arxiv.org/abs/2205.09991"
+    note="Diffuser: trajectory-level denoising with inpainted start and goal and gradient guidance by a cost — the model Derivation 5 states and the toy of w22.4 shrinks to one dimension."
+  />
+  <Reference
+    authors="Ho, J., Jain, A., and Abbeel, P."
+    year={2020}
+    title="Denoising Diffusion Probabilistic Models"
+    venue="Advances in Neural Information Processing Systems (NeurIPS)"
+    url="https://arxiv.org/abs/2006.11239"
+    note="The noise-prediction objective and the ancestral sampling step used in Derivation 5, with the variational bound it reweights."
+  />
+  <Reference
+    authors="Kingma, D. P. and Welling, M."
+    year={2014}
+    title="Auto-Encoding Variational Bayes"
+    venue="International Conference on Learning Representations (ICLR)"
+    url="https://arxiv.org/abs/1312.6114"
+    note="The evidence lower bound and the reparameterized encoder behind the CVAE sampler of the collapsible note."
+  />
+  <Reference
+    authors="Hart, P. E., Nilsson, N. J., and Raphael, B."
+    year={1968}
+    title="A Formal Basis for the Heuristic Determination of Minimum Cost Paths"
+    venue="IEEE Transactions on Systems Science and Cybernetics 4(2), 100–107"
+    doi="10.1109/TSSC.1968.300136"
+    note="A* and the admissibility theorem whose ε-relaxation is Derivation 3."
+  />
+  <Reference
+    authors="Karaman, S. and Frazzoli, E."
+    year={2011}
+    title="Sampling-based Algorithms for Optimal Motion Planning"
+    venue="International Journal of Robotics Research 30(7), 846–894"
+    doi="10.1177/0278364911406761"
+    note="The asymptotic-optimality baseline (RRT*, PRM*) a learned proposal must not pretend to beat; its incumbent is the Rust harness's cost reference."
+  />
+</References>

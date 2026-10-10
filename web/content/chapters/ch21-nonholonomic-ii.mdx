@@ -1,0 +1,1207 @@
+---
+title: Nonholonomic Systems II — Steering Cars, Trailers, and Underactuated Systems
+description: Chapter 20 proved Hitch can reach every pose; this chapter is the catalog of ways to actually get there — Brockett's sinusoids and chained forms, gradient steering, differential flatness, Dubins and Reeds–Shepp words, Choset's CAR GRID SEARCH and its descendants (state lattices, hybrid A*), forward-propagation trees and Kinodynamic RRT*, and Reach's dead third joint driven like a car along decoupling vector fields.
+chapter: 21
+part: PART V
+partTitle: Dynamics, Trajectories, and Constraints
+difficulty: Advanced
+readingTime: 85 min
+quote: This implies that it is possible to parallel-park your car into any parking space ϵ > 0 longer than your car.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), Chapter 12
+---
+
+import { ThreeHitchesHook } from '@/components/ch/ch21/three-hitches-hook';
+import { TrailerParker } from '@/components/ch/ch21/trailer-parker';
+import { FlatnessFollower } from '@/components/ch/ch21/flatness-follower';
+import { LatticeVsHybrid } from '@/components/ch/ch21/lattice-vs-hybrid';
+import { ReedsSheppAtlas } from '@/components/ch/ch21/reeds-shepp-atlas';
+import { ForwardPropagationTree } from '@/components/ch/ch21/forward-propagation-tree';
+import { DecouplingDrive } from '@/components/ch/ch21/decoupling-drive';
+import { CarGridFigure } from '@/components/ch/ch21/car-grid-figure';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Steer the driftless systems of Chapter 20 exactly in the absence of obstacles: Brockett\'s energy-optimal sinusoids, chained forms climbed by the (a/4π)ᵏb/k! ladder, and the coordinate changes that put the unicycle and Hitch\'s car into chained form',
+    'Derive the LSL closed form of a Dubins path, generate the remaining words by reflection and reversal, and implement the Reeds–Shepp family with the time-flip and reflect symmetries — every word checked by integration',
+    'Plan by differential flatness: read the state and controls of the car, and of the car with a trailer, off a polynomial in the flat outputs, and say exactly where the lift is singular and where control bounds break it',
+    'Implement Choset\'s Algorithm 22 CAR GRID SEARCH with the bucketed OPEN list, and explain state lattices and hybrid A* as Algorithm 22 plus three named deltas',
+    'Build the forward-propagation RRT of §7.5.1 on Hitch\'s dynamic model, explain its metric sensitivity, and contrast it with Kinodynamic RRT*, which needs an exact optimal steer',
+    'Test decoupling vector fields with Theorem 12.4.7, plan Reach\'s 3R arm with an unactuated third joint as a car with four primitives, and time-scale the plan with Chapter 18 so that one actuator is always saturated',
+  ]}
+  prerequisites={[
+    'Chapter 20: vector fields, Lie brackets, the LARC and STLC verdicts for the unicycle, the car and the car with trailer; the symmetric product and the kinetic-energy connection',
+    'Chapter 11 (the Steer interface, samplers, kd-tree), Chapter 12 (RRT and its Voronoi bias), Chapter 13 (RRT* rewiring), Chapter 6 (A* and its heap)',
+    'Chapter 17 (the standard form, PlanarArm) and Chapter 18 (path dynamics and time-optimal time scaling); Chapter 19 (Gauss–Newton and Levenberg–Marquardt)',
+    'Hitch and the Lot from Chapter 2; SE(2) from Chapter 5',
+  ]}
+>
+Chapter 20 proved that Hitch can reach every pose in the Lot. It did not say *how*, and the proof's own
+recipe — nested four-flow loops — is a terrible plan: each loop of amplitude $\epsilon$ buys $\epsilon^2$
+of sideways motion, so a small sideways correction costs a great many reversals. This chapter is the
+catalog of better answers, and its one idea is that **every steering method is a different way of
+spending the controllability you already own**. You can solve an optimal-control problem exactly
+(Dubins, Reeds–Shepp). You can change coordinates until the brackets become a ladder you climb with
+sinusoids (chained forms). You can push on the Jacobian of the end-state map until the error vanishes
+(gradient steering). You can find two coordinates from which the whole state is read off by
+differentiation (flatness). Or you can let a search integrate the dynamics forward and never invert
+anything at all — Barraquand and Latombe's CAR GRID SEARCH, and the kinodynamic trees that descend from
+it.
+
+None of these methods is "the" way to park a car, and the chapter's widgets are built to make that
+visible: one query, six fares. Exact methods ignore obstacles; search methods stop in a goal *region*;
+flat polynomials ignore the steering limit; sinusoids ignore everything except the chained coordinates
+and swing the trailer past jackknife. The second half of the chapter is about how today's autonomous
+vehicles recombine these pieces — state lattices and hybrid A\* are Algorithm 22 with lattice-consistent
+primitives, one continuous state per cell, Reeds–Shepp shots and a dual heuristic; Kinodynamic RRT\* is
+RRT\* with an exact optimal-control steer. It ends with Reach's third motor switched off and the dead
+link driven like a car.
+
+Honesty items kept throughout: Algorithm 22 is resolution complete, not exact; Reeds–Shepp and
+Algorithm 22 paths have curvature jumps a real steering actuator cannot follow; flatness handles neither
+control bounds nor obstacles without numerical optimization; forward propagation is metric-sensitive
+and offers no optimality without an exact steer; the decoupled planner stops at every switch and so
+forfeits global time-optimality; and the $\Theta(1/\epsilon^2)$ cusp count for tight parking is a
+theorem, not a bug.
+</Overview>
+
+## The problem: same destination, six fares
+
+Hitch is at the south curb of the Lot, heading east. Bay 3 is up and to the left. Three copies of Hitch
+leave at once.
+
+<Figure caption="One query, three planners from this chapter, replayed side by side (seed 21). Dotted: the Reeds–Shepp shortest path — four crisp segments, one cusp, exact, blind to obstacles. Solid: a quintic in the flat output — smooth, no cusp, a different length, blind to the steering limit. Dashed: a forward-propagated tree on Hitch's dynamic model — no steering function at all, collision-aware, ending somewhere inside a goal region. The scoreboard is computed live by planPark.">
+  <Deferred minHeight={520}>
+    <ThreeHitchesHook />
+  </Deferred>
+</Figure>
+
+The three paths are all correct, and all different, because each one answers a different question. The
+Reeds–Shepp path is the *shortest* path for a car that may reverse; it has a cusp because stopping and
+backing up is free in its cost. The flat-output path is the *simplest polynomial* consistent with the two
+poses; it never stops, but nothing in its derivation stops it from asking for more steering than Hitch
+has. The tree path is the first thing a randomized search found by *simulating* Hitch; it is jittery and
+does not end exactly on the goal, but it is the only one of the three that looked at the pillars while
+planning. Chapter 20's controllability theorem guaranteed all three exist. It said nothing about which one
+you want, and the rest of this chapter is about making that choice deliberately.
+
+## Building intuition
+
+### One query, several optimality criteria
+
+Start with the flagship. Hitch now pulls its trailer, and the scoreboard grows a column the planners were
+never asked about: how far the trailer swings.
+
+<Deferred minHeight={760}>
+  <TrailerParker />
+</Deferred>
+
+Three observations, each a section below.
+
+**The trailer is a hidden cost.** With the trailer on, the chained-form sinusoids reach the bay exactly
+— in the car's chained coordinates — while the trailer, simply towed along, swings far past
+$|\theta_1| = \pi/2$. The sinusoid method steers the four-state car; it does not know the trailer
+exists. The flat-output method with the trailer is different in kind: its flat output *is* the trailer's
+axle, so the trailer is parked by construction and the car's motion is derived from it.
+
+**Exactness and obstacle-awareness trade off.** The Reeds–Shepp word and the sinusoids land on the goal
+pose to round-off and do not look at the pillars. Turn "obstacles" on and the third method becomes
+Algorithm 22, which looks at everything and stops anywhere within $\pm 0.5$ m and $\pm 0.2$ rad of the
+goal. Exact steering is an obstacle-free subroutine; search is how obstacles enter.
+
+**Control bounds are where each method is weakest.** The flat planner's red $\max|\phi|$ is the curvature
+its polynomial asks for, not what Hitch can do. The sinusoids ask for $1.22$ rad of steering on the
+default query — twice Hitch's limit. Only the methods built from full-lock arcs (Reeds–Shepp, Algorithm 22)
+respect $|\phi| \le 0.6$ by construction.
+
+### Shortest paths have words
+
+The shortest path between two poses of a car with a minimum turning radius $\rho$ is a short *word* in
+three letters: $L$ and $R$ for full-lock arcs, $S$ for straight. Forward-only (Dubins), six words
+suffice; allowed to reverse (Reeds–Shepp), a handful of families with cusps join them.
+
+<Deferred minHeight={640}>
+  <ReedsSheppAtlas />
+</Deferred>
+
+The tint is the *synthesis*: for the goal heading on the slider, every point of the plane is colored by
+the family of its shortest path. Drag the goal along a boundary and the word flips — but the length in
+the readout moves continuously, because the optimal length is a continuous function of the goal even
+though the optimal word is not. Toggle "Dubins only" and compare: near the start, behind it and beside
+it, the forward-only car pays enormously (a loop of nearly $2\pi\rho$) for what the Reeds–Shepp car does
+with one cusp. The Reeds–Shepp length is never longer — the chapter's check confirms it on 400 random
+pairs — and reversing is *not* a Dubins word run backward: the reversing words are new words.
+
+### State from a curve
+
+Here is a planner with no differential equation in it.
+
+<Deferred minHeight={620}>
+  <FlatnessFollower />
+</Deferred>
+
+Drag the curve. Hitch is placed on it by differentiation alone: its heading is the curve's tangent, its
+steering angle is $\arctan$ of the wheelbase times the curve's curvature. Nothing was integrated. That is
+*differential flatness*: the car has two outputs — the rear-axle midpoint — from which state and inputs
+are algebraic functions of finitely many derivatives. Turn on the trailer and the flat output moves to the
+trailer's axle; now the *car's* position is a derivative away (the trailer tangent tells you where the
+hitch is) and its steering is two more. Make a corner tight and part of the curve turns red: the curve is
+still a perfectly good flat output, but it asks for more curvature than $1/\rho$, and flatness alone has
+no way to say no.
+
+### A tree without a steering function
+
+Every planner so far needed to *invert* the car — find controls that go from here to there. Choset's
+§7.5.1 points out that a tree planner needs much less: a way to propagate a state forward under a
+control.
+
+<Deferred minHeight={680}>
+  <ForwardPropagationTree />
+</Deferred>
+
+With one sampled control per extension the tree drifts; with eight it reaches. Push the heading weight
+$w_\theta$ up and the tree spends its effort matching headings of random samples instead of covering the
+Lot — the planner is only as good as its notion of "near", and the metric is a tuning knob, not a
+derived quantity. Turn on Kinodynamic RRT\* and the tree changes model: rewiring compares the cost of
+reaching a node through two different parents, which needs the *exact* optimal cost between two states.
+For the kinematic car that is the Reeds–Shepp length; for Hitch's dynamic model nobody has a closed form,
+which is why the toggle switches systems rather than pretending.
+
+### Grid search, then and now
+
+Barraquand and Latombe's 1990s answer to car planning among obstacles was a best-first search over six
+motion primitives — full left, straight, full right, forward and reverse — with an occupancy grid on
+$(x, y, \theta)$ to stop it revisiting. Today's planners in autonomous vehicles are recognizably the same
+algorithm.
+
+<Deferred minHeight={600}>
+  <LatticeVsHybrid />
+</Deferred>
+
+The left panel is a *state lattice*: the primitives were built so that every motion ends exactly on a
+lattice state, so the search is plain A\* on a graph. The right panel is *hybrid A\**: the states float
+freely as in Algorithm 22, each grid cell keeps the best one, and every few expansions the planner tries
+an analytic Reeds–Shepp "shot" to the goal (the dashed purple fans are shots that hit something).
+Coarsen the grid: the lattice, whose primitives must land on coarse lattice points, takes long detours;
+hybrid A\* barely notices because its states are continuous. Neither is new; both are Algorithm 22 plus
+a named change.
+
+### Driving a dead joint
+
+The last widget leaves the Lot. Reach's three-link arm lies flat on the Workbench with its third motor
+switched off.
+
+<Deferred minHeight={620}>
+  <DecouplingDrive />
+</Deferred>
+
+The free third link cannot be torqued. Chapter 20 showed the arm is nevertheless accessible from rest,
+and Choset's §12.5.7 shows how to *use* that: there are two motions the dead link can perform at any
+speed — sliding along its own length, and rotating about its center of percussion, the one point on the
+link that a force at the joint perpendicular to the link leaves momentarily unaccelerated. Drive with
+those two (forward and reverse each) and the link behaves like a car with four actions. The planner is
+Algorithm 22 with cost "number of switches"; the execution is Chapter 18's time-optimal scaling, segment
+by segment, coming to rest at every switch. In the inset one torque bar is always full.
+
+<KeyIdea title="The one-sentence version">
+Chapter 20 established *that* Hitch can reach every pose; steering is the choice of *how* to spend that
+controllability — by solving the optimal control exactly (Dubins, Reeds–Shepp), by climbing the bracket
+ladder with sinusoids in chained coordinates, by descending the end-state error, by reading the state off
+flat outputs, or by searching over forward-integrated primitives — and each choice buys exactness,
+smoothness or obstacle-awareness with some other property the others keep.
+</KeyIdea>
+
+<NotationTable
+  rows={[
+    { sym: '\\rho = r_{\\min} = L/\\tan\\gamma;\\ v,\\ \\omega', meaning: 'minimum turning radius; inputs of the reduced car (Choset eq. 12.35)', note: '|ω| ≤ |v|/ρ; Hitch: L = 2.6 m, γ = 0.6 rad, ρ = 3.80 m' },
+    { sym: 'L_\\pm,\\ R_\\pm,\\ S_\\pm', meaning: 'CAR GRID SEARCH actions: full left / right / straight, forward / reverse', note: 'Choset Alg. 22' },
+    { sym: 'C,\\ S,\\ |,\\ C_a,\\ C_{\\pi/2};\\ (t, p, q)', meaning: 'Reeds–Shepp alphabet: arc, straight, cusp, arc of angle a, quarter arc; normalized segment lengths', note: 'arcs in radians, straights in units of ρ' },
+    { sym: 'z = A(x)x,\\ v = B(x)u', meaning: 'chained-form coordinates and inputs', note: 'Choset §12.5.1–12.5.2' },
+    { sym: 'u^p,\\ f(x_{start}, u^p),\\ e', meaning: 'finite control parameterization, end-state map, end-state error', note: '§12.5.4' },
+    { sym: 'y,\\ \\varphi,\\ \\psi_u', meaning: 'flat outputs and the maps x = φ(y, ẏ, …), u = ψ_u(y, ẏ, …)', note: 'Choset writes ψ for the input map; here ψ is the trailer heading, so the input map is ψ_u' },
+    { sym: '\\psi,\\ \\theta_1 = \\theta - \\psi,\\ d', meaning: 'trailer heading, hitch angle, hitch length', note: 'Chapter 2 integrates ψ; d = 2.5 m' },
+    { sym: 'V_i(q),\\ \\mathcal{V},\\ w', meaning: 'decoupling vector fields, a set of them, kinematic inputs', note: '§12.4.2' },
+    { sym: 'G(q_{goal}),\\ \\mathrm{prop}(x, u, \\Delta t)', meaning: 'goal region of Alg. 22; forward propagation of ẋ = f(x, u)', note: '§12.5.6, §7.5.1' },
+  ]}
+/>
+
+## The mathematics
+
+Throughout, the *steering problem* is: given $\htmlClass{term-start}{x_{start}}$ and
+$\htmlClass{term-goal}{x_{goal}}$, find controls driving the system from one to the other, *ignoring
+obstacles*. It is exactly what PRM and RRT call a local planner. Choset splits the state of many systems
+into *shape* variables, driven directly by the inputs, and *fiber* variables, which change only when the
+shape variables move around closed loops — the astronaut who reorients by cycling her arms. Every exact
+method below is a way to engineer the right loop.
+
+### Brockett's sinusoids
+
+The simplest system with a fiber is Choset's (12.23):
+
+$$
+\dot x_1 = u_1, \qquad \dot x_2 = u_2, \qquad \dot x_3 = x_2 u_1,
+$$
+
+with $g_1 = [1, 0, x_2]^\top$, $g_2 = [0, 1, 0]^\top$ and $[g_1, g_2] = -e_3$. Shape $(x_1, x_2)$, fiber $x_3$.
+
+<KeyIdea title="Statement (Brockett; Choset §12.5.1)">
+For $t_f = 1$ and energy $J = \tfrac12\int_0^1 u^\top u\,dt$, optimal controls are quadrature sinusoids
+$u_1 = u_1(0)\cos\lambda_3 t - u_2(0)\sin\lambda_3 t$, $u_2 = u_1(0)\sin\lambda_3 t + u_2(0)\cos\lambda_3 t$.
+For a pure fiber motion — $x_1, x_2$ return — $\lambda_3 = 2k\pi$, and with $k = \mp 1$,
+$x_3(1) = \pm\bigl(u_1(0)^2 + u_2(0)^2\bigr)/4\pi$.
+</KeyIdea>
+
+<Derivation title="Pontryagin for the fiber" result="\dot u_1 = -\lambda_3 u_2,\quad \dot u_2 = \lambda_3 u_1,\quad x_3(1) = \mp\frac{u_1(0)^2 + u_2(0)^2}{4\pi}\ \ (k = \pm 1)">
+1. **Hamiltonian.** $H = \tfrac12(u_1^2 + u_2^2) + \lambda_1 u_1 + \lambda_2 u_2 + \lambda_3 x_2 u_1$.
+2. **Stationarity.** $\partial H/\partial u = 0$ gives $u_1 = -\lambda_1 - \lambda_3 x_2$ and $u_2 = -\lambda_2$.
+3. **Adjoint.** $\dot\lambda = -\partial H/\partial x$: $\dot\lambda_1 = 0$, $\dot\lambda_3 = 0$, $\dot\lambda_2 = -\lambda_3 u_1$.
+4. **Close the loop.** Differentiate step 2: $\dot u_1 = -\lambda_3\dot x_2 = -\lambda_3 u_2$ and $\dot u_2 = -\dot\lambda_2 = \lambda_3 u_1$ — a rotation of $(u_1, u_2)$ at rate $\lambda_3$, which integrates to the quadrature sinusoids.
+5. **Return the shape.** $\int_0^1 u_i\,dt = 0$ requires a whole number of periods: $\lambda_3 = 2k\pi$. Then $J = \tfrac12(u_1(0)^2 + u_2(0)^2)$ for every $k$, so pick $|k| = 1$. With $u_2(0) = 0$, $x_2(t) = u_1(0)(1 - \cos 2k\pi t)/(2k\pi)$ and $x_3(1) = \int_0^1 x_2 u_1\,dt = -u_1(0)^2/(4k\pi)$: negative for $k = 1$, positive for $k = -1$.
+</Derivation>
+
+So to move the fiber by $0.3$ choose $k = -1$ and any $(u_1(0), u_2(0))$ on the circle of radius
+$\sqrt{4\pi \cdot 0.3} = 1.9416$, at cost $J = 0.6\pi \approx 1.885$; the library's `steerBrockett`
+returns that circle's point on the $u_1$-axis, and integrating (12.23) under it lands on
+$(0, 0, 0.3)$ to round-off. The unicycle is this system in disguise: with Choset's
+
+$$
+z_1 = x_3,\quad z_2 = x_1\cos x_3 + x_2 \sin x_3,\quad z_3 = x_1\sin x_3 - x_2\cos x_3,\qquad
+v_1 = \omega,\quad v_2 = v - z_3\omega,
+$$
+
+the unicycle's $(\dot x_1, \dot x_2, \dot x_3) = (v\cos x_3, v\sin x_3, \omega)$ becomes
+$\dot z = (v_1, v_2, z_2 v_1)$ — check it: $\dot z_3 = v(\cos x_3\sin x_3 - \sin x_3\cos x_3) + (x_1\cos x_3 + x_2\sin x_3)\omega = z_2 v_1$.
+The heading is a shape variable, the position along the heading is the other, and the sideways offset is
+the fiber. Brockett's cost is not a physical one for a car, which is Choset's own caveat.
+
+### Chained form and the sinusoid ladder
+
+Generalize to $n$ states and two inputs (Choset eq. 12.28):
+
+$$
+\dot x = u_1 g_1(x) + u_2 g_2(x),\qquad g_1 = [1,\ 0,\ x_2,\ x_3,\ \dots,\ x_{n-1}]^\top,\qquad g_2 = e_2 .
+$$
+
+<KeyIdea title="Statement (Murray and Sastry; Choset §12.5.2, eq. 12.31)">
+The iterated brackets climb a ladder: $\mathrm{ad}_{g_1}^k g_2 = [g_1, [g_1, \dots [g_1, g_2]]] = (-1)^k e_{k+2}$,
+so the system is STLC everywhere. With $u_1 = a\sin 2\pi t$, $u_2 = b\cos 2k\pi t$ on $[0, 1]$, the states
+$x_1, \dots, x_{k+1}$ return and
+
+<LinkedMath>
+$$
+\htmlClass{term-path}{x_{k+2}(1) - x_{k+2}(0)} = \left(\frac{a}{4\pi}\right)^{k} \frac{b}{k!}.
+$$
+</LinkedMath>
+
+Steer by driving $x_1, x_2$ to their goals directly, then for $k = 1, \dots, n-2$ in ascending order
+choose $(a, b)$ by (12.31) to fix $x_{k+2}$.
+</KeyIdea>
+
+<Derivation title="Why the k-th cycle touches only x_{k+2} and above" result="\Delta x_{j} = 0\ (j \le k+1),\qquad \Delta x_{k+2} = \left(\tfrac{a}{4\pi}\right)^k \tfrac{b}{k!}">
+1. **The ladder.** $[g_1, g_2] = \tfrac{\partial g_2}{\partial x}g_1 - \tfrac{\partial g_1}{\partial x}g_2 = -\tfrac{\partial g_1}{\partial x}e_2 = -e_3$, because $g_2$ is constant and the only entry of $g_1$ depending on $x_2$ is the third. Inductively $[g_1, e_j] = -e_{j+1}$, so $\mathrm{ad}^k_{g_1}g_2 = (-1)^k e_{k+2}$ and $\{g_1, g_2, \mathrm{ad}g_2, \dots, \mathrm{ad}^{n-2}g_2\}$ spans $\mathbb{R}^n$ — Chapter 20's lieBracket confirms the signs to better than $10^{-10}$ at a random point for $n = 5$.
+2. **Linearity in the initial state.** Given $u_1(t)$, the chain $\dot x_j = x_{j-1}u_1$ is linear. A contribution of $x_m(0)$ to $x_j(t)$ is $x_m(0)\,s(t)^{j-m}/(j-m)!$ with $s(t) = \int_0^t u_1$ — a polynomial in $s$, and $s(1) = 0$, so every such contribution returns.
+3. **The forced part.** What remains is driven by $w(t) = \int_0^t u_2 = \tfrac{b}{2k\pi}\sin 2k\pi t$. Each pass down the chain multiplies by $u_1 = a\sin 2\pi t$ and integrates; by the product-to-sum identities a frequency-$2k\pi$ signal multiplied $k$ times by a frequency-$2\pi$ one contains a zero-frequency (DC) term only at the $k$-th multiplication, i.e. in $\dot x_{k+2}$. States above $x_{k+2}$ also drift, which is why the ladder is climbed upward.
+4. **The constant.** Tracking the DC coefficient through the $k$ multiplications gives $(a/4\pi)^k b/k!$ (Murray and Sastry's computation). The check runs the five-state ladder to $(1, -0.5, 0.3, 0.2, -0.4)$ and finds every cycle's increment equal to (12.31) to better than $10^{-10}$ — integration error, not formula error.
+</Derivation>
+
+Hitch's four-state car $q = (x, y, \phi, \theta)$ has a chained form too (Murray and Sastry):
+
+$$
+z = \Bigl(x',\ \frac{\tan\phi}{L\cos^3\theta'},\ \tan\theta',\ y'\Bigr),\qquad v_1 = v\cos\theta',
+$$
+
+where the primes are coordinates in a chart rotated by an angle $\beta$. In the original chart the
+transformation is singular at $\theta = \pm\pi/2$ — which is exactly where a parking query into a
+north-facing bay ends. The library sets $\beta$ to the bisector of the start and goal headings, so both ends
+sit inside $(-\pi/2, \pi/2)$; inside the motion $\theta' = \arctan z_3$ never reaches $\pm\pi/2$ by
+construction. On w21.1's default query, $(5.5, 1.2, 0) \to (9.25, 6.4, \pi/2)$, two sinusoid cycles land
+on the goal in chained coordinates to better than $10^{-9}$ — with three cusps and a peak steering angle of
+$1.22$ rad, twice what Hitch can do. The method is exact *in its coordinates* and blind to everything
+else. Car-and-trailer systems with any number of trailers also have chained forms (Sørdalen's result,
+Choset ref. 393), at the price of coordinate changes that blow up at the jackknife.
+
+### Gradient steering, and the cross-link to Chapter 19
+
+Exact methods need structure. Choset's §12.5.4 needs only a simulator: parameterize the control history by
+a finite vector $u^p \in \mathbb{R}^r$ (here, piecewise-constant $(v, \omega)$ on $K = 6$ equal intervals of
+$[0, 1]$ for the reduced car), call $f(x_{start}, u^p)$ the *end-state map*, and descend the error
+$e = f(x_{start}, u^p) - x_{goal}$.
+
+<KeyIdea title="Statement (Choset §12.5.4)">
+The update $u^p \leftarrow u^p + \alpha v$ with $v^\top = -e^\top\,\partial f/\partial u^p$ converges for small
+enough $\alpha$ if $\partial f/\partial u^p$ has rank $n$ everywhere — generically true for an STLC system
+with a rich parameterization. At a *singular control*, where the rank drops, append a *generic loop*: a
+random control with zero net motion.
+</KeyIdea>
+
+<Derivation title="Descent, rank, and the generic loop" result="\tfrac{d}{d\alpha}\tfrac12\|e\|^2\big|_{\alpha=0} = -\|J^\top e\|^2 < 0\ \text{ unless } e \in \ker J^\top">
+1. **Descent.** With $J = \partial f/\partial u^p$, $\tfrac12\|e(u^p + \alpha v)\|^2 = \tfrac12\|e\|^2 - \alpha\|J^\top e\|^2 + O(\alpha^2)$, so the step decreases the error unless $J^\top e = 0$.
+2. **Rank.** If $\mathrm{rank}\,J = n$ then $J^\top$ is injective and $J^\top e = 0$ forces $e = 0$: the only stationary point is the goal. Any error direction is correctable by a small change of $u^p$.
+3. **The singular control.** At $u^p = 0$ every column of $J$ is a first-order variation — a combination of $g_1$ and $g_2$ at $x_{start}$ — so $\mathrm{rank}\,J = 2 < 3$ and the sideways error is invisible. A driftless system retraces itself under a control followed by its time-reversed negative, so appending such a pair changes nothing about where the car ends and everything about the Jacobian.
+</Derivation>
+
+For a pure sideways move of $0.5$ m from rest the library's `steerGradient` finds rank $2$ at $u^p = 0$,
+appends a two-piece generic loop (rank $3$), and then needs $58$ backtracking gradient steps to bring
+$\|e\|$ below $10^{-4}$ — slow, because the sideways direction is a bracket direction and the Jacobian's
+singular value along it is small; Chapter 20's $\epsilon^2$ reappears as conditioning. Hand the same
+end-state map to [Chapter 19](/chapters/ch19-trajectory-optimization)'s Levenberg–Marquardt — §12.5.3's
+"nonlinear optimization", with no re-derivation needed — and five iterations reach round-off. Choset's two
+caveats carry over unchanged: a good initial guess is required, and nothing guarantees convergence; here
+the generic loop *is* the initial guess that makes it work.
+
+### Differential flatness
+
+<KeyIdea title="Statement (Fliess, Lévine, Martin and Rouchon; Choset §12.5.5)">
+For the reduced car, $y = (x_1, x_2)$ — the rear-axle midpoint — is a flat output:
+
+<LinkedMath>
+$$
+\htmlClass{term-robot}{\theta} = \operatorname{atan2}(\dot y_2, \dot y_1),\qquad
+\htmlClass{term-robot}{v} = \pm\sqrt{\dot y_1^2 + \dot y_2^2},\qquad
+\htmlClass{term-robot}{\omega} = \frac{\dot y_1\ddot y_2 - \ddot y_1\dot y_2}{\dot y_1^2 + \dot y_2^2}
+$$
+</LinkedMath>
+
+(eqs. 12.32–12.33), and for the four-state car $\tan\phi = L\kappa$ with $\kappa = \omega/v$. With a
+trailer hitched at the rear axle the flat output is the trailer's axle midpoint; with $p$ trailers, the
+last one's.
+</KeyIdea>
+
+<Derivation title="Heading from the tangent, steering from curvature, the car from the trailer" result="\phi = \arctan\!\Bigl(L\,\frac{\dot p \times \ddot p}{\|\dot p\|^3}\Bigr),\qquad p = y + d\,(\cos\psi, \sin\psi),\quad \psi = \operatorname{atan2}(\dot y)">
+1. **Heading.** No slip means the rear axle's velocity points along the body: $\dot y = v(\cos\theta, \sin\theta)$. Read $\theta$ and $|v|$ off $\dot y$; the sign of $v$ is a choice that must stay consistent with $\theta$ (Choset's warning: $\dot y = (1, 1)$ and $(-1, -1)$ give the same atan).
+2. **Turn rate and curvature.** $\omega = \dot\theta = \frac{d}{dt}\operatorname{atan2}(\dot y_2, \dot y_1) = (\dot y_1\ddot y_2 - \ddot y_1\dot y_2)/\|\dot y\|^2$, the cross product over speed squared; $\kappa = \omega/v$ is that over speed cubed, and the front-wheel geometry gives $\tan\phi = L\kappa$.
+3. **The trailer.** By (12.36)–(12.37) the trailer axle moves along the trailer's heading, so $\psi = \operatorname{atan2}(\dot y)$ when $y$ is the trailer axle; the hitch — the car's rear axle — sits at $p = y + d(\cos\psi, \sin\psi)$. Differentiate: $\dot p = \dot y + d\dot\psi(-\sin\psi, \cos\psi)$ and $\ddot p = \ddot y + d\ddot\psi(-\sin\psi, \cos\psi) - d\dot\psi^2(\cos\psi, \sin\psi)$, where $\dot\psi$ is step 2 applied to $y$ and $\ddot\psi$ needs $\dddot y$.
+4. **Apply steps 1–2 to $p$.** The car's heading needs $\dot p$ (two derivatives of $y$), its steering $\ddot p$ (four). One more pair of derivatives per body: "differentiate once more per trailer". Every formula divides by a speed, so the lift is singular wherever the flat output stops.
+</Derivation>
+
+Choset's Example 12.5.1 fits $y_1 = t$, $y_2 = 3t^2 - 2t^3$ between $(0, 0, 0)$ and $(1, 1, 0)$; the
+library's Hermite fit with unit end speed returns exactly those polynomials. At $t = 0.25$:
+$y = (0.25, 0.15625)$, $\dot y = (1, 1.125)$, $\ddot y = (0, 3)$, so
+
+$$
+\theta = \operatorname{atan2}(1.125, 1) = 0.844154\ \text{rad}\ (48.37°),\quad v = \sqrt{2.265625} = 1.505199,\quad
+\omega = \frac{3}{2.265625} = 1.324138,
+$$
+
+$\kappa = \omega/v = 0.879709$, and for wheelbase $L = 1$ the steering angle is
+$\phi = \arctan 0.879709 = 0.721491$ rad ($41.34°$). At $t = 0.5$ the curve inflects and
+$\omega = \phi = 0$ exactly. The chapter's check goes one step further: it takes the controls
+$(v(t), \phi(t))$ read off a quintic flat output, integrates the *true* car (and car-with-trailer) ODE
+forward from the lifted initial state, and finds the integrated state agreeing with the lifted one along
+the whole trajectory to better than $10^{-11}$. Flatness is not an approximation.
+
+What it is not, either, is a planner with constraints. A polynomial of minimal degree has no freedom left
+to respect $|\phi| \le \gamma$ or avoid a pillar; extra coefficients plus a numerical optimizer can, and
+Choset calls that "a topic of current research". On w21.1's trailer query the trailer-axle quintic asks
+for $|\phi| = 1.39$ rad and clips an obstacle.
+
+### Shortest paths: Dubins and Reeds–Shepp
+
+<KeyIdea title="Statement (Dubins; Reeds and Shepp; Choset §12.5.6)">
+For the reduced car with $|v| \le 1$ and $|\omega| \le |v|/\rho$, a shortest path exists and lies in
+Choset's nine families
+$\{C|C|C,\ CC|C,\ C|CC,\ CC_a|C_aC,\ C|C_aC_a|C,\ C|C_{\pi/2}SC,\ CSC_{\pi/2}|C,\ C|C_{\pi/2}SC_{\pi/2}|C,\ CSC\}$
+— Reeds and Shepp's forty-eight signed words, which Sussmann and Tang later trimmed to forty-six.
+Forward-only, the shortest path is one of the six Dubins words
+$\{LSL, RSR, LSR, RSL, RLR, LRL\}$.
+</KeyIdea>
+
+<Derivation title="From Pontryagin to six words, and LSL in closed form" result="p^2 = 2 + d^2 - 2\cos(\alpha - \beta) + 2d(\sin\alpha - \sin\beta),\quad t = -\alpha + \operatorname{atan2}(\cos\beta - \cos\alpha,\ d + \sin\alpha - \sin\beta),\quad q = \beta - \operatorname{atan2}(\cdot)">
+1. **Bang-bang or singular.** Minimize time with $v \in [-1, 1]$, $\omega = v\kappa$, $|\kappa| \le 1/\rho$. The Hamiltonian is linear in $\kappa$, so $\kappa$ sits at $\pm 1/\rho$ (bang) except on intervals where its switching function vanishes identically (singular), which forces $\kappa = 0$.
+2. **Arcs and straights.** Optimal paths are concatenations of full-lock arcs $C$ and straights $S$ — exactly CAR GRID SEARCH's primitives, which is why Algorithm 22 loses nothing essential by discretizing the steering.
+3. **Case analysis.** Reeds and Shepp's argument bounds the number of segments and the arc angles between cusps, leaving the nine families; with $v \ge 0$ forced there are no cusps and only $CSC$ and $CCC$ remain — Dubins' six words.
+4. **Normalize.** Put the start at the origin, the goal at $(d, 0)$ with $d = \|q_1 - q_0\|_{xy}/\rho$, and measure both headings from the bearing of the goal: $\alpha = \theta_0 - \text{bearing}$, $\beta = \theta_1 - \text{bearing}$.
+5. **LSL.** The start's left circle has center $c_0 = (-\sin\alpha, \cos\alpha)$, the goal's $c_1 = (d - \sin\beta, \cos\beta)$. Two equal circles turning the same way are joined by their external tangent, parallel to $c_1 - c_0$ and of the same length: $p^2 = \|c_1 - c_0\|^2 = (d - \sin\beta + \sin\alpha)^2 + (\cos\beta - \cos\alpha)^2$, which expands to the boxed formula. The tangent's direction is $\operatorname{atan2}(\cos\beta - \cos\alpha,\ d + \sin\alpha - \sin\beta)$; the first arc turns from $\alpha$ to it ($t$), the last from it to $\beta$ ($q$), both taken mod $2\pi$.
+6. **The other five.** Reflect ($y \to -y$, headings negated) and LSL becomes RSR. Reverse time and read the word backward and LSR and RSL swap; the internal tangent replaces the external one for the mixed words ($p^2 = d^2 - 2 + 2\cos(\alpha - \beta) + 2d(\sin\alpha + \sin\beta)$ for LSR, infeasible when negative), and three mutually tangent circles give $RLR$ and $LRL$, infeasible when the circles are more than $4\rho$ apart.
+</Derivation>
+
+**The micro-example.** $q_0 = (0, 0, 0)$, $q_1 = (3, 3, \pi/2)$, $\rho = 1$. The start's left circle is
+centered at $(0, 1)$, the goal's at $(3, 3) + (-\sin\tfrac\pi2, \cos\tfrac\pi2) = (2, 3)$; the centers are
+$2\sqrt2$ apart along direction $\pi/4$, so $LSL$ has $t = \pi/4$, $p = 2\sqrt2$, $q = \pi/4$ and length
+$\pi/2 + 2\sqrt2 = 4.39922$. By integration: after the first arc Hitch is at $(0.70711, 0.29289)$ heading
+$\pi/4$; the straight adds $(2, 2)$; the last arc about $(2, 3)$ ends at $(3, 3)$ heading $\pi/2$. The others
+are longer — $LSR = RSL = 10.56698$, $LRL = 10.99557$, $RSR = 16.65243$ — and $RLR$ is infeasible. Reeds–Shepp
+returns the same $L^+S^+L^+$: here a cusp cannot help.
+
+**Reeds–Shepp by symmetry.** Nobody codes forty-eight formulas. Reeds and Shepp's §8 gives a handful of
+base formulas — $L^+S^+L^+$, $L^+S^+R^+$, $L^+R^-L$, $L^+R^+_aL^-_aR^-$, $L^+R^-_aL^-_aR^+$,
+$L^+R^-_{\pi/2}S^-L^-$, $L^+R^-_{\pi/2}S^-R^-$, $L^+R^-_{\pi/2}S^-L^-_{\pi/2}R^+$ — and three symmetries of the
+normalized goal $(x, y, \varphi)$ generate the rest:
+
+$$
+\text{time-flip: } (x, y, \varphi) \mapsto (-x, y, -\varphi),\qquad
+\text{reflect: } (x, y, \varphi) \mapsto (x, -y, -\varphi),\qquad
+\text{backwards: } (x, y, \varphi) \mapsto (x\cos\varphi + y\sin\varphi,\ x\sin\varphi - y\cos\varphi,\ \varphi).
+$$
+
+Time-flip negates every segment ($L^+ \leftrightarrow L^-$), reflect swaps $L$ and $R$, backwards reads the
+word right to left. The library evaluates eleven base formulas (four of them backwards readings) under
+the four flip/reflect combinations — forty-four evaluations, the construction OMPL's
+`ReedsSheppStateSpace` uses. Several base formulas leave the sign of their last segment free, so the
+forty-four evaluations cover the forty-eight words; the module does not prove that itself, and the check
+tests the two consequences that would fail if it were false. On 400 seeded pairs, every one of the 2,700
+candidate words integrates to its goal to round-off (worst error $10^{-14}$), and the shortest Reeds–Shepp length never
+exceeds the shortest Dubins length (Dubins paths are Reeds–Shepp candidates, so a missing family or a
+mistyped formula would show up as a violation). All nine families appear among the optimal words. The
+Reeds–Shepp length is also symmetric — $d(q_0, q_1) = d(q_1, q_0)$ — because reversing time maps a path to
+a path; that is what makes it a *metric* on $SE(2)$, and the reason PRM can use it as an undirected local
+planner while a Dubins-steered PRM needs directed edges.
+
+### Local planners with the topological property
+
+<KeyIdea title="Statement (Laumond; Sekhavat and Laumond; Choset §12.5.6)">
+If the free-flying car body has a free path that keeps an open free neighborhood, then recursive
+bisection with a Reeds–Shepp local planner terminates with a feasible car path, and PRM with a
+Reeds–Shepp local planner is probabilistically complete. Parking in a space $\epsilon$ longer than the
+car needs $\Theta(1/\epsilon^2)$ cusps.
+</KeyIdea>
+
+<Derivation title="STLC, the topological property, and compactness" result="\exists\,\epsilon > 0:\ \|q - q'\| < \epsilon \Rightarrow \mathrm{RS}(q, q') \subset B_\delta(q)">
+1. **The topological property** (Choset Fig. 12.28). For every ball $B_\delta(q)$ there is a ball $B_\epsilon(q)$ such that the local planner's path from $q$ to any $q' \in B_\epsilon(q)$ stays inside $B_\delta(q)$. Reeds–Shepp has it because the car is STLC and the shortest path between close poses is short: its length is $O(\|q - q'\|^{1/2})$ in the sub-Riemannian sense, so it cannot wander far.
+2. **Uniformity.** The free-flying path is compact and at positive clearance $\delta$ from obstacles; by compactness one $\epsilon$ works along its whole length.
+3. **Bisection terminates.** Halve the parameter interval until consecutive samples are within $\epsilon$; each Reeds–Shepp piece then stays in a $\delta$-ball around a free configuration, hence is free.
+4. **PRM.** Chapter 11's completeness proof covered the path with a chain of balls and needed only that the local planner connects samples in consecutive balls; it never used that the planner's path is a straight line, nor that it is symmetric. The cusp count: each reversal of a car of length $\ell$ in a slot of length $\ell + \epsilon$ gains $O(\epsilon^2)$ of sideways motion (Chapter 20's bracket), so a fixed sideways offset needs $\Theta(1/\epsilon^2)$ of them.
+</Derivation>
+
+The library implements both: `ReedsSheppLocal` and `DubinsLocal` satisfy Chapter 11's `Steer<Pose2>`
+interface (symmetric and not, respectively), and `pathTransform` is Laumond's bisection. Their price is
+the next honesty item: the curvature jumps at every arc–straight junction, so either the steering wheel
+turns instantaneously, the car stops at each junction, or execution has error. Smoothed primitives —
+clothoids, or flat-output polynomials — are the standard repair.
+
+### CAR GRID SEARCH
+
+<KeyIdea title="Statement (Barraquand and Latombe; Choset Alg. 22)">
+Best-first search over $\{L_\pm, R_\pm, S_\pm\}$, with a $d^3$ occupancy grid on $(x, y, \theta)$ and cost
+$a\cdot\text{steps} + b\cdot\text{steering changes} + c\cdot\text{cusps}$, finds a path to the goal region
+$G(q_{goal})$ if one exists at a small enough step, and the path it finds is optimal for the cost at the
+given step and resolution. Any path of the full car with $p$ cusps can be followed arbitrarily closely by a
+path of full-lock arcs with $p$ cusps.
+</KeyIdea>
+
+<Derivation title="Termination, optimality, and the bucketed OPEN list" result="\#\{\text{expansions}\} \le d^3,\qquad \text{pop order} = \text{nondecreasing integer cost}">
+1. **Termination.** A node is expanded only if its cell has not been marked; there are $d^3$ cells, so at most $d^3$ expansions and $6d^3$ children. The step must be long enough to leave the current cell, and the goal region must be larger than a cell — otherwise the search can loop inside a cell or jump over the goal.
+2. **Best-first on integer costs is Dijkstra.** With nonnegative integer $a, b, c$, every edge cost is a nonnegative integer, and popping the cheapest open node is [Chapter 6](/chapters/ch06-graph-search)'s Dijkstra on the tree. Testing the goal at *pop* time (line 4), not at generation, is what makes the returned path the cheapest one: Choset's Fig. 12.25 has a node in the goal region waiting in OPEN behind a cheaper one.
+3. **Constant-time insertion.** Integer costs index an array of FIFO buckets; insertion is an append, and the pop scans forward from the lowest non-empty bucket, which only ever moves up.
+4. **Full lock suffices.** By the Pontryagin argument of the previous section, optimal paths between cusps are full-lock arcs and straights; Barraquand and Latombe show more — that any $p$-cusp path is approximable by a $p$-cusp full-lock path — so minimizing cusps with $a = b = 0$ loses nothing to the discretization of steering.
+</Derivation>
+
+<CarGridFigure />
+
+Choset's description includes two practicalities the implementation keeps. The occupancy grid is checked
+when a node is *popped* (line 7), so a cell can be reached several times but expanded once; and with a
+trailer the grid gains a fourth axis for the hitch angle, the trailer's change over one action being
+"numerically integrated, or stored in a lookup table" — here by Chapter 2's `Hitch.step`, whose RK4
+trailer integration is the lookup table computed on demand. On the Lot's reverse-parking query the
+search with $a = 1, c = 0$ and the search with $c = 300$ both find a 20-step path with one cusp; the
+second expands half as many nodes, because the cusp penalty prunes every branch that reverses early.
+Choset's remark that the planner "actually runs faster in cluttered spaces because the obstacles prune the
+search tree" is the same effect from the other side.
+
+### Forward propagation
+
+<KeyIdea title="Statement (LaValle and Kuffner; Choset §7.5.1)">
+With $\mathrm{prop}(x, u, \Delta t)$ Lipschitz in $x$ and controls sampled with full support, the single
+tree that extends the nearest node toward a random state by the best of $k$ sampled controls reaches any
+goal region of nonzero measure with probability tending to one.
+</KeyIdea>
+
+<Derivation title="A tube, a chain of cross-sections, and the Voronoi bias" result="P[\text{no node in } G \text{ after } n \text{ extensions}] \to 0">
+1. **A tube.** Take a feasible trajectory reaching the interior of $G$ with clearance. Lipschitz continuity of $\mathrm{prop}$ in $x$ (and continuity in $u$) gives a tube of nearby trajectories: from any state within $r_i$ of the $i$-th waypoint, some open set of controls lands within $r_{i+1}$ of the next.
+2. **Cross-sections.** Discretize the trajectory into $K$ steps of $\Delta t$ and ball $B_i$ around each waypoint.
+3. **One step has positive probability.** If the tree has a node in $B_i$, an extension succeeds in placing one in $B_{i+1}$ with probability at least $p > 0$: the random sample lands in the Voronoi region of that node with positive probability (Chapter 12's bias), and some sampled control falls in the open good set with positive probability.
+4. **Chain.** The event "progress from $B_i$ to $B_{i+1}$ within $m$ extensions" fails with probability at most $(1 - p)^m$; multiply over $K$ stages and let $m \to \infty$.
+5. **What the proof never used.** Symmetry of the edge relation, reflexivity, or any ability to steer *to* a state — the theorem holds for the asymmetric, forward-only relation "some $u$ drives $x$ to $x'$ in $\Delta t$".
+</Derivation>
+
+Two honesty items follow from the proof. The constant $p$ depends on the metric through step 3 — a
+metric that ranks a node with the wrong heading as "near" wastes extensions, which is the w21.5 slider —
+and nothing in the proof bounds path *quality*. On the Lot query from w21.1, Hitch's dynamic model
+(acceleration and steering-rate inputs, speed and steering angle in the state) with best-of-eight
+controls and $\Delta t = 0.8$ s first lands in the goal region at extension 106 for seed 21, and
+re-running the simulator on the stored controls reproduces every state bit for bit. Time can be added to
+the state to handle moving obstacles (Choset ref. 195); the theorem does not change.
+
+### Kinodynamic RRT\*: optimality needs a steer
+
+Chapter 13's RRT\* is asymptotically optimal because its rewiring step asks, for a node $v$ near a new
+node $x$, whether reaching $v$ *through* $x$ is cheaper — a question about the exact optimal cost
+$c^*(x, v)$ and the trajectory achieving it. Forward propagation cannot answer it. Webb and van den Berg's
+Kinodynamic RRT\* answers it for linear dynamics $\dot x = Ax + Bu$ with cost $\int_0^\tau (1 + u^\top R u)\,dt$:
+for a fixed arrival time $\tau$ the minimum-energy cost is
+
+$$
+c(\tau) = \tau + \bigl(x_1 - e^{A\tau}x_0\bigr)^\top G(\tau)^{-1}\bigl(x_1 - e^{A\tau}x_0\bigr),\qquad
+G(\tau) = \int_0^\tau e^{A(\tau - t)}BR^{-1}B^\top e^{A^\top(\tau - t)}\,dt,
+$$
+
+and the free final time is $\tau^* = \arg\min_\tau c(\tau)$. For the planar double integrator with
+$R = rI$ each axis gives $G(\tau) = \tfrac1r\left[\begin{smallmatrix}\tau^3/3 & \tau^2/2\\ \tau^2/2 & \tau\end{smallmatrix}\right]$
+and $c(\tau) = \tau + r\sum(12\Delta p^2/\tau^3 - 12\Delta p\,\Delta v/\tau^2 + 4\Delta v^2/\tau)$ with
+$\Delta p = p_1 - p_0 - v_0\tau$, $\Delta v = v_1 - v_0$. From $(0, 0, 1, 0)$ to $(2, 1, 0, 0.5)$ with $r = 0.5$
+the library finds $\tau^* = 2.3893$ s at cost $3.0075$, and integrating the closed-form optimal control
+$u(t) = R^{-1}B^\top e^{A^\top(\tau - t)}G(\tau)^{-1}d$ lands on the target to round-off. For the
+reduced *kinematic* car the exact steer is Reeds–Shepp, which is what w21.5's toggle uses; Hitch's dynamic
+model has neither, and Exercise 6 asks you to linearize it about rest and use the LQR edge anyway.
+
+### Kinematic reductions and decoupling vector fields
+
+Chapter 20 left Reach's dead-motor arm with an uncomfortable verdict: accessible from rest, with
+Lewis–Murray unable to certify STLC. §12.4.2 changes the question from "can it get anywhere?" to "can I
+plan it like a kinematic system?".
+
+<KeyIdea title="Statement (Lewis; Bullo and Lynch; Choset Theorems 12.4.5, 12.4.7)">
+A driftless $\dot q = \sum V_i w_i$ is a *kinematic reduction* of $\nabla_{\dot q}\dot q = \sum Y_i u_i$ if all its
+trajectories are feasible for the mechanical system. The system is *maximally reducible* iff
+$\mathrm{Sym}(\mathcal{Y}) = \mathrm{span}(\mathcal{Y})$ (Theorem 12.4.5). A single field $V$ is
+*decoupling* — followable at any speed profile $w(t)$ — iff
+
+<LinkedMath>
+$$
+V \in \mathrm{span}(\mathcal{Y}) \quad\text{and}\quad \nabla_V V \in \mathrm{span}(\mathcal{Y})
+$$
+</LinkedMath>
+
+(Theorem 12.4.7). If some set of decoupling fields has $\mathrm{Lie}(\mathcal{V})(q) = T_q\mathcal{Q}$ the
+system is STLKC at $q$, hence equilibrium controllable by decoupling segments with stops at the switches.
+</KeyIdea>
+
+<Derivation title="Why V and ∇_V V must both be actuated" result="\nabla_{\dot q}\dot q = V\dot w + \nabla_V V\, w^2 \in \mathrm{span}(\mathcal{Y})\ \ \forall\, w, \dot w">
+1. **Substitute.** Along $\dot q = V(q)w$, $\ddot q = V\dot w + \tfrac{\partial V}{\partial q}V w^2$ (Choset 12.16–12.17).
+2. **Covariant form.** $\nabla_{\dot q}\dot q = \ddot q + M^{-1}\dot q^\top\Gamma\dot q = V\dot w + \bigl(\tfrac{\partial V}{\partial q}V + M^{-1}V^\top\Gamma V\bigr)w^2 = V\dot w + \nabla_V V\,w^2$.
+3. **Feasibility for all speed profiles.** The left side must equal $\sum Y_i u_i$ for *some* $u$, for every $w$ and $\dot w$ independently: the $\dot w$ term forces $V \in \mathrm{span}(\mathcal{Y})$, the $w^2$ term forces $\nabla_V V \in \mathrm{span}(\mathcal{Y})$. Conversely, both memberships let you solve for $u$.
+4. **Finding them.** Write $V = \sum h_i(q)Y_i$ and solve $\langle X_c, \nabla_V V\rangle = 0$ for the $M$-orthogonal complement $X_c$ of span$(\mathcal{Y})$ — quadratic equations in the $h_i$. Then plan in $\mathcal{Q}$ and time-scale each segment with [Chapter 18](/chapters/ch18-trajectory-planning).
+</Derivation>
+
+For the planar body with thrusters Choset finds $V_1 = Y_1$ (translation along the thrust line) and
+$V_2 = Y_2$ (rotation about the center of percussion at distance $1/d$), with $\nabla_{V_1}V_1 = 0$ and
+$\nabla_{V_2}V_2 \in \mathrm{span}(Y_1)$; but $\langle Y_1 : Y_2\rangle \notin \mathrm{span}(\mathcal{Y})$, so
+$V_1 + V_2$ is *not* decoupling (Example 12.4.8). For the 3R arm with $u_3 = 0$ the free third link is that
+body, its "thrusters" the forces joints 1 and 2 apply at joint 3. The two decoupling fields are
+translation along link 3 and rotation about its center of percussion with respect to joint 3, at distance
+
+$$
+k = \frac{I_3 + m_3 r_3^2}{m_3 r_3} = \frac{0.004125 + 0.5 \cdot 0.15^2}{0.5 \cdot 0.15} = 0.205\ \text{m}
+$$
+
+for Choset's Table 12.1 robot. In joint coordinates both are built through the inverse of the $2\times2$
+Jacobian of joint 3's position. The check evaluates Theorem 12.4.7 numerically with Chapter 20's
+kinetic-energy connection at three configurations: both fields pass with residuals below
+$5 \times 10^{-10}$; rotation about the center of *mass* fails (it is not even in span($\mathcal{Y}$) — a
+rotation about the COM needs a torque the dead joint cannot supply); and the sum of the two fails the
+second condition, exactly as for the free body.
+
+### Modern descendants: lattices and hybrid A\*
+
+Choset's chapter ends in 2005 with Algorithm 22 and PRM-with-Reeds–Shepp. The planners that parked the
+DARPA Urban Challenge vehicles, and their successors, are those two ideas recombined, with three deltas:
+
+1. **Lattice-consistent primitives** (state lattices, Pivtoraiko, Knepper and Kelly). Choose primitives that start and end *exactly* on lattice states — grid points times a set of headings — so the search graph is a real graph and A\* runs unchanged. The library builds them with this chapter's Dubins solver: for each start heading and each category (straight, ±45°, ±90°, lane change), the cheapest Dubins path to a lattice endpoint whose total turning equals the heading change. The cost of exactness is that the start and goal must be lattice states.
+2. **One continuous state per cell** (hybrid A\*, Dolgov, Thrun, Montemerlo and Diebel). Keep Algorithm 22's free-running continuous configurations and its occupancy grid, but let each cell hold the cheapest state that reached it rather than the first.
+3. **Analytic expansions and a dual heuristic** (hybrid A\*). Every $N$ expansions try a Reeds–Shepp shot from the popped state straight to the goal and accept it if it is free — the PRM local planner, inside the search. Order OPEN by $\max(\text{Reeds–Shepp length ignoring obstacles},\ \text{2-D shortest distance ignoring kinematics})$: each term is a lower bound on the true cost, so their maximum is too. (The library's 2-D table is scaled by $1/1.0824$, the worst octile-to-Euclidean ratio, to keep it admissible.)
+
+On the Lot, reversing into bay 3 from $(2, 1, 0)$ to $(9.5, 8.5, -\pi/2)$ at $0.5$ m resolution with the
+dual heuristic: the six-primitive state lattice expands 298 states and returns a $24.368$ m path with
+three cusps; hybrid A\* with a shot every ten expansions expands 161, fires seventeen shots, and returns
+$17.107$ m with three cusps, ending *exactly* on the goal. Both are at least the obstacle-blind Reeds–Shepp
+distance, $15.189$ m. Hybrid A\* is not optimal (the cell pruning discards states that might have led to
+cheaper paths) and the lattice is optimal only over its primitives; w21.3 lets you watch both trade-offs.
+
+## The algorithm
+
+<Algorithm
+  name="Algorithm 22 — CAR GRID SEARCH (Barraquand and Latombe)"
+  inputs="start q_start, goal region G(q_goal), action set {L±, S±, R±}, step Δ, grid resolution d, integer weights (a, b, c), MAXTREESIZE, collision checker"
+  outputs="a path of actions from q_start into G(q_goal), or FAILURE"
+  complexity="at most d³ expansions (d⁴ with a trailer), six motions each; O(1) OPEN insertion by cost buckets"
+>
+1. initialize the tree $T$ and the bucket array OPEN with $q_{start}$ at cost 0
+2. **while** OPEN is not empty and $|T| <$ MAXTREESIZE:
+3. $\quad q \leftarrow$ first node of the lowest non-empty bucket; remove it
+4. $\quad$**if** $q \in G(q_{goal})$: **return** SUCCESS and the path root → $q$
+5. $\quad$**if** the cell of $q$ in the $d^3$ grid is not marked:
+6. $\quad\quad$mark it
+7. $\quad\quad$**for** each action $\in \{L_\pm, R_\pm, S_\pm\}$: integrate for arc length $\Delta$ (Hitch.step, with the trailer if hitched) to $q_{new}$, checking the footprint at substeps
+8. $\quad\quad\quad$**if** the motion is free: add $q_{new}$ under $q$; cost $=$ cost$(q) + a + b\,[\text{steer changed}] + c\,[\text{direction changed}]$; append to that cost's bucket
+9. **return** FAILURE
+</Algorithm>
+
+<Algorithm
+  name="steer_sinusoids(x_start, x_goal) — Choset §12.5.2"
+  inputs="chained-form start and goal in ℝⁿ, optional amplitude cap"
+  outputs="n − 1 control phases on unit time and the integrated trace"
+  complexity="n − 1 integrations of the chain"
+>
+1. phase 0: $u_1 = x_{goal,1} - x_{start,1}$, $u_2 = x_{goal,2} - x_{start,2}$, constant on $[0, 1]$
+2. **for** $k = 1, \dots, n - 2$: $\Delta \leftarrow x_{goal,k+2} - x_{k+2}$; $a = b = (|\Delta|\,k!\,(4\pi)^k)^{1/(k+1)}$ with the sign of $\Delta$ on $b$; if $a$ exceeds the cap, clamp it and set $b = \Delta\,k!\,(4\pi/a)^k$
+3. $\quad$apply $u_1 = a\sin 2\pi t$, $u_2 = b\cos 2k\pi t$ for unit time and integrate
+4. for Hitch's car: map poses to $z = (x', \tan\phi/(L\cos^3\theta'), \tan\theta', y')$ in the chart rotated to the heading bisector, and back
+</Algorithm>
+
+<Algorithm
+  name="steer_gradient(x_start, x_goal, u⁰, ε) — Choset §12.5.4"
+  inputs="start and goal, initial parameter vector (zero by default), tolerance, a seeded RNG for generic loops"
+  outputs="u^p with ‖f(x_start, u^p) − x_goal‖ < ε, or the iterate where the line search stalled"
+  complexity="per iteration: one end-state Jacobian (2r propagations) and a backtracking line search"
+>
+1. **if** rank $\partial f/\partial u^p < n$: append a generic loop (random pieces, then the same pieces reversed and negated)
+2. **repeat** until $\|e\| < \epsilon$: $J \leftarrow \partial f/\partial u^p$ by central differences; $v \leftarrow -J^\top e$
+3. $\quad$**if** $v = 0$: append another generic loop and continue
+4. $\quad$double $\alpha$, then halve it until $\tfrac12\|e(u^p + \alpha v)\|^2 \le \tfrac12\|e\|^2 - 10^{-4}\alpha\|v\|^2$; accept
+5. (§12.5.3 variant: hand $r(u^p) = e$ and $J$ to Chapter 19's levenbergMarquardt)
+</Algorithm>
+
+<Algorithm
+  name="kinodynamic_rrt(prop, x_start, G, n, metric, k) — Choset §7.5.1"
+  inputs="a simulator prop(x, u, Δt), a control sampler, a state sampler with goal bias, a metric, controls per extension k"
+  outputs="a tree whose root-to-goal branch is a list of (control, Δt) pairs that re-integrates exactly"
+  complexity="per extension: one nearest-neighbor query and k propagations of `substeps` collision checks"
+>
+1. tree $\leftarrow \{x_{start}\}$
+2. **for** $i = 1, \dots, n$: $x_{rand} \leftarrow$ goal sample with probability $p_g$, else uniform
+3. $\quad x_{near} \leftarrow \arg\min_{v \in \text{tree}} \mathrm{metric}(v, x_{rand})$
+4. $\quad$**for** $j = 1, \dots, k$: sample $u_j$; propagate $x_{near}$ for $\Delta t$ in substeps, discarding $u_j$ at the first collision
+5. $\quad$keep the free endpoint closest to $x_{rand}$; add it with its control and segment
+6. $\quad$**if** any state of the segment is in $G$: **return** the branch
+</Algorithm>
+
+<Algorithm
+  name="hybrid_a_star(q_start, q_goal, cell, h, N)"
+  inputs="start and goal poses, cell size, heuristic (Euclidean, RS, or max(RS, 2-D)), shot period N, heading bins"
+  outputs="arc primitives followed by one Reeds–Shepp shot, ending exactly at q_goal"
+  complexity="A* over at most (cells × heading bins) expansions; one RS evaluation per heuristic call"
+>
+1. push $q_{start}$; best $g$ per cell $\leftarrow \infty$ except the start's
+2. **while** OPEN not empty: pop the lowest $f = g + h$; **if** its cell is closed, continue; close it
+3. $\quad$**every** $N$-th expansion: RS shot to $q_{goal}$; **if** free, **return** path to here + shot
+4. $\quad$**for** each of $L_\pm, S_\pm, R_\pm$ (arc length just long enough to leave the cell and, at full lock, the heading bin — otherwise a turning child ties with its straight sibling in the same cell and is pruned): integrate, check, compute the child's cell
+5. $\quad\quad$**if** the cell is open and $g_{child} <$ best $g$ of that cell: record it, push with $f = g_{child} + h(q_{child})$
+</Algorithm>
+
+<Algorithm
+  name="decoupling_grid_search(V, q_start, G, ik) then time_scale — Choset §12.5.7"
+  inputs="decoupling primitives (translate ±, rotate ± about the center of percussion), link-3 start and goal poses, IK with a fixed elbow, collision and singularity margin"
+  outputs="a switch-minimizing sequence of decoupling segments and its time-optimal, rest-to-rest execution"
+  complexity="Alg. 22 over link-3 poses with 4 primitives and lexicographic cost (switches, steps); one time scaling per segment"
+>
+1. best-first over link-3 poses $(x_{J3}, y_{J3}, \alpha)$ with a $d^3$ occupancy grid; children by the four primitives, valid if IK exists with $|\sin q_2| \ge$ margin and the whole arm is free
+2. cost $=$ (number of switches, number of steps) compared lexicographically; goal tested at pop
+3. merge equal consecutive primitives into segments
+4. **for** each segment: path $q(s)$ by IK; Chapter 18's time scaling of the two actuated rows from rest to rest (the third row is identically zero along a decoupling path)
+</Algorithm>
+
+## Implementation in Rust
+
+The `nonholonomic` crate of Chapter 20 gains a `steer/` directory, `car_grid.rs`, `lattice/` and
+`reduction.rs`; forward propagation gets its own crate, `kinodynamic`, which owns the `Propagate` trait
+Chapter 14's preview borrowed. The TypeScript port in `web/lib/nonholonomic/` — `dubins.ts`,
+`reeds-shepp.ts`, `chained.ts`, `gradient.ts`, `flat.ts`, `car-grid.ts`, `lattice.ts`, `kinodynamic.ts`,
+`reduction.ts`, `steer.ts`, `park.ts` — is the code behind every widget on this page, and its
+`__checks_ch21__.ts` pins every number in the prose.
+
+```rust title="crates/nonholonomic/src/steer/dubins.rs"
+use manifold::SE2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Word { LSL, RSR, LSR, RSL, RLR, LRL }
+
+/// Dubins shortest path for the reduced car (Choset eq. 12.35). Segment lengths are
+/// normalized by ρ — arcs in radians, the straight in units of ρ — so the closed forms
+/// are scale-free; every word returned is checked by integration in the tests.
+#[derive(Clone, Copy, Debug)]
+pub struct DubinsPath { pub word: Word, pub segs: [f64; 3], pub rho: f64 }
+
+impl DubinsPath {
+    pub fn len(&self) -> f64 { self.rho * self.segs.iter().sum::<f64>() }
+}
+
+fn mod2pi(a: f64) -> f64 { a.rem_euclid(std::f64::consts::TAU) }
+
+/// Start at the origin, goal at (d, 0): headings measured from the bearing of the goal.
+fn normalize(q0: &SE2, q1: &SE2, rho: f64) -> (f64, f64, f64) {
+    let (dx, dy) = (q1.x - q0.x, q1.y - q0.y);
+    let bearing = dy.atan2(dx);
+    (dx.hypot(dy) / rho, mod2pi(q0.theta - bearing), mod2pi(q1.theta - bearing))
+}
+
+/// LSL: the two left circles and their external tangent (Derivation 5, step 5).
+fn lsl(d: f64, a: f64, b: f64) -> Option<[f64; 3]> {
+    let p2 = 2.0 + d * d - 2.0 * (a - b).cos() + 2.0 * d * (a.sin() - b.sin());
+    if p2 < 0.0 { return None; }
+    let th = (b.cos() - a.cos()).atan2(d + a.sin() - b.sin());
+    Some([mod2pi(-a + th), p2.sqrt(), mod2pi(b - th)])
+}
+
+pub fn dubins_shortest_path(q0: &SE2, q1: &SE2, rho: f64) -> Option<DubinsPath> {
+    let (d, a, b) = normalize(q0, q1, rho);
+    // RSR, LSR, RSL, RLR, LRL follow from LSL by reflection (L <-> R, headings negated)
+    // and by reading the word backward; each has its own feasibility test.
+    [(Word::LSL, lsl(d, a, b)), (Word::RSR, rsr(d, a, b)), (Word::LSR, lsr(d, a, b)),
+     (Word::RSL, rsl(d, a, b)), (Word::RLR, rlr(d, a, b)), (Word::LRL, lrl(d, a, b))]
+        .into_iter()
+        .filter_map(|(word, s)| s.map(|segs| DubinsPath { word, segs, rho }))
+        .min_by(|x, y| x.len().total_cmp(&y.len()))
+}
+```
+
+```rust title="crates/nonholonomic/src/steer/reeds_shepp.rs"
+use manifold::SE2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Steer { L, S, R }
+
+/// A signed segment: arcs in radians, straights in units of ρ; negative means reverse.
+#[derive(Clone, Copy, Debug)]
+pub struct Seg { pub steer: Steer, pub len: f64 }
+
+/// The three symmetries of the normalized goal (x, y, φ). Time-flip negates every
+/// segment, reflect swaps L and R; "backwards" (applied separately) reads the word
+/// right to left. Eleven base formulas under these four maps: 44 evaluations that
+/// cover the 48 Reeds–Shepp words.
+const SYMMETRIES: [(f64, f64, f64, bool, bool); 4] = [
+    (1.0, 1.0, 1.0, false, false),   // base
+    (-1.0, 1.0, -1.0, true, false),  // time-flip
+    (1.0, -1.0, -1.0, false, true),  // reflect
+    (-1.0, -1.0, 1.0, true, true),   // both
+];
+
+pub fn reeds_shepp_candidates(x: f64, y: f64, phi: f64) -> Vec<Vec<Seg>> {
+    let mut out = Vec::new();
+    for &(sx, sy, sp, flip, refl) in &SYMMETRIES {
+        let sign = if flip { -1.0 } else { 1.0 };
+        let word = |w: [Steer; 3], l: [f64; 3]| -> Vec<Seg> {
+            w.iter().zip(l).map(|(&s, len)| Seg {
+                steer: if refl { s.mirrored() } else { s },
+                len: sign * len,
+            }).collect()
+        };
+        if let Some((t, u, v)) = lp_sp_lp(sx * x, sy * y, sp * phi) {
+            out.push(word([Steer::L, Steer::S, Steer::L], [t, u, v]));
+        }
+        if let Some((t, u, v)) = lp_sp_rp(sx * x, sy * y, sp * phi) {
+            out.push(word([Steer::L, Steer::S, Steer::R], [t, u, v]));
+        }
+        // … L+R-L (and its backwards reading), the two CCCC, the four CCSC, the CCSCC.
+    }
+    out
+}
+
+/// The shortest word in world units, or None (never, for ρ > 0).
+pub fn reeds_shepp_shortest_path(q0: &SE2, q1: &SE2, rho: f64) -> Option<(Vec<Seg>, f64)> {
+    let local = q0.inverse() * *q1;           // goal in the start's frame
+    reeds_shepp_candidates(local.x / rho, local.y / rho, local.theta)
+        .into_iter()
+        .map(|w| { let l = rho * w.iter().map(|s| s.len.abs()).sum::<f64>(); (w, l) })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+}
+
+impl Steer {
+    fn mirrored(self) -> Self { match self { Steer::L => Steer::R, Steer::R => Steer::L, Steer::S => Steer::S } }
+}
+```
+
+```rust title="crates/nonholonomic/src/car_grid.rs"
+use std::collections::VecDeque;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action { Lp, Sp, Rp, Lm, Sm, Rm }
+
+/// Integer weights: OPEN becomes an array of FIFO buckets indexed by cost (Choset's
+/// "one-dimensional array with cost as the index"), so insertion is O(1).
+#[derive(Clone, Copy, Debug)]
+pub struct GridSearchCost { pub a: u32, pub b: u32, pub c: u32 }
+
+pub struct Node<C> { pub q: C, pub parent: Option<usize>, pub action: Option<Action>, pub cost: u32 }
+
+/// C Alg. 22, generic over the car model so the trailer is one type away.
+pub fn car_grid_search<C: CarModel>(
+    car: &C, q_start: C::Config, goal: &GoalRegion<C::Config>, step: f64,
+    cells_per_dim: usize, cost: GridSearchCost, cs: &dyn collide::Collision<C::Config>,
+    max_tree: usize,
+) -> Result<Vec<(C::Config, Action)>, Failure> {
+    let mut tree = vec![Node { q: q_start, parent: None, action: None, cost: 0 }];
+    let mut open: Vec<VecDeque<usize>> = vec![VecDeque::from([0])];
+    let mut occupied = vec![false; car.cells(cells_per_dim)];    // d³, or d⁴ with a trailer
+    let mut lowest = 0usize;
+    while tree.len() < max_tree {
+        // Line 3: the first node of the lowest non-empty bucket.
+        while lowest < open.len() && open[lowest].is_empty() { lowest += 1; }
+        let Some(id) = open.get_mut(lowest).and_then(|b| b.pop_front()) else { break };
+        let q = tree[id].q.clone();
+        // Line 4: the goal is tested when popped, which is what makes the path cost-optimal.
+        if goal.contains(&q) { return Ok(path_to(&tree, id)); }
+        // Lines 7-8: expand each cell once.
+        let cell = car.cell_of(&q, cells_per_dim);
+        if std::mem::replace(&mut occupied[cell], true) { continue; }
+        for act in Action::ALL {
+            let (q_new, sweep) = car.integrate(&q, act, step);
+            if !sweep.iter().all(|s| cs.is_free(s)) { continue; }   // line 11
+            let prev = tree[id].action;
+            let c = tree[id].cost + cost.a
+                + if prev.is_some_and(|p| p.steer() != act.steer()) { cost.b } else { 0 }
+                + if prev.is_some_and(|p| p.dir() != act.dir()) { cost.c } else { 0 };
+            if open.len() <= c as usize { open.resize_with(c as usize + 1, VecDeque::new); }
+            open[c as usize].push_back(tree.len());
+            lowest = lowest.min(c as usize);
+            tree.push(Node { q: q_new, parent: Some(id), action: Some(act), cost: c });
+        }
+    }
+    Err(Failure::TreeExhausted { size: tree.len() })
+}
+```
+
+```rust title="crates/kinodynamic/src/rrt.rs"
+use rand::{rngs::Pcg64, Rng};
+
+/// §7.5.1: planning with a simulator instead of a steer.
+pub trait Propagate {
+    type State: Clone;
+    type Control: Clone;
+    fn propagate(&self, x: &Self::State, u: &Self::Control, dt: f64) -> Self::State;  // RK4 inside
+    fn sample_control(&self, rng: &mut Pcg64) -> Self::Control;
+}
+
+pub struct KinoRrt<P: Propagate> {
+    pub sys: P,
+    pub controls_per_extend: usize,
+    pub dt: f64,
+    pub substeps: usize,
+    pub goal_bias: f64,
+    nodes: Vec<(P::State, Option<(usize, P::Control)>)>,
+}
+
+impl<P: Propagate> KinoRrt<P> {
+    pub fn plan(
+        &mut self, x_start: P::State, goal: &dyn Fn(&P::State) -> bool, n: usize,
+        sample: &dyn Fn(&mut Pcg64) -> P::State, metric: &dyn Fn(&P::State, &P::State) -> f64,
+        is_free: &dyn Fn(&P::State) -> bool, rng: &mut Pcg64,
+    ) -> Option<Vec<(P::Control, f64)>> {
+        self.nodes = vec![(x_start, None)];
+        for _ in 0..n {
+            let x_rand = sample(rng);
+            // The metric is the planner's only notion of "near" — and its most sensitive knob.
+            let near = (0..self.nodes.len())
+                .min_by(|&a, &b| metric(&self.nodes[a].0, &x_rand).total_cmp(&metric(&self.nodes[b].0, &x_rand)))?;
+            let mut best: Option<(P::State, P::Control, f64)> = None;
+            for _ in 0..self.controls_per_extend {
+                let u = self.sys.sample_control(rng);
+                let h = self.dt / self.substeps as f64;
+                let mut x = self.nodes[near].0.clone();
+                let mut free = true;
+                for _ in 0..self.substeps {
+                    x = self.sys.propagate(&x, &u, h);
+                    if !is_free(&x) { free = false; break; }
+                }
+                let d = metric(&x, &x_rand);
+                if free && best.as_ref().is_none_or(|b| d < b.2) { best = Some((x, u, d)); }
+            }
+            let Some((x_new, u, _)) = best else { continue };
+            self.nodes.push((x_new.clone(), Some((near, u))));
+            if goal(&x_new) { return Some(self.controls_to(self.nodes.len() - 1)); }
+        }
+        None
+    }
+}
+```
+
+```rust title="crates/nonholonomic/src/reduction.rs"
+use nalgebra::{SMatrix, SVector};
+
+/// Theorem 12.4.7: V is decoupling iff V ∈ span(Y) and ∇_V V ∈ span(Y).
+pub fn is_decoupling<const Q: usize>(
+    v: &dyn VectorField<Q>, inputs: &[&dyn VectorField<Q>],
+    model: &dynamics::Model<Q>, q: &SVector<f64, Q>, tol: f64,
+) -> bool {
+    let y: Vec<SVector<f64, Q>> = inputs.iter().map(|f| f.eval(q)).collect();
+    let vq = v.eval(q);
+    // ∇_V V = (∂V/∂q) V + M⁻¹ (Vᵀ Γ V), Chapter 17's Christoffel symbols, Choset's convention.
+    let nabla = v.jacobian(q) * vq + model.mass_matrix(q).try_inverse().unwrap()
+        * model.christoffel_form(q, &vq, &vq);
+    relative_residual(&vq, &y) < tol && relative_residual(&nabla, &y) < tol
+}
+
+/// Reach 3R with u₃ = 0: rotation of link 3 about its center of percussion with respect
+/// to joint 3, at k = (I₃ + m₃r₃²)/(m₃r₃) — 0.205 m for Choset's Table 12.1 robot.
+pub fn rotate_about_percussion(arm: &PlanarArm<3>) -> impl VectorField<3> + '_ {
+    let k = arm.percussion_distance();
+    move |q: &SVector<f64, 3>| {
+        let a = q.sum();                                   // link 3's absolute heading
+        let j: SMatrix<f64, 2, 2> = arm.joint3_jacobian(q); // ∂(x_J3, y_J3)/∂(q₁, q₂)
+        let r = j.try_inverse().unwrap() * SVector::<f64, 2>::new(k * a.sin(), -k * a.cos());
+        SVector::<f64, 3>::new(r[0], r[1], 1.0 - r[0] - r[1])
+    }
+}
+```
+
+### The worked example, printed
+
+```rust title="crates/nonholonomic/examples/dubins_check.rs"
+fn main() {
+    let q0 = SE2::new(0.0, 0.0, 0.0);
+    let q1 = SE2::new(3.0, 3.0, std::f64::consts::FRAC_PI_2);
+    for p in dubins_all(&q0, &q1, 1.0) {
+        println!("{:?}  t={:.6} p={:.6} q={:.6}  len={:.6}", p.word, p.segs[0], p.segs[1], p.segs[2], p.len());
+    }
+    let best = dubins_shortest_path(&q0, &q1, 1.0).unwrap();
+    let end = best.integrate(&q0);
+    println!("integrate(LSL) -> ({:.6}, {:.6}, {:.6})", end.x, end.y, end.theta);
+    let (rs, len) = reeds_shepp_shortest_path(&q0, &q1, 1.0).unwrap();
+    println!("reeds-shepp: {}  len={:.6}", word_string(&rs), len);
+}
+```
+
+```text title="cargo run --example dubins_check -p nonholonomic"
+LSL  t=0.785398 p=2.828427 q=0.785398  len=4.399223
+LSR  t=0.927295 p=4.000000 q=5.639684  len=10.566979
+RSL  t=5.639684 p=4.000000 q=0.927295  len=10.566979
+LRL  t=3.141593 p=4.712389 q=3.141593  len=10.995574
+RSR  t=5.497787 p=5.656854 q=5.497787  len=16.652429
+integrate(LSL) -> (3.000000, 3.000000, 1.570796)
+reeds-shepp: L+S+L+  len=4.399223
+```
+
+```text title="cargo run --example flat_car -p nonholonomic"
+t=0.25  y=(0.250000, 0.156250)  theta=0.844154 v=1.505199 omega=1.324138 kappa=0.879709 phi(L=1)=0.721491
+t=0.50  y=(0.500000, 0.500000)  theta=0.982794 v=1.802776 omega=0.000000 kappa=0.000000 phi(L=1)=0.000000
+```
+
+```text title="cargo run --example reach_dead_joint_drive -p nonholonomic"
+percussion distance k = 0.205000 m
+plan: T- 0.240 | R+ 1.100 | T+ 0.390 | R- 0.200   (3 switches)
+time-optimal, rest to rest: 0.151 + 0.157 + 0.230 + 0.050 = 0.589 s
+max |tau3| along every segment: 0 (to finite-difference accuracy); one actuator saturated at every node
+```
+
+`#[test] fn reproduces_micro_example()` asserts the first two blocks to $10^{-6}$;
+`tests/words_integrate.rs` draws 400 seeded pose pairs and asserts that every Dubins and Reeds–Shepp word
+integrates to its endpoint within $10^{-9}$ and that Euclidean $\le$ Reeds–Shepp $\le$ Dubins length. The
+dead-joint example cannot reproduce Choset's $0.890$ s, because his Fig. 12.33 path is drawn but not
+given numerically; it reproduces his *structure* — four decoupling segments, one actuator always
+saturated — on the query of w21.6.
+
+## Putting it together
+
+The Integration lab is `park_six_ways` live: Hitch with its 2.5 m trailer, from $(5.5, 1.2, 0)$ into bay 3,
+every planner of the chapter, one scoreboard (seed 21; the trailer is simulated along each path, or
+produced by the method itself for the trailer-axle flat planner and Algorithm 22's trailer extension).
+
+| method | length (m) | cusps | max $\lvert\theta_1\rvert$ (rad) | clearance (m) | ends |
+|---|---|---|---|---|---|
+| Reeds–Shepp (obstacle-blind) | 7.37 | 1 | 0.62 | 0.10 | exactly on the goal |
+| flat-output quintic, trailer axle | 9.19 | 0 | 1.03 | collides | exactly; $\lvert\phi\rvert$ up to 1.39 rad |
+| chained-form sinusoids | 27.89 | 3 | 2.39 | collides | exactly, in chained coordinates |
+| CAR GRID SEARCH (Alg. 22, trailer grid) | 7.20 | 0 | 0.63 | 0.11 | inside $\pm 0.5$ m, $\pm 0.2$ rad |
+| hybrid A\* (car), trailer towed | 7.37 | 1 | 0.62 | 0.10 | exactly (its RS shot) |
+| forward-propagation RRT, dynamic car | 6.85 | 0 | 0.66 | 0.13 | inside $0.8$ m, $0.35$ rad |
+
+Read it as a summary of the chapter. Here the query is open enough that hybrid A\*'s first shot is
+already free, so it *is* the Reeds–Shepp path; Algorithm 22 finds a slightly shorter path only because it
+is allowed to stop half a metre short. The flat planner's single smooth curve is the only one built
+around the trailer, and it is also the one that asks for more steering than Hitch has. The sinusoids are
+exact in the coordinates where they are exact and absurd everywhere else: the trailer swings to
+$2.39$ rad, a jackknife, because the chained form of the four-state car simply does not contain it. The
+forward-propagated tree is the shortest because its goal is a region — the honest comparison is the
+column on the right.
+
+Two more experiments belong to the lab. **The failure button**: shrink the bay until Hitch is only a
+little shorter than it and run Algorithm 22 with $c = 0$; the number of cusps in the solution grows as the
+slack shrinks, as Choset's $\Theta(1/\epsilon^2)$ theorem says it must, and no planner in this chapter can
+beat that — it is a property of the car, paid in Chapter 20's currency of brackets. **The randomized
+pillar**: in w21.1 turn obstacles on and re-roll the seed; a third pillar lands in the open floor, the
+obstacle-blind methods start reporting collisions, and Algorithm 22 routes around it. Chapter 23 reuses
+the trailer flat-output planner and the lattice for its jackknife tour, and
+[Chapter 22](/chapters/ch22-learning-and-planning) learns hybrid A\*'s heuristic from data.
+
+The sister book's [motion-planning chapter](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch20-motion-planning)
+previewed the Dubins dial and sketched hybrid A\* for a car under uncertainty; this chapter is the
+derivation and the tested implementation behind both.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="RSL from LSL, and when CCC can never win">
+    Derive the $RSL$ closed form from $LSL$ by reflection and reversal, and show where $p^2 < 0$ makes it
+    infeasible. Then prove that for $\|q_1 - q_0\|_{xy} \ge 4\rho$ no $CCC$ word is optimal — note that
+    $CCC$ words can still be *feasible* there.
+    <Hints>
+      <>Reflection $y \to -y$ maps $L \leftrightarrow R$ and negates headings; reading a path backward from the goal swaps the roles of $\alpha$ and $\beta$. Compose the two and $LSL$'s external tangent becomes the internal tangent of $RSL$.</>
+      <>For two circles of radius 1 turning in opposite directions the internal tangent has length $p$ with $p^2 + 4 = \|c_1 - c_0\|^2$: infeasible exactly when the circles overlap, $\|c_1 - c_0\| < 2$. A $CCC$ word needs its outer centers within $4\rho$, so the poses themselves can be up to $6\rho$ apart — feasibility is not the issue.</>
+      <>Two facts finish it: in an optimal $CCC$ path the middle arc exceeds $\pi\rho$ (Dubins' lemma), and with $\|q_1 - q_0\| \ge 4\rho$ the outer centers are at least $2\rho$ apart, so the same-direction $CSC$ word on the *same* outer circles exists; compare the two lengths arc by arc. Then test your proof against the library: among the chapter check's 20,000 seeded goals, none with $d \ge 4\rho$ has an optimal $CCC$ word.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={2} title="Chained forms are flat">
+    Prove that every chained-form system is flat with $(x_1, x_n)$ as flat outputs (Choset Problem 25) and
+    give $\varphi$ and $\psi_u$ explicitly for $n = 4$. Relate $x_4$ to Hitch's trailer flat output when
+    the car-with-trailer is put in chained form.
+    <Hints>
+      <>Wherever $u_1 = \dot x_1 \ne 0$, $\dot x_n = x_{n-1}u_1$ gives $x_{n-1} = \dot x_n/\dot x_1$; repeat down the chain.</>
+      <>For $n = 4$: $x_3 = \dot y_2/\dot y_1$, $x_2 = \dot x_3/\dot y_1 = (\ddot y_2\dot y_1 - \dot y_2\ddot y_1)/\dot y_1^3$, $u_1 = \dot y_1$, $u_2 = \dot x_2$ — three derivatives of $y_2$.</>
+      <>In Murray–Sastry coordinates for the four-state car, $(z_1, z_4) = (x', y')$ is the rear axle in the rotated chart — the car's flat output. With a trailer the last chained coordinates are the trailer axle's, matching the trailer-axle flat output of §12.5.5; both lose meaning at $v = 0$ and at the coordinate singularity.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the word, then drag">
+    <Predict
+      id="ch21.e3"
+      question="In the Reeds–Shepp Atlas with ρ = 1, start (0, 0, 0) and goal (2, −1, 0): which word is the shortest Dubins path, and does allowing cusps (Reeds–Shepp) shorten it?"
+      options={[
+        { label: 'RSL, length 2.287; Reeds–Shepp returns the same path', correct: true, because: 'A lane change to the right: arc right by atan(3/4) = 0.6435 rad, straight 1, arc left by the same angle — 2·atan(3/4) + 1 = 2.287. Every reversing word must cover at least the same ground plus the wasted motion of a cusp at this range.' },
+        { label: 'RSR, length about 2.2', because: 'An RSR path ends heading the way its last right arc leaves it; to finish with heading 0 after turning right it must turn back left, so RSR would need a near-full loop — the library gives RSR = 8.52.' },
+        { label: 'RSL for Dubins, but Reeds–Shepp is shorter with one cusp', because: 'The second-best Reeds–Shepp word here is R⁺L⁻R⁻L⁺ at 3.558; cusps pay off when the goal is close and beside or behind the start, not two radii ahead.' },
+      ]}
+    >
+    Now drag the goal to $(0.5, -1, 0)$ — beside the start rather than ahead of it. Dubins must loop
+    ($LSL$, $7.401$) while Reeds–Shepp switches to a $C|CC|C$ word of length $2.355$: a lane change that
+    short is made by backing up.
+    </Predict>
+    <CheckAnswer id="ch21.e3b" prompt="Length of the shortest path to (2, −1, 0) at ρ = 1" answer={2.287} tolerance={0.01} />
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Make the sinusoids swing and the flat planner fail">
+    In w21.1 with the trailer on, place the bay so that the sinusoid planner's trailer swing exceeds
+    $|\theta_1| = 1.2$ rad while the flat planner stays under $0.6$; then make the flat planner fail (its
+    steering demand over $0.6$ rad) by lowering the end-speed slider. Say where control constraints enter
+    each method.
+    <Hints>
+      <>The sinusoid planner's amplitude grows like $(|\Delta|\,k!\,(4\pi)^k)^{1/(k+1)}$; any bay that needs a large lateral correction $y'$ drives big oscillations in $x'$, and the passive trailer follows them.</>
+      <>The flat planner's curvature scales like $1/(\text{end speed})^2$ near the ends: a slow start means a sharp turn in little arc length. Control bounds enter flatness only through such free parameters — or through an optimizer over extra coefficients.</>
+      <>Reeds–Shepp and Algorithm 22 respect the steering limit by construction (full lock is the limit), and violate *smoothness* instead: the curvature jumps at every junction.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={2} title="CAR GRID SEARCH with a trailer, and the jackknife guard">
+    Implement the trailer extension of `car_grid_search` with a lookup table of $\Delta\theta_1$ per
+    primitive (indexed by the hitch angle at the start of the motion, Choset §12.5.6), check it against
+    integration on three seeded queries, and add the jackknife guard $|\theta_1| < \pi/2 - \delta$ as
+    pruning. Measure the expansions it saves.
+    <Hints>
+      <>Over one primitive of arc length $\Delta$ the hitch angle obeys $\theta_1' = \kappa - \sin\theta_1/d$ per unit arc length, with $\kappa \in \{1/\rho, 0, -1/\rho\}$ and the sign of $\Delta$ for reverse: the change depends only on $\theta_1$ and the action, so a 1-D table per action suffices.</>
+      <>Interpolate the table linearly in $\theta_1$; with 256 entries the error against RK4 is far below the grid's resolution in $\theta_1$.</>
+      <>The library's `CarGridSearch` takes a `jackknife` option; reversing primitives are the ones that get pruned, and the saving is largest on reverse-parking queries.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Kinodynamic RRT* for Hitch's dynamic model (stretch)">
+    Implement `KinoRrtStar` for Hitch's dynamic model linearized about rest (Webb and van den Berg:
+    fixed-final-state, free-final-time LQR edges), compare its cost curve with `KinoRrt` (best of 8) over
+    20 seeds, then swap the LQR edge for `steer_flat` and report which assumption each connection violates.
+    <Hints>
+      <>About rest the car's linearization is uncontrollable in the lateral direction (Chapter 20: the sideways direction is a bracket, not a first-order direction), so the LQR Gramian $G(\tau)$ is singular — linearize about a moving nominal instead, or accept edges only where $G$ is well conditioned.</>
+      <>The library's `doubleIntegratorSteer` shows the closed form for the controllable case; check your edge by integrating its control and landing on the target.</>
+      <>`steer_flat` is exact for the nonlinear car but neither optimal nor constraint-aware: RRT\*'s rewiring then compares costs that are not $c^*$, and its optimality argument no longer applies.</>
+    </Hints>
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 12, §12.4.2 and §12.5 (Brockett's sinusoids, chained forms, gradient steering, flatness, cars and trailers, Algorithm 22, kinematic reductions, Table 12.1) and §7.5.1 (control-based planning), followed section by section. The Souères–Laumond synthesis and the Sussmann–Tang reduction of the Reeds–Shepp list are its refs. 395 and 402."
+  />
+  <Reference
+    authors="Dubins, L. E."
+    year={1957}
+    title="On Curves of Minimal Length with a Constraint on Average Curvature, and with Prescribed Initial and Terminal Positions and Tangents"
+    venue="American Journal of Mathematics 79(3)"
+    doi="10.2307/2372560"
+    note="The six-word result for the forward-only car: the CSC/CCC words implemented in dubins.ts and pinned by the micro-example."
+  />
+  <Reference
+    authors="Reeds, J. A. and Shepp, L. A."
+    year={1990}
+    title="Optimal Paths for a Car That Goes Both Forwards and Backwards"
+    venue="Pacific Journal of Mathematics 145(2)"
+    doi="10.2140/pjm.1990.145.367"
+    note="The forty-eight words and the §8 base formulas that reeds-shepp.ts evaluates under the time-flip and reflect symmetries."
+  />
+  <Reference
+    authors="Murray, R. M. and Sastry, S. S."
+    year={1993}
+    title="Nonholonomic Motion Planning: Steering Using Sinusoids"
+    venue="IEEE Transactions on Automatic Control 38(5)"
+    doi="10.1109/9.277235"
+    note="Chained forms, the sinusoid ladder of eq. (12.31), and the chained coordinates of the kinematic car used by steerCarSinusoids."
+  />
+  <Reference
+    authors="Fliess, M., Lévine, J., Martin, P., and Rouchon, P."
+    year={1995}
+    title="Flatness and Defect of Non-linear Systems: Introductory Theory and Examples"
+    venue="International Journal of Control 61(6)"
+    doi="10.1080/00207179508921959"
+    note="Differential flatness, with the car and the car with trailers among its examples — Choset's refs. 152–153 and the basis of flat.ts."
+  />
+  <Reference
+    authors="Barraquand, J. and Latombe, J.-C."
+    year={1993}
+    title="Nonholonomic Multibody Mobile Robots: Controllability and Motion Planning in the Presence of Obstacles"
+    venue="Algorithmica 10"
+    doi="10.1007/BF01891837"
+    note="The grid search over full-lock primitives with a cusp-weighted cost that Choset presents as Algorithm 22, including the trailer extension."
+  />
+  <Reference
+    authors="Laumond, J.-P., Jacobs, P. E., Taïx, M., and Murray, R. M."
+    year={1994}
+    title="A Motion Planner for Nonholonomic Mobile Robots"
+    venue="IEEE Transactions on Robotics and Automation 10(5)"
+    doi="10.1109/70.326564"
+    note="The omnidirectional-to-nonholonomic path transformation by recursive Reeds–Shepp bisection (pathTransform) and the topological property behind its completeness."
+  />
+  <Reference
+    authors="LaValle, S. M. and Kuffner, J. J."
+    year={2001}
+    title="Randomized Kinodynamic Planning"
+    venue="International Journal of Robotics Research 20(5)"
+    doi="10.1177/02783640122067453"
+    note="Forward-propagation RRTs for systems with differential constraints — the KinoRrt of this chapter and the metric-sensitivity discussion."
+  />
+  <Reference
+    authors="Bullo, F. and Lynch, K. M."
+    year={2001}
+    title="Kinematic Controllability for Decoupled Trajectory Planning in Underactuated Mechanical Systems"
+    venue="IEEE Transactions on Robotics and Automation 17(4)"
+    doi="10.1109/70.954753"
+    note="Decoupling vector fields, Theorem 12.4.7 and kinematic controllability, with the 3R arm whose third joint is unactuated."
+  />
+  <Reference
+    authors="Pivtoraiko, M., Knepper, R. A., and Kelly, A."
+    year={2009}
+    title="Differentially Constrained Mobile Robot Motion Planning in State Lattices"
+    venue="Journal of Field Robotics 26(3)"
+    doi="10.1002/rob.20285"
+    note="State lattices with lattice-consistent primitives: delta 1 of the chapter's three deltas from Algorithm 22."
+  />
+  <Reference
+    authors="Dolgov, D., Thrun, S., Montemerlo, M., and Diebel, J."
+    year={2010}
+    title="Path Planning for Autonomous Vehicles in Unknown Semi-structured Environments"
+    venue="International Journal of Robotics Research 29(5)"
+    doi="10.1177/0278364909359210"
+    note="Hybrid A*: continuous states in a discrete grid, analytic Reeds–Shepp expansions and the dual heuristic — deltas 2 and 3."
+  />
+  <Reference
+    authors="Webb, D. J. and van den Berg, J."
+    year={2013}
+    title="Kinodynamic RRT*: Asymptotically Optimal Motion Planning for Robots with Linear Dynamics"
+    venue="IEEE International Conference on Robotics and Automation (preprint arXiv:1205.5088)"
+    url="https://arxiv.org/abs/1205.5088"
+    note="The fixed-final-state, free-final-time optimal edge that turns RRT* into a kinodynamic planner; the double-integrator closed form in kinodynamic.ts."
+  />
+  <Reference
+    authors="Karaman, S. and Frazzoli, E."
+    year={2011}
+    title="Sampling-based Algorithms for Optimal Motion Planning"
+    venue="International Journal of Robotics Research 30(7)"
+    doi="10.1177/0278364911406761"
+    note="RRT* and its asymptotic optimality, which Chapter 13 proves and Kinodynamic RRT* inherits once the steer is exact."
+  />
+</References>

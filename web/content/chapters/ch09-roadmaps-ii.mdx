@@ -1,0 +1,1219 @@
+---
+title: "Roadmaps II: Sensor-Based Roadmaps and Silhouettes"
+description: Where the planar GVD stops being a roadmap and what replaces it — the generalized Voronoi graph by intersecting equidistance sheets transversally, its disconnection and the hierarchical patch, a Lyapunov tracing law that lets a robot build the graph from range data alone, Canny's silhouette roadmap and the opportunistic path planner, and the price of exact planning.
+chapter: 9
+part: PART II
+partTitle: Classical Planners — Search, Potentials, Roadmaps, Cells
+difficulty: Advanced
+readingTime: 70 min
+quote: Since ∇G(q) is a function of distance gradients, the planner can compute ∇G(q) solely from range sensor information.
+quoteAuthor: Howie Choset, Kevin Lynch, Seth Hutchinson, George Kantor, Wolfram Burgard, Lydia Kavraki, and Sebastian Thrun
+quoteSource: Principles of Robot Motion (2005), §5.3.3
+---
+
+import { UnknownApartmentHook } from '@/components/ch/ch09/unknown-apartment-hook';
+import { GvgExplorerWidget } from '@/components/ch/ch09/gvg-explorer';
+import { SilhouetteSweep } from '@/components/ch/ch09/silhouette-sweep';
+import { LyapunovFunnel } from '@/components/ch/ch09/lyapunov-funnel';
+import { TransversalityTrio } from '@/components/ch/ch09/transversality-trio';
+import { LinkedMath } from '@/components/book/linked-math';
+import { Predict, CheckAnswer, Hints } from '@/components/book/predict';
+import { Deferred } from '@/components/sim/deferred';
+
+<Overview
+  goals={[
+    'Define the generalized Voronoi graph in R^m as the set of points equidistant to m closest obstacles with distinct gradients, and prove its edges are one-dimensional from the preimage theorem plus the transversality assumption',
+    'Explain why the GVG is generically disconnected in three dimensions — no one-dimensional deformation retract of a punctured 3-space exists — and how second-order edges, periods and the projected gradient patch it into the hierarchical GVG',
+    'State the definition of a Lyapunov function, derive Γ̇ = βGᵀG for the tracing law q̇ = αv + β(DG)†G, and say exactly where the derivation stops holding',
+    'Build a roadmap of an unknown environment from a range ring: access, trace, home onto meet points, and run depth-first search over a graph the robot is still drawing',
+    'Compute a silhouette as the critical set of a projection (Lemmas 5.5.1–5.5.2 and the slice lemma), locate critical slices, and connect the pieces by recursion — Canny\'s roadmap — and its cousin the opportunistic path planner with its generalized gradient',
+    'Quote Canny\'s singly exponential bound and the PSPACE-hardness of the generalized mover\'s problem, and explain why they motivate the sampling-based planners of Part III',
+  ]}
+  prerequisites={[
+    'The range ring, ρ, D(x) and ∇D, and the predictor–corrector curve tracer (Chapter 3)',
+    'Manifolds, tangent spaces, the differential and codimension (Chapter 5); A* on a graph (Chapter 6)',
+    'The distance function D, its nonsmoothness, and the local minima of a scan as distances to obstacles (Chapter 7)',
+    'The GVD, SS_ij, the preimage theorem, deformation retracts and the Morse definition box (Chapter 8)',
+  ]}
+>
+Chapter 8 ended on a cliff. In the plane, "equidistant to the two nearest obstacles" is a curve,
+and the curves form a roadmap. In $\mathbb{R}^3$ the same condition is one equation in three
+unknowns and cuts out a *sheet* — and a union of sheets is not a roadmap: the problem is only one
+dimension smaller than before. This chapter climbs down two ways, and they turn out to be one
+idea. The first way intersects more equations: equidistance to *three* obstacles in
+$\mathbb{R}^3$ is a curve again, the **generalized Voronoi graph**, provided the sheets cross
+cleanly — *transversally*. The curves need not connect, and patching them, the hierarchical GVG,
+is the real work. The second way sweeps a slice through the space and tracks the extrema of a
+function on it: **Canny's silhouette curves**, recursing wherever the trace breaks. Both obey
+Chapter 8's Morse vocabulary: critical points are exactly where a roadmap can change connectivity.
+
+The practical surprise is that a robot can build a roadmap *without a map*. The quantity $d_1 -
+d_2$ is something a range sensor measures directly, and so is its gradient; a control law that
+drives $\Gamma = \tfrac12 G^\top G$ to zero — a Lyapunov function, the book's first stability
+proof — lets Rusty trace the generalized Voronoi graph with no predictor, no corrector, and no
+equation of the curve. Exploration is then depth-first search over a graph the robot is still
+drawing.
+
+The price of exactness closes the chapter. Canny's roadmap is complete and its running time is
+singly exponential in the dimension; the generalized mover's problem is PSPACE-hard. Both facts are
+why Part III gives completeness up for speed. Everything on this page runs: the Apartment's graph
+is built from a simulated range ring and lands on all twenty-six meet points of Chapter 8's exact
+diagram, the sphere's silhouette is its equator to $10^{-6}$, and the chapter's one-step Lyapunov
+example prints $\dot\Gamma = -0.7918$ to four decimals in both the TypeScript port and the Rust.
+</Overview>
+
+## The problem: a map nobody drew
+
+Drop Rusty into the Apartment with no floor plan, only its range ring. Twenty seconds into the
+replay — under three minutes of simulated driving — a graph of the whole floor exists: every room,
+every doorway, the corridor, drawn by the robot driving along it.
+
+<Figure caption="Rusty (orange) in an Apartment it has never seen. It drives away from the nearest wall until two range readings tie, then follows the curve along which they stay tied, drawing it in blue; where a third reading ties it has found a meet point and records how many curves leave it. The purple rays are the two shortest returns of the ring. The replay runs the same code as the GVG Explorer below, at ten simulation steps per frame.">
+  <Deferred minHeight={460} label="the unknown-Apartment replay">
+    <UnknownApartmentHook />
+  </Deferred>
+</Figure>
+
+Nothing in that animation knows where a wall is. Each step the robot reads its 360 rays, finds the
+local minima of the range — the distances $d_i$ to the nearby obstacles and, from their bearings,
+the gradients $\nabla d_i$ — and commands one velocity. The blue curve is Chapter 8's generalized
+Voronoi diagram; the robot does not compute it, it *lives on it*, because staying on it is a
+condition the sensor can check: two of the ranges are equal. The run ends when every curve leaving
+every meet point has been driven: $27$ meet points, $33$ boundary points where a curve runs into a
+corner, $62$ edges and $103.4$ m of roadmap after $205.0$ m of driving.
+
+Two questions organize the rest of the chapter. *Why does this work* — what makes a velocity law
+converge onto a curve it cannot see? And *what happens in three dimensions*, where "two readings
+tie" is a surface and the robot would be wandering on sheets? The first answer is a Lyapunov
+function. The second is a story about transversality, disconnection, and slices — and it ends in a
+complexity bound that sends us to sampling.
+
+## Building intuition
+
+### Driving the graph
+
+<Deferred minHeight={720} label="the GVG Explorer">
+  <GvgExplorerWidget />
+</Deferred>
+
+Watch the explorer in phases. **Access**: from wherever it starts, Rusty backs away from the
+nearest return — gradient ascent of $D$, exactly Chapter 8's Lemma 5.2.1 — until a second return is
+as short as the first. **Trace**: now it holds the difference of the two shortest returns at zero
+while moving perpendicular to the chord between their two closest points. The $\Gamma$ sparkline
+under the floor plan is the square of that difference: it spikes when the robot is pushed off the
+curve (the parabolic edges near door jambs curve faster than the law can follow at a gentle gain)
+and decays back. **Home**: when a third return closes in, a meet point is near; the robot switches
+law and converges on the point where all three tie. **Branch**: each meet point in the plane has
+three departing edges. The hollow node's number counts those not yet driven. **Backtrack**: when a
+node has none left, the robot drives along edges it already knows to the nearest node that still
+has one — depth-first search over a graph whose nodes are being discovered by the search itself.
+**Terminate**: when no node has an undriven edge, the graph is complete.
+
+The faint blue curves underneath are Chapter 8's exact GVD of the same walls, traced from geometry.
+The sensor's graph lands on them: every meet point the robot homes onto is three-way equidistant by
+exact wall geometry to $10^{-6}$, and all twenty-six exact meet points are found within five
+centimetres. Two more — in the corridor at $(6.00, 4.30)$ and in the bedroom at $(7.85, 6.79)$ — are
+genuine meet points that Chapter 8's lattice-seeded tracer missed, which the same exact test
+confirms. The headline control is $\beta$, the stiffness with which the robot is pulled back onto
+the curve. The misconception this widget kills is the one in the chapter title: *you do not need a
+map to build a roadmap*. The roadmap is a sensor quantity.
+
+### From sheets to curves
+
+In the plane one equation, $d_i = d_j$, leaves one free direction: a curve. In $\mathbb{R}^3$ it
+leaves two: a sheet. Imagine the Apartment extruded upward into a box-shaped room with a floor and
+a ceiling. The set of points equally far from the floor and the ceiling is the horizontal plane
+halfway up; equally far from the floor and the west wall is a tilted plane; and so on. These sheets
+form Chapter 8's GVD in three dimensions, and it is a perfectly good *two*-dimensional retract — but
+a planner searching a two-dimensional set has not gained much.
+
+So intersect more. Points equidistant to the floor, the ceiling *and* the west wall lie on two
+sheets at once, and two planes in $\mathbb{R}^3$ meet in a line. That is a generalized Voronoi
+graph edge: think of a ball rolling along the room, touching the floor, the ceiling and one wall at
+once; its centre traces the edge. Where a fourth obstacle ties, four sheets meet at a point — a
+meet point. Two conditions must hold for the picture to be right: the sheets must actually cross
+rather than graze, and the resulting curves must connect. The first is transversality; the second,
+it turns out, fails.
+
+### A slice through a doughnut
+
+Canny's idea comes at the same problem from the other side. Sweep a plane through the
+configuration space and look at what the plane cuts out: a few closed curves. On each curve mark
+the extreme points in some fixed direction. As the plane moves those marks move, and their traces
+are curves — *silhouettes* — that a planner can follow. On a torus lying flat, a plane sweeping
+across it first touches the outer rim, cuts one oval, and then, as it reaches the hole, the oval
+pinches and splits into two. That moment is a *critical slice*: the silhouette breaks there, and
+the algorithm repairs it by solving the same problem one dimension down, inside the critical slice.
+The Silhouette Sweep in the mathematics section plays this out.
+
+## The mathematics
+
+<NotationTable
+  rows={[
+    { sym: 'S_{ijk},\\; SS_{ijk},\\; F_{ijk}', meaning: 'triple-equidistant set; its subset with pairwise distinct gradients; a GVG edge in R³ (eq. 5.3)' },
+    { sym: '\\mathrm{codim};\\; T_x M_1 + T_x M_2 = T_x M', meaning: 'codimension (the GVD has codimension 1, the GVG dimension 1); transversal intersection at x' },
+    { sym: 'F_{kl}\\big|_{F_{ij}},\\; F_{klp}\\big|_{F_{ij}};\\; \\pi_{T F_{ij}}', meaning: 'second-order GVG edge and meet point on the sheet F_ij (eq. 5.4); projection onto its tangent space' },
+    { sym: 'G(q),\\; DG,\\; (DG)^{\\dagger}', meaning: 'constraint vector, e.g. [d₁ − d₂, d₁ − d₃]ᵀ; its differential; the pseudoinverse DGᵀ(DG DGᵀ)⁻¹' },
+    { sym: '\\alpha,\\; \\beta,\\; v \\in \\mathrm{Null}(DG);\\; \\Gamma = \\tfrac12 G^{\\top} G', meaning: 'tracing gains and unit tangent (eq. 5.5); the Lyapunov function of the tracer' },
+    { sym: 'RF_{ij},\\; RF_{ijk},\\; J_{ijk}', meaning: 'rod two-equidistant face, rod-GVG edge, junction region (§5.4)' },
+    { sym: 'Q_\\lambda,\\; \\pi_1, \\pi_2, \\pi_{12};\\; \\Sigma(\\cdot),\\; D(f, h)', meaning: 'the slice at λ and coordinate projections; critical set; the stacked differential of Lemma 5.5.2' },
+    { sym: '\\tilde d_i(p; \\lambda),\\; \\tilde D', meaning: 'distance restricted to a slice and its minimum over obstacles (eqs. 5.7–5.8)' },
+    { sym: '\\partial D(q^\\star),\\; \\mathrm{Co},\\; Z(q^\\star)', meaning: 'generalized gradient, convex hull, index set of the closest obstacles' },
+    { sym: 'p,\\; w', meaning: 'number and maximum degree of the polynomials bounding the obstacles (Canny\'s bound)' },
+  ]}
+/>
+
+### The generalized Voronoi graph
+
+<KeyIdea title="Definition — generalized Voronoi graph (Choset §5.3.1, eq. 5.3)">
+In $\mathbb{R}^3$ let $S_{ijk} = \{q : (d_i - d_j)(q) = 0 \text{ and } (d_i - d_k)(q) = 0\}$ — the
+third equation $d_j = d_k$ follows — and $SS_{ijk} = SS_{ij} \cap SS_{ik} \cap SS_{jk}$, the
+points of $S_{ijk}$ where the three gradients $\nabla d_i, \nabla d_j, \nabla d_k$ are pairwise
+distinct. A **GVG edge** is $F_{ijk} = \{q \in SS_{ijk} : d_i(q) \le d_h(q)\ \forall h\}$ and the
+**GVG** is $\bigcup_i \bigcup_j \bigcup_k F_{ijk}$. In $\mathbb{R}^m$ the GVG is the set of points
+equidistant to $m$ closest obstacles with distinct gradients; it is one-dimensional, and its edges
+end at **meet points** (equidistant to $m + 1$) and **boundary points**. In the plane the GVG and
+the GVD coincide.
+</KeyIdea>
+
+Note what the definition does *not* say: $SS_{ijk}$ is not $SS_{ij} \cap SS_{ik}$. Transitivity of
+equality gives $d_j = d_k$ for free, but not $\nabla d_j \ne \nabla d_k$, and all three gradients
+must differ for the preimage theorem to apply. Choset's Table 5.2 compares the two structures in
+$\mathbb{R}^m$:
+
+| Structure | Dimension | Codimension | Equidistant to | Symbol |
+|---|---|---|---|---|
+| GVD | $m - 1$ | $1$ | $2$ | $F_{i_1 i_2}$ |
+| GVG | $1$ | $m - 1$ | $m$ | $F_{i_1 \dots i_m}$ |
+
+<KeyIdea title="Definition — transversality (Choset §5.3.1)">
+Submanifolds $M_1, M_2 \subset M$ intersect **transversally** if $T_x M_1 + T_x M_2 = T_x M$ at every
+point $x$ of the intersection. Then codimensions add: $\mathrm{codim}(T_x M_1 \cap T_x M_2) =
+\mathrm{codim}\, T_x M_1 + \mathrm{codim}\, T_x M_2$. Transversal intersections are *stable* — a small
+perturbation of either manifold leaves an intersection of the same dimension — and a
+non-transversal intersection becomes transversal after a generic small perturbation. The
+transversality assumption generalizes the general-position assumption of computational geometry.
+</KeyIdea>
+
+<Figure caption="The transversality trio (Choset Fig. 5.17). Two lines in the plane meet not at all, at a point, or along a line. Hover a panel to perturb the teal line: the parallel and overlapping pairs change the dimension of their intersection; the crossing pair still meets at a point. The number in each panel is the smallest singular value of the matrix whose rows are the two lines' normals — the transversality margin the GVG code computes for its sheets — and it is zero exactly in the unstable cases.">
+  <TransversalityTrio />
+</Figure>
+
+Two lines in the plane each have codimension one; meeting transversally, their intersection has
+codimension two — a point. Two planes in $\mathbb{R}^3$ meet transversally in a line, a plane and
+a line in a point; two lines in $\mathbb{R}^3$ can never meet transversally, because a generic
+nudge separates them. Two planes in $\mathbb{R}^4$, codimension two each, meet in a point. That
+arithmetic is the whole content of Table 5.2.
+
+<LinkedMath>
+$$
+G(q) = \begin{bmatrix} d_i - d_j \\ d_i - d_k \end{bmatrix}\!(q),
+\qquad
+DG(q) = \begin{bmatrix} (\nabla d_i - \nabla d_j)^{\top} \\ (\nabla d_i - \nabla d_k)^{\top} \end{bmatrix},
+\qquad
+\htmlClass{term-graph}{SS_{ijk}} \subset G^{-1}(0) \;\; \text{is a 1-manifold where } \operatorname{rank} DG = 2.
+$$
+</LinkedMath>
+
+<Derivation title="GVG edges in R³ are one-dimensional" result="SS_{ijk} = G^{-1}(0) \cap \{\text{distinct gradients}\},\quad \dim = 3 - 2 = 1">
+**Statement** (Choset §5.3.1). With $G = [d_i - d_j,\ d_i - d_k]^\top : \mathbb{R}^3 \to
+\mathbb{R}^2$, the set $SS_{ijk}$ is a one-dimensional manifold, provided the sheets $SS_{ij}$
+and $SS_{ik}$ intersect transversally.
+
+**Step 1 — each row is nonzero.** On $SS_{ij}$ the first row $\nabla d_i - \nabla d_j$ is nonzero by
+definition (Chapter 8: that is what the extra $S$ in $SS$ means); likewise the second row on
+$SS_{ik}$.
+
+**Step 2 — rank loss means proportional rows.** A $2 \times 3$ matrix with nonzero rows loses rank
+exactly when $\nabla(d_i - d_j) = \alpha\, \nabla(d_i - d_k)$ for some $\alpha \in \mathbb{R}$.
+
+**Step 3 — proportional rows are a non-transversal crossing.** The rows are the normals of the two
+sheets. Proportional normals mean equal tangent planes, $T_q SS_{ij} = T_q SS_{ik}$, whose sum is a
+plane and not $\mathbb{R}^3$: the sheets are tangent there. Under the transversality assumption this
+does not happen, and if it did, a small perturbation of either sheet would remove it.
+
+**Step 4 — the preimage theorem.** $DG$ has full rank two on $SS_{ijk}$, so $0$ is a regular value
+there and $SS_{ijk}$ is a submanifold of dimension $3 - 2 = 1$, with tangent $\ker DG$ — the cross
+product of the two rows. $\blacksquare$
+
+*The numbers.* The chapter's synthetic room — a $10 \times 8 \times 3$ box, Choset's Fig. 5.15 —
+is explored by the same tracer that runs in the Apartment, with exact plane distances in place of a
+scan. From one start it finds the four meet points $(1.5, 1.5, 1.5)$, $(8.5, 1.5, 1.5)$, $(8.5,
+6.5, 1.5)$, $(1.5, 6.5, 1.5)$ — each four-way equidistant to $10^{-9}$ and of degree four — and
+eight spokes into the corners, thirteen edges in all. Every edge sample is three-way equidistant to
+$10^{-6}$, and the smallest singular value of $DG$ along the edges is at least $0.87 =
+\sqrt{3 - \sqrt5}$, the value on the rectangle's long edges: comfortably transversal everywhere.
+</Derivation>
+
+### Why the GVG falls apart, and the hierarchical GVG
+
+In the room the GVG is connected. Put a box in the middle of the room — Choset's Fig. 5.19 — and it
+is not. The outer network is unchanged; but around the box there is a second component, a *halo*:
+the loop of points equally far from the floor, the ceiling and the box. No edge of the outer network
+touches it.
+
+<KeyIdea title="Definitions — GVG cycle, second-order edge, period, HGVG (Choset §5.3.2, eq. 5.4)">
+A **GVG cycle** is a GVG edge homeomorphic to $S^1$. A **second-order GVG edge** on the sheet $F_{ij}$
+is $F_{kl}\big|_{F_{ij}} = \{q : d_i = d_j \le d_k = d_l \le d_h\ \forall h \ne i, j, k, l,\
+\nabla d_i \ne \nabla d_j,\ \nabla d_k \ne \nabla d_l\}$: $\QO_i, \QO_j$ are the closest pair and
+$\QO_k, \QO_l$ the second-closest. Second-order edges end at **second-order meet points**
+$F_{klp}\big|_{F_{ij}}$. A **period** is a closed loop of second-order edges sharing a common
+second-closest obstacle. The **hierarchical GVG** (HGVG) is the union of the GVG and the
+second-order GVG.
+</KeyIdea>
+
+<Derivation title="The GVG is generically disconnected, and the HGVG repairs it" result="\dot c = -\pi_{T F_{ij}} \nabla d_k(c) \text{ from a period reaches } d_i = d_j = d_k">
+**Statement** (Choset §5.3.2). In a punctured three-dimensional free space there is in general no
+one-dimensional deformation retract [Choset ref. 63], so the GVG can be disconnected. The
+two-dimensional GVD is connected; GVG edges lie on the boundaries of its sheets, $F_{ijk} =
+\partial F_{ij} \cap \partial F_{ik} \cap \partial F_{jk}$; and a path that keeps $d_i = d_j$ while
+decreasing $d_k$ leads from a period to the missing cycle.
+
+**Step 1 — the hole.** In the box-in-a-room, the floor–ceiling sheet $F_{fc}$ is the plane halfway
+up, with a hole where the box is nearer than the floor and the ceiling. The boundary of that hole is
+the halo: the GVG edge $F_{fcb}$, a cycle.
+
+**Step 2 — the trouble is on sheet boundaries.** The GVD is a two-dimensional deformation retract of
+the free space and therefore connected. If the boundary of every sheet were connected, the GVG would
+be too. The floor–ceiling sheet's boundary is not: its outer rim belongs to the outer network, its
+hole to the halo.
+
+**Step 3 — draw a planar GVG on the sheet.** On $F_{fc}$, look at which obstacles are *second*
+closest and where two of them tie. Those are the second-order edges of eq. (5.4) — planar GVG edges
+drawn on the sheet — and they are one-manifolds by the preimage theorem, because of the gradient
+conditions on the second line of (5.4).
+
+**Step 4 — a period announces a cycle.** Around the box the second-order edges whose tied pair
+includes the box close into a loop: a period. Its common second-closest obstacle, the box, is the
+clue that a GVG component involving the box exists somewhere inside it.
+
+**Step 5 — descend to it.** Starting on the period, follow $\dot c = -\pi_{T_c F_{ij}} \nabla
+d_k(c)$: decrease the distance to the box while staying on the sheet. Since $d_k > d_i = d_j$ at the
+start, the path reaches $d_i = d_j = d_k$ — a GVG edge — unless the projected gradient vanishes
+first, in which case no such edge exists and the robot returns to the period. $\blacksquare$
+
+*Honesty.* Full HGVG connectivity is "tedious and challenging" in Choset's words and is proved in
+Choset and Burdick [Choset ref. 106]; this book cites it and does not prove it. The HGVG is
+*retract-like*, not a retract. *The numbers.* The check builds Fig. 5.19 with a unit box at the
+centre of the $10 \times 8 \times 3$ room. The outer network never touches the box. The explorer,
+run on the floor–ceiling sheet with the sheet's own nearest-obstacle query, traces nine
+second-order edges; the four whose tied pair includes the box close into a period around it;
+descending $-\pi \nabla d_{box}$ from the period reaches $d_{box} = d_{floor} = d_{ceiling} = 1.5$,
+and from there the halo traces as a closed GVG cycle $13.42$ m long, three-way equidistant to
+$10^{-6}$.
+</Derivation>
+
+### Tracing without a predictor: the Lyapunov law
+
+Chapter 3 traced curves with a discrete predictor–corrector: step along the tangent, then Newton
+back onto the curve. Choset §5.3.3 replaces both by one velocity,
+
+<LinkedMath>
+$$
+\htmlClass{term-robot}{\dot q} = \alpha\, \htmlClass{term-graph}{v} + \beta\, \htmlClass{term-path}{(DG)^{\dagger} G},
+\qquad
+v \in \mathrm{Null}(DG),\ \|v\| = 1,
+\qquad
+(DG)^{\dagger} = DG^{\top} \big(DG\, DG^{\top}\big)^{-1},
+$$
+</LinkedMath>
+
+with $G = d_1 - d_2$ in the plane and $G = [d_1 - d_2,\ d_1 - d_3]^\top$ in $\mathbb{R}^3$
+(eq. 5.5). On the GVG $G = 0$ and the law reduces to $\alpha v$: move along the tangent. Off it, the
+second term pulls back — Choset calls $\alpha$ and $\beta$ "spring constants": $\alpha$ is the speed
+along the edge, $\beta$ the stiffness of the return. Both terms need only $G$ and $DG$, and
+$DG$'s rows are differences of distance gradients — unit vectors pointing back along the shortest
+rays. That is the epigraph: the planner can compute $\nabla G$ solely from range sensor information.
+
+<KeyIdea title="Definition box — Lyapunov function (introduced here; Appendix E has the full treatment)">
+Let $\dot q = X(q)$ be a dynamical system and $A$ a closed invariant set — here, the GVG. A $C^1$
+function $\Gamma \ge 0$ defined on a neighborhood $U$ of $A$ is a **Lyapunov function** for $A$ if
+$\Gamma = 0$ exactly on $A$ and $\dot\Gamma = \nabla \Gamma \cdot X < 0$ on $U \setminus A$. Then
+$A$ is **asymptotically stable**: trajectories that start close enough to $A$ stay close and converge
+to it. Choset's gloss: think of a Lyapunov function as "an error function whose minimal value is
+zero". The guarantee is *local* — it holds only where $\dot\Gamma < 0$ has been shown.
+</KeyIdea>
+
+<Deferred minHeight={640} label="the Lyapunov Funnel">
+  <LyapunovFunnel />
+</Deferred>
+
+The funnel is the chapter's micro-world: two point obstacles at $(0, 0)$ and $(4, 0)$, whose GVG
+is the bisector $x = 2$, and Rusty at $(2.5, 1)$. The shading is $\Gamma = \tfrac12 G^2$ — a trough
+along the bisector — and the robot slides down its wall while advancing along its floor. The
+sparkline plots $\Gamma(t)$ on the curve $\Gamma_0 e^{2\beta t}$, which the derivation below says it
+must follow; slide $\beta$ above zero and the robot climbs out instead. The misconception this
+widget kills: *the controller needs the GVG's equation*. It needs $G$ and $DG$ at the point where
+the robot is, and nothing else.
+
+<Derivation title="The tracing law is Lyapunov-stable" result="\dot\Gamma = \beta\, G^{\top} G \le 0 \text{ for } \beta < 0,\ \text{strict off the GVG}">
+**Statement** (Choset §5.3.3, eq. 5.5). Along $\dot q = \alpha v + \beta (DG)^\dagger G$ with $v \in
+\mathrm{Null}(DG)$, the function $\Gamma = \tfrac12 G^\top G$ satisfies $\dot\Gamma = \beta\,
+G^\top G$. For $\beta < 0$ it is a Lyapunov function for the GVG wherever $DG\, DG^\top$ is
+invertible, so the robot converges onto the GVG.
+
+**Step 1 — the chain rule.** $\dot\Gamma = G^\top \dot G = G^\top DG\, \dot q$.
+
+**Step 2 — the tangent term vanishes.** $DG\, (\alpha v) = \alpha\, DG\, v = 0$, because $v$ lies in
+the null space of $DG$. Moving along the edge does not change $G$ to first order.
+
+**Step 3 — the pseudoinverse is a right inverse.** $DG\, (DG)^\dagger = DG\, DG^\top (DG\,
+DG^\top)^{-1} = I$, so $G^\top DG\, \beta (DG)^\dagger G = \beta\, G^\top G$.
+
+**Step 4 — the sign.** $\dot\Gamma = \beta\, G^\top G = 2 \beta\, \Gamma \le 0$ for $\beta < 0$,
+with equality only where $G = 0$, on the GVG. In fact $\Gamma(t) = \Gamma(0)\, e^{2\beta t}$ exactly
+along the continuous flow.
+
+**Step 5 — the neighborhood.** All of this needs $(DG\, DG^\top)^{-1}$. Near the interior of a GVG
+edge the rows of $DG$ are independent (Derivation 1), and they stay independent in a neighborhood
+[Choset ref. 108] — the neighborhood the definition box asks for. $\blacksquare$
+
+*Where it stops holding.* The argument needs two things: a fixed set of closest obstacles, so that
+$G$ is smooth, and an invertible $DG\, DG^\top$. Both fail at meet points. There a further obstacle
+ties, the identity of the "closest" ones switches, $G$ is not even continuous across the switch, and
+the Lyapunov argument has nothing to say; and wherever two gradients become parallel — a
+non-transversal point — $DG\, DG^\top$ is singular and the pseudoinverse does not exist. The tracer's
+guarantee is local, and at meet points a different law, homing, takes over.
+*The sign of $v$* is the planner's choice (Choset's footnote 4): the null space is a line and the
+tracer keeps the direction that continues the previous heading. *Sensing $\nabla G$*: fit a
+codimension-one plane through the $n$ closest points on the $n$ closest obstacles; the tangent is
+its normal. In the plane, $\nabla d_1 - \nabla d_2$ is perpendicular to the chord through the two
+closest points, and the tangent is along the chord's perpendicular — Chapter 8's Fig. 5.13.
+</Derivation>
+
+#### The chapter's micro-example, by hand
+
+Take the funnel's opening position: sites $c_1 = (0, 0)$, $c_2 = (4, 0)$, Rusty at $q = (2.5,
+1)$, gains $\alpha = 1$, $\beta = -1$.
+
+<LinkedMath>
+$$
+\begin{aligned}
+d_1 &= \sqrt{7.25} = 2.6926, \qquad d_2 = \sqrt{3.25} = 1.8028, \qquad G = d_1 - d_2 = 0.8898,\\
+DG &= \nabla d_1 - \nabla d_2 = (0.9285,\ 0.3714) - (-0.8321,\ 0.5547) = (1.7605,\ -0.1833),\\
+(DG)^{\dagger} &= DG^{\top} / (DG\, DG^{\top}) = (1.7605,\ -0.1833) / 3.1333 = (0.5619,\ -0.0585),\\
+\htmlClass{term-graph}{v} &= (0.1036,\ 0.9946) \quad (\perp DG,\ \text{oriented upward}),\\
+\htmlClass{term-path}{\beta (DG)^{\dagger} G} &= (-0.5000,\ 0.0521), \qquad
+\htmlClass{term-robot}{\dot q} = \alpha v + \beta (DG)^{\dagger} G = (-0.3964,\ 1.0467),\\
+\Gamma &= \tfrac12 G^2 = 0.3959, \qquad \dot\Gamma = \beta G^2 = -0.7918 < 0.
+\end{aligned}
+$$
+</LinkedMath>
+
+The velocity points left, toward $x = 2$, while advancing along the edge. Look at the correction's
+$x$-component: exactly $-0.5$, minus Rusty's offset from the bisector. For two point sites the
+Newton-like step $(DG)^\dagger G$, projected on the line through the sites, is *exactly* the signed
+distance to the bisector — not approximately, everywhere — and Exercise 1 asks why. The check pins
+all of these numbers to $10^{-4}$ and the identity to $10^{-12}$ at twenty seeded points around
+twenty seeded pairs of sites. Integrating the law with explicit Euler steps of $0.01$ s, $\Gamma$
+never increases, and at $t = 2$ it is within $3\,\%$ of $e^{-4}\Gamma_0$, the continuous-time
+prediction; after $200$ steps of $0.05$ s the robot is on $x = 2$ to $10^{-3}$, having driven up
+the edge. With $\beta = +1$, $\Gamma$ more than triples in $0.6$ s.
+
+### Meet-point homing
+
+<Derivation title="Homing is the same law with an empty null space" result="\dot q = \beta\, (DG)^{-1} G \;\to\; \text{the centre of the circle (sphere) through the closest points}">
+**Statement** (Choset §5.3.3). With $G = [d_1 - d_2,\ d_1 - d_3]^\top$ in the plane (three rows,
+$[d_1 - d_2, d_1 - d_3, d_1 - d_4]^\top$, in $\mathbb{R}^3$), $DG$ is square, $\mathrm{Null}(DG) =
+\{0\}$, and $\dot q = \beta (DG)^\dagger G = \beta\, DG^{-1} G$ converges to the meet point.
+
+**Step 1 — Derivation 3 with $v = 0$.** The computation of $\dot\Gamma$ never used $v$ except to
+kill it; with $v = 0$ it reads $\dot\Gamma = \beta\, G^\top G$ unchanged.
+
+**Step 2 — $G = 0$ only at the meet point.** Two independent equations in the plane, three in
+$\mathbb{R}^3$, cut out isolated points: the meet points, where $m + 1$ obstacles tie.
+
+**Step 3 — the geometry of the step.** Linearize each $d_i$ about $q$: the step $-DG^{-1} G$ goes to
+the point where the linearized distances agree, the centre of the circle through the three closest
+points (the sphere through four in $\mathbb{R}^3$). Choset: "The velocity vector points toward the
+center of this sphere." $\blacksquare$
+
+*Higher-order laws* come from swapping $G$: a second-order edge uses $G = [d_i - d_j,\ d_k -
+d_l]^\top$, a second-order meet point $[d_i - d_j,\ d_k - d_l,\ d_k - d_p]^\top$. *The numbers.* On
+Chapter 8's slab — pegs at $(0, 0)$ and $(4, 0)$, a wall along $y = 4$ — homing from three seeds
+converges to the meet point $(2, 1.5)$ with clearance $2.5$ to $10^{-9}$. For the wall the
+linearization is exact; for the pegs it is first order, so the aim sharpens with distance: from
+$0.57$ m away the homing velocity points within $45°$ of the meet point, from $0.06$ m away within
+$3°$.
+</Derivation>
+
+### Beyond a point robot: the rod
+
+<KeyIdea title="Definitions — rod, rod distance, R-edge, piecewise retract (Choset §5.4)">
+A **rod** is a line segment moving in the plane; its configuration space is $SE(2)$, three
+dimensional. Distance is measured *in the workspace*: $d_i(q) = \min_{r \in R(q),\ c \in \WO_i}
+d(r, c)$, which is what sensors on the rod measure. The **rod two-equidistant face** is $RF_{ij} =
+\{q \in SE(2) : d_i(q) = d_j(q),\ \nabla d_i(q) \ne \nabla d_j(q)\}$, and a **rod-GVG edge** is
+$RF_{ijk} = RF_{ij} \cap RF_{ik} \cap RF_{jk}$. An **R-edge** is the set of rod placements tangent to
+the planar point-GVG. The **rod-HGVG**, rod-GVG edges joined by R-edges, is a **piecewise retract**:
+a union of deformation retracts of *junction regions* $J_{ijk}$, linked.
+</KeyIdea>
+
+The rod-GVG edges play the role of meet points, but each is a whole curve of orientations: a small
+rod can spin a full turn while staying three-way equidistant, so $RF_{ijk}$ is homeomorphic to
+$S^1$ (Choset's footnote 5). The R-edges inherit adjacency from the plane. The chapter keeps the rod
+to a definition and a check — Exercise 6 builds it — and the check confirms the first claim: a
+$0.3$ m rod centred near the Workbench's widest meet point (clearance $1.539$) stays three-way
+equidistant through all $36$ orientations sampled, Newton in $(x, y)$ at fixed $\theta$ converging
+to $10^{-10}$, and $130$ R-edge placements are sampled from Chapter 8's point-GVD.
+
+### Silhouettes: Canny's roadmap
+
+<KeyIdea title="Definitions — slice, critical slice, silhouette (Choset §5.5, §5.5.1)">
+The **slice** at $\lambda$ is $Q_\lambda = \pi_1^{-1}(\lambda) = \{q : q_1 = \lambda\}$; sweeping
+$\lambda$ sweeps it through $\Q$. On each slice take the extrema of $\pi_2(q) = q_2$ restricted to
+the free-space boundary in the slice. The traces of those extrema as $\lambda$ varies are the
+**silhouette curves**. A **critical slice** is one where the number of silhouette curves changes;
+its $\lambda$ is a **critical value**, and the points where a silhouette curve is tangent to the
+critical slice are **critical points**. On each critical slice the algorithm recurses one dimension
+down, sweeping along $q_2$ and extremizing $q_3$, until no critical points remain or the slice is
+one-dimensional — and "the roadmap of a one-dimensional set is the set itself". The union of all
+silhouettes is **Canny's roadmap**.
+</KeyIdea>
+
+<KeyIdea title="Lemma 5.5.1 (Lagrange multiplier) and Lemma 5.5.2 (generalized, Canny)">
+If $S = f^{-1}(c) \subset \mathbb{R}^{n+1}$ with $\nabla f \ne 0$ on $S$, and $p$ is an extremum of a
+smooth $h$ on $S$, then $\nabla h(p) = \mu\, \nabla f(p)$ for some $\mu$. For vector-valued $f :
+\mathbb{R}^m \to \mathbb{R}^p$ and $h : \mathbb{R}^m \to \mathbb{R}^n$, $x$ is a critical point of
+$h|_{f^{-1}(\cdot)}$ if and only if the stacked differential $D(f, h)(x)$ — the rows of $Df$, then
+the rows of $Dh$ — loses rank. **Slice lemma:** $\Sigma(\pi_{12}|_S) = \bigcup_\lambda \Sigma\big(\pi_2|_{\pi_1^{-1}(\lambda)}\big)$ — the silhouette is the critical set of $\pi_{12}$.
+</KeyIdea>
+
+<Deferred minHeight={760} label="the Silhouette Sweep">
+  <SilhouetteSweep />
+</Deferred>
+
+The sweep makes the definitions concrete on three bodies. The **sphere** has one silhouette, its
+equator — traced as two curves, the maxima and the minima of $q_2$ — born at $\lambda = -r$ and dying
+at $\lambda = r$. The **torus** lying flat ($R = 2$, $r =
+0.7$) is Choset's Figs. 5.31–5.32: the slice is one closed curve for $|\lambda| > R - r$ and two for
+$|\lambda| < R - r$, so the critical values are $\pm 2.7$ (birth and death) and $\pm 1.3$ (pinch).
+Its silhouette is four arcs — the $q_2 > 0$ and $q_2 < 0$ halves of the outer and inner equators — and
+they are not connected to one another: four components. The linking curves on the two pinch slices join them
+into one. The **ellipsoid with a bent hole** is Fig. 5.25 simplified: an ellipsoid with semi-axes
+$3$, $2$ and $1.5$ and a hole of radius $0.7$ drilled along $q_3$ at $q_1 = 0.6$, its axis bending as $y =
+0.5 z^2$. The bend matters. With a straight hole the wall is a cylinder, $q_2$ is constant along its
+vertical lines, and the extrema are degenerate — not Morse. Bent, each slice's wall curve is a
+parabola with one nondegenerate extremum. Choset describes the silhouette as the ellipsoid's
+equator, the perimeter of the hole and the two curves along its side; the sweep finds it in six
+pieces, and the linking curves join them into one.
+That is the misconception the widget kills: *the silhouette is not the outline* of the body as you
+see it. It is the critical set of a projection, and it lives where the surface's tangent plane
+contains the $q_3$ direction.
+
+<LinkedMath>
+$$
+D(f, \pi_{12})(q) = \begin{bmatrix} 2q_1 & 2q_2 & 2q_3 \\ 1 & 0 & 0 \\ 0 & 1 & 0 \end{bmatrix},
+\qquad
+\det D(f, \pi_{12}) = 2 q_3 = 0 \iff \htmlClass{term-graph}{q_3 = 0}\ \text{(the equator)}.
+$$
+</LinkedMath>
+
+<Derivation title="Silhouettes are critical sets, and connectivity changes only at critical points" result="\Sigma(\pi_{12}|_S) = \textstyle\bigcup_\lambda \Sigma(\pi_2|_{Q_\lambda}),\quad \text{slice topology constant between adjacent critical values}">
+**Statement** (Choset §5.5.1; Lemmas 5.5.1–5.5.2, the slice lemma, Morse theory [Choset ref.
+315]). For $S = f^{-1}(0)$, a point $x \in S$ is on the silhouette iff $D(f, \pi_{12})(x)$ loses
+rank; the silhouette is the union over $\lambda$ of the critical points of $\pi_2$ on each slice; and
+between adjacent critical values the slice topology does not change, so the silhouette's
+connectivity can change only at critical slices.
+
+**Step 1 — Lagrange.** At an extremum $p$ of $h$ on $f^{-1}(c)$, every direction tangent to the
+surface leaves $h$ stationary to first order, so $\nabla h(p)$ has no tangential component:
+$\nabla h(p) = \mu \nabla f(p)$ (Lemma 5.5.1).
+
+**Step 2 — stacking.** For vector-valued constraints and functions the same condition says the rows
+of $Dh$ are combinations of the rows of $Df$ on the tangent space — rank loss of the stacked matrix
+$D(f, h)$ (Lemma 5.5.2). For two real-valued functions, rank loss of a two-row matrix *is*
+parallelism, and Lemma 5.5.1 is recovered.
+
+**Step 3 — the slice lemma.** Fixing $q_1 = \lambda$ and extremizing $q_2$ on the slice is the same
+as asking that the map $q \mapsto (q_1, q_2)$ restricted to $S$ fail to be a submersion: the rows
+$e_1$ (the slice) and $e_2$ (the extremized coordinate) together with $\nabla f$ lose rank. So
+$\Sigma(\pi_{12}|_S) = \bigcup_\lambda \Sigma(\pi_2|_{\pi_1^{-1}(\lambda)})$.
+
+**Step 4 — the sphere.** For $f = q_1^2 + q_2^2 + q_3^2 - r^2$ the stacked matrix above has
+determinant $2 q_3$, zero exactly on the equator. The check sweeps the unit sphere: every
+silhouette sample has $|q_3| < 10^{-6}$ and $|\det| = 2|q_3| < 10^{-6}$ there, while at $(0, 0.6,
+0.8)$, off the equator, $|\det| = 1.6$; the only critical slices are birth and death at $\lambda =
+\pm 1$.
+
+**Step 5 — critical slices are where the roadmap's tangent lies in the slice.** At a critical point
+of $\pi_1$ restricted to the roadmap, the roadmap's tangent is orthogonal to $\nabla \pi_1 = e_1$:
+it lies in the slice. There the number of silhouette pieces can change, and by Morse theory it can
+change *only* there: between adjacent critical values a diffeomorphism carries one slice's
+intersection with $S$ to the next (Choset Fig. 5.33). $\blacksquare$
+
+*The recursion.* Each critical slice is a lower-dimensional problem of the same kind: sweep it along
+$q_2$, extremize $q_3$, find its critical slices, recurse, down to dimension one. Accessibility and
+departability come from treating the slices through $\qstart$ and $\qgoal$ as critical, and
+connectivity is proved by induction on dimension [Choset refs. 90–92]. The demonstrator in this
+chapter recurses once: in a surface in $\mathbb{R}^3$ a critical slice meets the surface in curves,
+and those curves *are* their own roadmap — the linking curves. *The numbers.* The torus sweep finds
+its critical values at $-2.7, -1.3, 1.3, 2.7$ to $2 \times 10^{-3}$, with two slice curves and four
+extrema just inside $|\lambda| = 1.3$ and one curve with two extrema just outside, and four silhouette
+components that the linking curves join into one. The bent-hole ellipsoid has six critical values,
+at $-2.999$, $-0.122$, $-0.109$, $1.307$, $1.322$ and $2.992$. The slice-curve count changes exactly
+twice, where the hole punches through at $0.6 - 0.7$ and closes at $0.6 + 0.7$; the smoothing of
+the rim (the solid is a smooth maximum of the ellipsoid and the tube, so that Newton has a
+gradient) adds a "dimple" critical slice just outside each. Midway through the hole the slice is two
+curves with six extrema. Six silhouette components, one with the linking curves.
+</Derivation>
+
+Choset's ellipsoid has four critical points, $Cp_1$ to $Cp_4$, because his hole goes down and comes
+back up, punching through the slice twice on the way in and twice on the way out. Ours goes straight
+through, so it has two; the honest bookkeeping above is what the sweep finds, not what the figure
+shows.
+
+### The opportunistic path planner and the generalized gradient
+
+Canny's silhouettes extremize a coordinate. Canny and Lin's **opportunistic path planner** (OPP)
+extremizes something a robot cares about: the distance to the nearest obstacle, restricted to the
+slice.
+
+<KeyIdea title="Definitions — freeway, channel, bridge curve, interesting critical point (Choset §5.5.2, eqs. 5.7–5.8)">
+Write $q = [\lambda, p]^\top$ with $p$ the slice coordinates. The **slice-restricted distances** are
+$\tilde d_i(p; \lambda) = d_i(q)$ and $\tilde D(p; \lambda) = \min_i \tilde d_i(p; \lambda)$. A
+**freeway** is the trace of the local maxima of $\tilde D$ on the slices as $\lambda$ sweeps. A
+**channel** is a connected component of the free part of a slice. An **interesting critical point**
+is where channels join or split; a **bridge curve** joins neighbouring freeways near an interesting
+critical point, or leads away from a **bifurcation point** where a freeway ends in free space. The
+union of freeways and bridges is the OPP roadmap.
+</KeyIdea>
+
+<KeyIdea title="Definition — generalized gradient (Choset §5.5.2, after Clarke)">
+Where $D = \min_i d_i$ is not differentiable — at ties — its **generalized gradient** is the convex
+hull of the active gradients,
+$\partial D(q^\star) = \mathrm{Co}\{\nabla d_i(q^\star) : i \in Z(q^\star)\}$,
+with $Z(q^\star)$ the indices of the closest obstacles. If $0 \in \partial D(q^\star)$ then
+$q^\star$ is a local maximum; if $\partial D(q^\star) = \{0\}$, a local minimum. No second
+derivative is needed: first-order information characterizes the extremum.
+</KeyIdea>
+
+<Derivation title="OPP freeways are ties, characterized by the generalized gradient" result="q^\star \text{ a slice maximum of } \tilde D \iff 0 \in \mathrm{Co}\{\partial \tilde d_i / \partial p : i \in Z(q^\star)\}">
+**Statement** (Choset §5.5.2). Slice maxima of $\tilde D$ trace freeways joined by bridges near
+interesting critical points. Since $\tilde D$ is nonsmooth at ties, a maximum is characterized by
+$0 \in \partial \tilde D$; for convex obstacles every freeway point is a tie, hence a GVD point.
+
+**Step 1 — smooth between ties.** On a slice, $\tilde D = \tilde d_i$ wherever $\QO_i$ is the unique
+closest obstacle, and it inherits the smoothness of $\tilde d_i$ there (Choset Fig. 5.37).
+
+**Step 2 — at a tie, the convex hull.** Approaching a tie from either side gives the limiting
+gradients $\nabla \tilde d_i$ of the tied obstacles; the generalized gradient is their convex hull.
+
+**Step 3 — a maximum means no ascent direction.** At a slice maximum no direction along the slice
+increases every active $\tilde d_i$; by a separating-hyperplane argument that is exactly $0 \in
+\mathrm{Co}\{\nabla \tilde d_i\}$. On a one-dimensional slice: the active slopes bracket zero.
+
+**Step 4 — bridges at merges and splits.** Freeways are traces of maxima *within a channel*; where
+two channels merge or split — where the slice's normal $\nabla h$ is parallel to an obstacle's
+surface normal, the rank loss of $D(f, h)$ again (Choset Fig. 5.35) — maxima appear or vanish, and a
+bridge along the slice joins them. $\blacksquare$
+
+*Problem 12, for convex obstacles.* Each $d_i$ is convex when $\QO_i$ is (Choset Problem 19), so its
+restriction to a slice is convex and has no interior maximum; a maximum of $\tilde D$ must therefore
+be a tie of two or more obstacles with slopes of both signs — a point of the GVD, for *any* slice
+direction. Exercise 2 asks for the general proof. *The numbers.* In the chapter's tilted $10 \times 6$
+room with two convex obstacles, the sweep finds $181$ freeway points on $4$ freeways; at every one of
+them the active slopes bracket zero and two or more obstacles tie. The channel count changes at the
+interesting critical values $\lambda = 2.2, 4.6, 6.0, 8.2$, and the $10$ bridges there and at the
+bifurcation points connect the four freeways into one roadmap. The room's walls are tilted on
+purpose: a slice parallel to a wall makes $\tilde D$ constant along it, every point a degenerate
+maximum, and the Morse assumption fails — the tilt is the general-position fix.
+</Derivation>
+
+### What exactness costs
+
+Canny's algorithm was the first general roadmap algorithm, and with it came the complexity bound
+that made roadmap theory a theory: for a configuration space of dimension $n$ whose obstacles are
+bounded by $p$ polynomials of degree at most $w$, any path-planning query can be answered in
+
+<LinkedMath>
+$$
+p^{\,n} (\log p)\, w^{O(n^4)}
+$$
+</LinkedMath>
+
+time [Choset refs. 90–92]. That is *singly* exponential in $n$, where the earlier general method of
+Schwartz and Sharir — cylindrical algebraic decomposition — was doubly exponential. It is still
+enormous. Taking the constant in the $O(\cdot)$ as one, $p = 10$ and $w = 2$, the base-ten logarithm
+of the bound is $7.2$ for $n = 2$, $27.7$ for $n = 3$, $81.4$ for $n = 4$ and $396.5$ for $n = 6$ — a
+six-joint arm among quadric obstacles: more operations than there are atoms in the observable
+universe, by over three hundred orders of magnitude. And no algorithm can do fundamentally better in
+general: Reif showed that the generalized mover's problem — many independently moving parts — is
+PSPACE-hard (Appendix D). Exact, complete planning in high dimensions is not going to get cheap.
+
+Canny's roadmap is complete, and it has never been a practical planner; the opportunistic planner,
+which is, gives up nothing of the theory but runs on a sweep that still scales with the volume of
+the space. The honest reading is that this chapter's exact structures are tools for low
+dimensions and for *understanding*: the GVG for a mobile robot that must explore, silhouettes as the
+reason sweep-based coverage works (Chapter 10), critical points as the place where everything
+interesting happens. For a six-joint arm, Part III trades completeness for probabilistic
+completeness and the problem becomes tractable.
+
+## The algorithm
+
+<Algorithm
+  name="SENSOR-BASED GVG EXPLORATION  —  Choset §5.2.5, §5.3.3 steps (1)–(5)"
+  inputs="a nearest-obstacle query (a range ring's local minima of ρ with their bearings, or exact geometry); gains α > 0, β < 0; step dt; tolerances meetTol, boundaryTol, nodeTol"
+  outputs="a graph whose nodes are meet, access and boundary points and whose edges are the driven polylines"
+  complexity="one traversal per GVG edge plus the backtracking of a depth-first search; one scan and one 2×2 (3×3) solve per step"
+>
+1. **access**: drive along $\nabla d_1$ until $d_2 - d_1 <$ `accessTol`; in $\mathbb{R}^3$ continue along the two-equidistant sheet, increasing $d$, until a third reading ties. Record an access node with two departure slots
+2. **depart**: pick an unexplored slot at the current node, step `departStep` along it, start a new edge
+3. **trace**: apply the Lyapunov law $\dot q = \alpha v + \beta (DG)^\dagger G$ with $G$ from the $m$ nearest readings and $v$ signed to continue the heading; append $q$ to the edge; log $\Gamma$
+4. **detect**: if the $(m+1)$-th reading comes within `meetTol` of the first — "a sudden change in one of the two closest obstacles" — go to **home**; if $d_1 <$ `boundaryTol`, close the edge at a boundary point and go to **backtrack**
+5. **home**: Newton on $G = [d_1 - d_2, \ldots, d_1 - d_{m+1}]$, i.e. the homing law with $\beta\,dt = -1$, to `homeTol`; if a node lies within `nodeTol`, close the edge there and mark the arriving slot explored; otherwise create a meet node with the $m + 1$ departure directions (each omits one obstacle, signed so the omitted one falls behind) and close the edge there
+6. **branch**: if the node has an unexplored slot go to **depart**; else **backtrack**
+7. **backtrack**: breadth-first search over known edges to the nearest node with an unexplored slot; drive its polylines; go to **depart**. If no such node exists: **done**
+
+*Rejected ties.* A homing that converges somewhere other than a three-way (four-way) tie, or a tie
+whose gradients coincide, is reported as spurious and tracing resumes after a short cooldown — the
+"sudden change" detector is a heuristic, and with noisy ranges it fires early, late or twice.
+*Degenerate meet points.* When four or more readings tie to within the sensor's resolution — the
+Apartment's mirrored doorways produce meet points two millimetres apart — the node gets one departure
+per *adjacent* pair of closest points around the robot.
+</Algorithm>
+
+<Algorithm
+  name="LYAPUNOV TRACER AND MEET-POINT HOMING  —  Choset eq. (5.5), §5.3.3"
+  inputs="the m (edge) or m + 1 (homing) nearest readings d_i, ∇d_i; gains α, β; the previous heading"
+  outputs="the commanded velocity q̇ and Γ = ½GᵀG"
+  complexity="O(m³) for the (m−1)×(m−1) or m×m inverse"
+>
+1. $G \leftarrow [d_1 - d_2, \ldots, d_1 - d_k]$, $DG \leftarrow$ rows $(\nabla d_1 - \nabla d_j)^\top$
+2. $(DG)^\dagger \leftarrow DG^\top (DG\, DG^\top)^{-1}$; **if** $DG\, DG^\top$ is singular **return** "undefined" (a meet point for the edge law, or parallel gradients)
+3. **if** $k = m$: $v \leftarrow$ unit vector of $\mathrm{Null}(DG)$ — the perpendicular of the row in the plane, the cross product of the rows in $\mathbb{R}^3$ — negated if $v \cdot$ heading $< 0$; **else** $v \leftarrow 0$
+4. **return** $\dot q = \alpha v + \beta (DG)^\dagger G$ and $\Gamma = \tfrac12 G^\top G$; along it $\dot\Gamma = \beta G^\top G$
+</Algorithm>
+
+<Algorithm
+  name="HGVG PERIOD FOLLOWING  —  Choset §5.3.2"
+  inputs="a sheet F_ij (here the floor–ceiling plane z = h/2) with its nearest-obstacle query; a candidate obstacle k"
+  outputs="a period around k, a link to the GVG cycle, the cycle"
+  complexity="one planar exploration of the sheet; one projected-gradient descent"
+>
+1. explore the planar GVG of the sheet — the second-order edges $F_{kl}|_{F_{ij}}$ — with the exploration algorithm above, using the sheet's own query (obstacles $i, j$ left out)
+2. collect the second-order edges whose tied pair includes $k$; if they close into a loop around $k$ (angular gaps small), it is a **period**
+3. from a point of the period, follow $\dot c = -\pi_{T F_{ij}} \nabla d_k(c)$ until $d_k = d_i = d_j$ (stop: a GVG edge) or $\|\pi_{T F_{ij}} \nabla d_k\| \to 0$ (stop: no edge; return to the period)
+4. trace the GVG edge reached; if it closes on itself, it is the missing **GVG cycle**; link it to the period
+</Algorithm>
+
+<Algorithm
+  name="CANNY'S ROADMAP (demonstrator)  —  Choset §5.5.1"
+  inputs="an implicit surface S = f⁻¹(0) in R³ with ∇f; a box; the number of slices"
+  outputs="silhouette curves, critical slices with their before/after signatures, linking curves; component counts"
+  complexity="general algorithm: p^n (log p) w^{O(n⁴)}; the demonstrator: one 2-D curve trace per slice"
+>
+1. **for** $\lambda$ on a grid over the $q_1$-range: trace every closed curve of $f(\lambda, p) = 0$ with Chapter 3's predictor–corrector, seeded from a lattice and deduplicated
+2. on each curve, locate the extrema of $q_2$ as the sign changes of $\partial f / \partial q_3$ (the tangent $(-f_3, f_2)$ has no $q_2$-component there — Lemma 5.5.2), refined by bisection along the chord with Newton projection
+3. **signature** of a slice = (number of curves, number of extrema); between grid values with different signatures, bisect on $\lambda$ to locate the **critical value**
+4. chain the extrema across slices into **silhouette curves** (nearest neighbour, maxima with maxima)
+5. **recurse once**: on each critical slice the roadmap of the one-dimensional intersection is the intersection itself — take the slice curves just either side of $\lambda^\star$ as **linking curves**
+6. count connected components of the silhouette alone and with the linking curves
+</Algorithm>
+
+<Algorithm
+  name="OPPORTUNISTIC PATH PLANNER  —  Choset §5.5.2 (Canny and Lin)"
+  inputs="a planar polygonal world in general position; a slice direction"
+  outputs="freeways, interesting critical values, bridge curves"
+  complexity="one 1-D maximization per slice; bisection on the channel count"
+>
+1. **for** each slice $x = \lambda$: split the slice into **channels**; on each, find the strict local maxima of $\tilde D$ by sampling and golden-section refinement
+2. at each maximum record the active set $Z$ and the slopes $\partial \tilde d_i / \partial y$, and test $0 \in \mathrm{Co}\{\cdot\}$
+3. chain maxima across slices into **freeways**
+4. locate **interesting critical values** by bisection where the channel count changes; on the merged side, add the slice segment joining the freeway points of the splitting channels as a **bridge**
+5. where a freeway ends in free space (a bifurcation point), bridge it along its last slice to the nearest freeway point in the same channel
+6. access and departure: slice-constrained gradient ascent of $\tilde D$ from $\qstart$ and $\qgoal$
+</Algorithm>
+
+## Implementation in Rust
+
+This chapter adds the `gvg` submodule to Chapter 8's `roadmap` crate: `scan.rs` turns a range ring
+into the $k$ nearest obstacles, `tracer.rs` is eq. (5.5), `explore.rs` the five-step exploration,
+`hgvg.rs` the period following, `canny.rs` the silhouette demonstrator and `opp.rs` the freeways. The
+tracer is written once for any number of readings; const generics carry the sizes, and the
+pseudoinverse returns `None` exactly where the Lyapunov argument stops holding.
+
+```rust title="crates/roadmap/src/gvg/tracer.rs" {16-20,31-38}
+use nalgebra::{SMatrix, SVector, Vector2};
+
+/// The k nearest hits in a range ring: distance and unit direction away from each (C §4.3.1).
+/// `obstacle_id` is `None` from a scan — the sensor cannot name what it sees, and the law never asks.
+pub struct Nearest<const K: usize> {
+    pub d: [f64; K],
+    pub grad: [Vector2<f64>; K],
+    pub obstacle_id: [Option<usize>; K],
+}
+
+pub struct Twist { pub v: Vector2<f64> }
+pub struct GvgTracer { pub alpha: f64, pub beta: f64 }
+
+/// DG† = DGᵀ (DG DGᵀ)⁻¹ for a full-row-rank differential. `None` where the Gram matrix is singular:
+/// two sheet normals parallel (a non-transversal crossing) or, for the edge law, a meet point —
+/// exactly where Lyapunov's neighborhood ends and homing has to take over.
+pub fn pseudo_inverse<const R: usize, const C: usize>(dg: &SMatrix<f64, R, C>) -> Option<SMatrix<f64, C, R>> {
+    let gram = dg * dg.transpose();
+    gram.try_inverse().map(|inv| dg.transpose() * inv)
+}
+
+/// G and DG from the first R + 1 readings: rows d₁ − d_j and ∇d₁ − ∇d_j.
+fn constraint<const K: usize, const R: usize>(n: &Nearest<K>) -> (SVector<f64, R>, SMatrix<f64, R, 2>) {
+    let g = SVector::<f64, R>::from_fn(|j, _| n.d[0] - n.d[j + 1]);
+    let dg = SMatrix::<f64, R, 2>::from_fn(|j, c| n.grad[0][c] - n.grad[j + 1][c]);
+    (g, dg)
+}
+
+impl GvgTracer {
+    /// Edge tracing, C eq. (5.5): q̇ = α v + β (DG)† G with v ∈ Null(DG), ‖v‖ = 1, signed to keep
+    /// going the way we were going (Choset's footnote 4). Also returns Γ = ½ GᵀG; Γ̇ = β GᵀG.
+    pub fn trace_step(&self, n: &Nearest<2>, heading: Vector2<f64>) -> Option<(Twist, f64)> {
+        let (g, dg) = constraint::<2, 1>(n);
+        let dg_pinv = pseudo_inverse(&dg)?;
+        let row = dg.row(0);
+        let mut v = Vector2::new(-row[1], row[0]).normalize();
+        if v.dot(&heading) < 0.0 { v = -v; }
+        let correction = self.beta * (dg_pinv * g);
+        Some((Twist { v: self.alpha * v + correction }, 0.5 * g.norm_squared()))
+    }
+
+    /// Meet-point homing: DG is square, Null(DG) = {0}, so the law is a Newton-like step
+    /// β DG⁻¹ G toward the centre of the circle through the three closest points.
+    pub fn home_step(&self, n: &Nearest<3>) -> Option<(Twist, f64)> {
+        let (g, dg) = constraint::<3, 2>(n);
+        let dg_pinv = pseudo_inverse(&dg)?;
+        Some((Twist { v: self.beta * (dg_pinv * g) }, 0.5 * g.norm_squared()))
+    }
+
+    /// Access (Ch. 8, Lemma 5.2.1): climb ∇d₁ until the second reading ties. Unit speed, so the
+    /// ascent takes d₂ − d₁ seconds at most from any start in a bounded room.
+    pub fn access_step(&self, n: &Nearest<2>) -> Twist {
+        Twist { v: self.alpha * n.grad[0] }
+    }
+}
+```
+
+The tracer returns `Option` rather than a bare `(Twist, f64)` so that the one place the derivation
+fails — a singular $DG\, DG^\top$ — is a value the caller must handle, not a
+`NaN` that drives the robot into a wall. The explorer is a state machine around the tracer, and its
+graph is `petgraph`'s.
+
+```rust title="crates/roadmap/src/gvg/explore.rs" {28-40}
+use petgraph::graph::{NodeIndex, UnGraph};
+
+pub struct MeetNode { pub q: Vector2<f64>, pub clearance: f64, pub departures: Vec<Vector2<f64>>, pub explored: Vec<bool> }
+pub struct Edge { pub polyline: Vec<Vector2<f64>>, pub length: f64 }
+/// The incrementally built topological map; `frontier` lists (node, slot) pairs not yet driven.
+pub struct GvgGraph { pub graph: UnGraph<MeetNode, Edge>, pub frontier: Vec<(NodeIndex, usize)> }
+pub enum Event { OnEdge, MeetPoint(NodeIndex), BoundaryPoint, Done }
+enum Phase { Access, Depart, Trace, Home, Backtrack(Vec<Vector2<f64>>), Done }
+
+pub struct Explorer<'r> {
+    pub robot: &'r mut sim::Rusty,
+    pub tracer: GvgTracer,
+    pub graph: GvgGraph,
+    phase: Phase, heading: Vector2<f64>, edge: Vec<Vector2<f64>>, from: NodeIndex,
+    pub gamma_log: Vec<f64>,
+}
+
+impl Explorer<'_> {
+    /// One tick: scan; access / trace / home by phase; DFS to the next unexplored slot.
+    pub fn tick(&mut self, dt: f64) -> Event {
+        let near: Nearest<3> = scan::nearest_from_scan(&self.robot.scan());
+        match &self.phase {
+            Phase::Access => {
+                if near.d[1] - near.d[0] > ACCESS_TOL { self.drive(self.tracer.access_step(&near.first2()), dt); return Event::OnEdge; }
+                self.from = self.add_node(self.robot.position(), access_departures(&near));
+                self.phase = Phase::Depart;
+                Event::OnEdge
+            }
+            Phase::Trace => {
+                // "A sudden change in one of the two closest obstacles": a third reading closes in.
+                if near.d[2] - near.d[0] < MEET_TOL { self.phase = Phase::Home; return Event::OnEdge; }
+                if near.d[0] < BOUNDARY_TOL { return self.close_at_boundary(); }
+                let Some((tw, gamma)) = self.tracer.trace_step(&near.first2(), self.heading) else {
+                    self.phase = Phase::Home; // DG DGᵀ singular: we are at (or past) a meet point
+                    return Event::OnEdge;
+                };
+                self.gamma_log.push(gamma);
+                self.drive(tw, dt);
+                self.edge.push(self.robot.position());
+                Event::OnEdge
+            }
+            Phase::Home => match newton_home(&mut *self.robot, &self.tracer, HOME_TOL) {
+                Some(q) => {
+                    let node = self.node_near(q, NODE_TOL).unwrap_or_else(|| self.add_meet_node(q, &near));
+                    self.close_edge(node);
+                    self.next_from(node);
+                    Event::MeetPoint(node)
+                }
+                None => { self.phase = Phase::Trace; Event::OnEdge } // spurious tie: carry on
+            },
+            Phase::Depart => self.depart(dt),
+            Phase::Backtrack(_) => self.follow_backtrack(dt),
+            Phase::Done => Event::Done,
+        }
+    }
+
+    /// DFS bookkeeping: an unexplored slot here, or BFS over known edges to the nearest node with one.
+    fn next_from(&mut self, n: NodeIndex) {
+        self.phase = if self.graph.graph[n].explored.iter().any(|e| !e) { Phase::Depart }
+            else { match self.path_to_frontier(n) { Some(p) => Phase::Backtrack(p), None => Phase::Done } };
+    }
+}
+```
+
+Canny's demonstrator works on implicit surfaces. Each slice is a planar curve-tracing problem, so
+Chapter 3's tracer does the work; the extrema are the sign changes of one partial derivative.
+
+```rust title="crates/roadmap/src/gvg/canny.rs" {20-27}
+use nalgebra::{SVector, Vector2};
+
+pub struct Silhouette {
+    pub curves: Vec<Vec<SVector<f64, 3>>>,
+    pub critical_points: Vec<SVector<f64, 3>>,
+    pub linking: Vec<Vec<SVector<f64, 3>>>,
+    pub depth: usize,
+}
+struct Slice { lambda: f64, pieces: Vec<Vec<Vector2<f64>>>, extrema: Vec<(SVector<f64, 3>, bool)> }
+
+/// Sweep π₁ slices; π₂-extrema where D(f, π₁₂) = [∇f; e₁; e₂] loses rank, i.e. ∂f/∂q₃ = 0
+/// (Lemma 5.5.2); recurse once on the critical slices, where the (curves, extrema) count changes.
+pub fn canny(f: &dyn Fn(SVector<f64, 3>) -> f64, grad_f: &dyn Fn(SVector<f64, 3>) -> SVector<f64, 3>,
+             bounds: [(f64, f64); 3], n_slices: usize) -> Silhouette {
+    let lambdas: Vec<f64> = (0..=n_slices).map(|k| bounds[0].0 + (bounds[0].1 - bounds[0].0) * k as f64 / n_slices as f64).collect();
+    let slices: Vec<Slice> = lambdas.iter().map(|&l| slice(f, grad_f, l, bounds)).collect();
+    let mut sil = Silhouette { curves: chain_extrema(&slices), critical_points: vec![], linking: vec![], depth: 1 };
+    for w in slices.windows(2) {
+        if signature(&w[0]) == signature(&w[1]) { continue; }
+        // Bisect on λ for the critical value; the slice there is pinched, so the linking curves
+        // are taken just either side — the recursion's roadmap of a one-dimensional set is the set.
+        let l_star = bisect_signature(f, grad_f, bounds, w[0].lambda, w[1].lambda, 8);
+        let eps = 0.5 * (w[1].lambda - w[0].lambda);
+        for l in [l_star - eps, l_star + eps] {
+            sil.linking.extend(slice(f, grad_f, l, bounds).pieces.into_iter().map(|c| lift(l, &c)));
+        }
+        sil.critical_points.push(changed_extremum(&w[0], &w[1], l_star));
+        sil.depth = 2;
+    }
+    sil
+}
+
+/// The curves of f(λ, ·) = 0 by Chapter 3's predictor–corrector, and the sign changes of ∂f/∂q₃
+/// along each: there the tangent (−f₃, f₂) has no q₂-component, so q₂ is extremal.
+fn slice(f: &dyn Fn(SVector<f64, 3>) -> f64, grad_f: &dyn Fn(SVector<f64, 3>) -> SVector<f64, 3>,
+         lambda: f64, bounds: [(f64, f64); 3]) -> Slice {
+    let g = |p: Vector2<f64>| f(SVector::<f64, 3>::new(lambda, p.x, p.y));
+    let dg = |p: Vector2<f64>| { let n = grad_f(SVector::<f64, 3>::new(lambda, p.x, p.y)); Vector2::new(n[1], n[2]) };
+    let pieces = trace_all_closed(&g, &dg, bounds[1], bounds[2], bugs::TraceParams { step: 0.03, ..Default::default() });
+    let f3 = |p: &Vector2<f64>| grad_f(SVector::<f64, 3>::new(lambda, p.x, p.y))[2];
+    let extrema = pieces.iter().flat_map(|c| sign_changes(c, f3).map(|(p, is_max)| (lift_point(lambda, p), is_max))).collect();
+    Slice { lambda, pieces, extrema }
+}
+```
+
+The opportunistic planner's one new idea fits in a function: a slice maximum of a nonsmooth
+minimum is a convex-hull test on first derivatives.
+
+```rust title="crates/roadmap/src/gvg/opp.rs"
+/// 0 ∈ ∂D̃(q*) = Co{∂d̃_i/∂y : i ∈ Z(q*)} on a vertical slice: the active slopes bracket zero.
+/// For one active obstacle this is the smooth condition ∂d̃/∂y = 0; at a tie it is a kink maximum.
+pub fn generalized_gradient_has_zero(slopes: &[f64], tol: f64) -> bool {
+    let lo = slopes.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = slopes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    lo <= tol && hi >= -tol
+}
+
+pub struct FreewayPoint { pub q: Point2<f64>, pub d: f64, pub active: Vec<usize>, pub slopes: Vec<f64>, pub channel: usize }
+
+/// Strict local maxima of D̃(·; λ) on each channel of the slice x = λ, golden-section refined.
+pub fn slice_maxima(world: &OppWorld, lambda: f64, samples: usize) -> Vec<FreewayPoint> {
+    channels(world, lambda).iter().enumerate().flat_map(|(ci, &(lo, hi))| {
+        let d = |y: f64| world.nearest(Point2::new(lambda, y)).d;
+        strict_maxima(d, lo, hi, samples).into_iter().map(move |y| world.freeway_point(lambda, y, ci))
+    }).collect()
+}
+```
+
+### The worked example, and its printed output
+
+```rust title="crates/roadmap/examples/lyapunov_step.rs"
+use nalgebra::Vector2;
+use roadmap::gvg::{GvgTracer, Nearest};
+
+/// Two point sites; Nearest in *site* order (site 1 at the origin), as the text labels them.
+fn nearest(q: Vector2<f64>, sites: &[Vector2<f64>; 2]) -> Nearest<2> {
+    let d = sites.map(|c| (q - c).norm());
+    let grad = sites.map(|c| (q - c).normalize());
+    Nearest { d, grad, obstacle_id: [Some(0), Some(1)] }
+}
+
+fn main() {
+    let sites = [Vector2::new(0.0, 0.0), Vector2::new(4.0, 0.0)];
+    let tracer = GvgTracer { alpha: 1.0, beta: -1.0 };
+    let q = Vector2::new(2.5, 1.0);
+    let n = nearest(q, &sites);
+    let g = n.d[0] - n.d[1];
+    let dg = n.grad[0] - n.grad[1];
+    let dg_pinv = dg / dg.norm_squared();
+    let v = Vector2::new(-dg.y, dg.x).normalize();
+    let (tw, gamma) = tracer.trace_step(&n, Vector2::new(0.0, 1.0)).unwrap();
+    println!("G = {g:.4}  DG = ({:.4}, {:.4})  DG+ = ({:.4}, {:.4})  v = ({:.4}, {:.4})", dg.x, dg.y, dg_pinv.x, dg_pinv.y, v.x, v.y);
+    println!("correction = ({:.4}, {:.4})  qdot = ({:.4}, {:.4})  Gamma = {gamma:.4}  dGamma = {:.4}",
+             tracer.beta * dg_pinv.x * g, tracer.beta * dg_pinv.y * g, tw.v.x, tw.v.y, tracer.beta * g * g);
+
+    // The Lyapunov box: integrate, watch Γ. The edge x = 2 is vertical, so "keep going up" is the
+    // heading for the whole run.
+    let heading = Vector2::new(0.0, 1.0);
+    let (mut q, mut prev) = (q, f64::INFINITY);
+    for _ in 0..200 {
+        let (tw, gamma) = tracer.trace_step(&nearest(q, &sites), heading).unwrap();
+        assert!(gamma <= prev + 1e-12, "Γ must not increase");
+        prev = gamma;
+        q += 0.05 * tw.v;
+    }
+    println!("200 steps of dt = 0.05: Gamma monotone, |x - 2| < 1e-3: {}", (q.x - 2.0).abs() < 1e-3);
+}
+```
+
+```text title="cargo run -p roadmap --example lyapunov_step"
+G = 0.8898  DG = (1.7605, -0.1833)  DG+ = (0.5619, -0.0585)  v = (0.1036, 0.9946)
+correction = (-0.5000, 0.0521)  qdot = (-0.3964, 1.0467)  Gamma = 0.3959  dGamma = -0.7918
+200 steps of dt = 0.05: Gamma monotone, |x - 2| < 1e-3: true
+```
+
+`lyapunov_step_matches_text` pins every printed number to $10^{-4}$, the correction's $x$-component
+to $-0.5$ to $10^{-12}$, and the monotone descent of $\Gamma$. Two hundred steps of $0.01$ s would not
+land the robot: at $t = 2$ s the offset has shrunk only by $e^{-2}$, to about $0.07$. So the test
+integrates to $t = 10$ s, where $|x - 2| < 10^{-3}$ holds, and checks the $t = 2$ s value of $\Gamma$
+against $e^{-4}\Gamma_0$ instead. The other two examples print the chapter's
+larger numbers:
+
+```text title="cargo run -p roadmap --example explore_apartment  ·  --example ellipsoid_silhouette"
+explore: done after 5779 ticks, 205.0 m driven
+         27 meet points, 33 boundary points, 62 edges, 103.4 m of roadmap
+         every homed meet point three-way equidistant by exact geometry to < 1e-6
+exact GVD (Chapter 8): 26 meet points, 26 matched within 0.05 m, 2 extra: (6.00, 4.30) (7.85, 6.79)
+fifty seeded queries, 29 pass the filter, 29 answered
+         mean length: GVG 10.88 m   shortest (disc, r = 0.22) 6.68 m   ratio 1.62 mean, 2.46 worst
+         mean min clearance: GVG 0.48 m   shortest 0.22 m
+
+torus R = 2, r = 0.7: critical lambda -2.700 -1.300 1.300 2.700; silhouette components 4 -> 1
+ellipsoid with a bent hole: critical lambda (curves/extrema before -> after)
+  -2.999   0/0  -> 1/2
+  -0.122   1/2  -> 1/10
+  -0.109   1/10 -> 2/6
+   1.307   2/6  -> 1/6
+   1.322   1/6  -> 1/2
+   2.992   1/2  -> 0/0
+  silhouette components 6 -> 1 with linking curves
+sphere r = 1: silhouette |q3| < 1e-6 at every sample; critical lambda -1.000 1.000
+```
+
+`explored_graph_matches_exact_gvd` asserts that every exact meet point is matched within five
+centimetres and every homed meet point is a three-way tie by exact geometry; `sphere_silhouette_is_equator`
+asserts $|q_3| < 10^{-6}$ (Derivation 5, step 4); `torus_pinches_at_r_minus_r` and
+`ellipsoid_critical_slices` pin the values above. The TypeScript port in `web/lib/roadmap/` runs the
+same twelve checks, and every widget on this page is that port.
+
+<Callout type="info">
+Three things the port had to learn from the range ring. First, a ring of 360 rays reports the local
+minima of $\rho$ *on its rays*, not on the obstacles: the closest point can sit half a degree away,
+and the homing then converges to a point a centimetre off the true meet point. The port refines each
+minimum's bearing by golden-section search between its neighbouring rays — Chapter 3's "more rays
+where they matter" — and the meet points then land on the exact ones to $10^{-6}$. Second, one wall
+seen across the $0/2\pi$ seam, or a flat minimum split in two, produces two readings with the same
+gradient: $DG$ is singular and the meet detector fires on nothing. Readings within $0.05$ rad and
+$10^{-6}$ m of each other are merged. Third, transversality says exactly degenerate meet points have
+probability zero; the Apartment's mirrored doorways produce two meet points two millimetres apart
+all the same, and the robot cannot tell them apart. Such a node gets one departure per adjacent pair
+of closest points, which is what the geometry would give if the two points were merged.
+</Callout>
+
+## Putting it together: the floor plan Rusty drew
+
+The integration lab uses the explored graph as what Chapter 8 said a roadmap is for. Rusty explores
+the Apartment from room A with the ideal ring, and the graph it draws — $27$ meet points, $62$
+edges — is turned into a roadmap: every polyline sample a node, consecutive samples joined, meet
+points shared. Getting on is Chapter 8's gradient ascent, the same access the explorer used; the
+landing point is on the GVD, and the nearest explored sample is never more than $2$ cm away, which
+is the honest measure of how completely the sensor-built graph covers the exact diagram. Riding is
+Chapter 6's A\*. Getting off is the goal's ascent, reversed.
+
+Chapter 8's fifty seeded start–goal pairs — the same generator, the same filter, twenty-nine pairs
+surviving it — are answered on the explored GVG and on the visibility graph for a $0.22$ m disc.
+All twenty-nine are answered; the explored graph is one connected component. The GVG paths average
+$10.88$ m against $6.68$ m for the shortest paths: $1.62$ times as long on average and $2.46$ times
+in the worst case — the price of riding the middle of every room and doorway. They average $0.48$ m of minimum clearance against $0.22$ m — the shortest path grazes the
+inflated walls, which is what shortest means. The sensor-built graph's mean path length is within two
+percent of Chapter 8's grid-GVD paths for the same queries ($10.70$ m): the robot's map is as good a
+highway as the geometer's.
+
+The sister book's frontier exploration (*Probabilistic Robotics via Rust*,
+[Chapter 24](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch24-exploration))
+is the probabilistic cousin of this lab: it drives toward the boundary between known and unknown
+cells of an occupancy grid, while the GVG explorer drives along a topological skeleton and needs no
+grid at all — but it trusts its range readings, and the GVG Explorer's noise slider shows what that
+trust costs (Exercise 4). What a range ring actually returns, and how noisy, is the sister book's
+[Chapter 10](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch10-sensor-models).
+Maps that keep a Euclidean distance field (the sister book's
+[Chapter 19](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch19-map-representations)
+surveys map representations) yield the GVD as the field's ridge, exactly as Chapter 8's brushfire
+did; and Choset and Nagatani's topological SLAM, which localizes a robot by where it is *on* the
+explored GVG, is the direct descendant of this chapter's explorer.
+
+Three pointers close Part II's roadmaps. [Chapter 10](/chapters/ch10-cell-decompositions) takes the
+critical points of this chapter literally: the boustrophedon decomposition's cell boundaries are the
+slices through Canny's critical points, found by a robot with Lemma 5.5.2 in its sensor loop. The
+complexity bound sends us to [Chapter 11](/chapters/ch11-prm), where a roadmap is built by throwing
+darts and the contract of Definition 5.0.2 is restated with probability one. And the capstone,
+[Chapter 23](/chapters/ch23-capstone), explores an unknown Apartment again.
+
+## Exercises
+
+<Exercises>
+  <Exercise level="F" difficulty={2} title="The Newton step lands on the bisector — exactly, and only for points">
+    For two point sites $c_1, c_2$ and $G = d_1 - d_2$, prove that the component of $(DG)^\dagger G$
+    along $\hat u = (c_2 - c_1)/\|c_2 - c_1\|$ equals the signed distance from $q$ to the bisector,
+    for every $q$ off the line through the sites (Choset's micro-example has it equal to $0.5$). Then
+    repeat the computation numerically for a point site and a segment site (a parabolic edge) and
+    explain what you find: is the step still exact, and if not, what is it?
+    <CheckAnswer
+      id="ch09.e1"
+      prompt="With sites (0, 0) and (4, 0), Rusty at (3, −1) and β = −1, what is the x-component of the correction β(DG)†G?"
+      answer={-1}
+      tolerance={0.01}
+    >
+    The signed distance from $(3, -1)$ to the bisector $x = 2$ is $1$, so the correction's component
+    along the site axis is $\beta \cdot 1 = -1$. The proof: put $x = q - c_1$ and $y = q - c_2$, so that
+    $x - y = L \hat u$ with $L = \|c_2 - c_1\|$. Then $d_1^2 - d_2^2 = (x - y)\cdot(x + y)$ is $2L$ times
+    the signed distance $s$, and $G = 2 L s / (d_1 + d_2)$. With $DG = x/d_1 - y/d_2$, the product
+    $L\, \hat u \cdot DG = (x - y)\cdot(x/d_1 - y/d_2)$ simplifies to $(d_1 + d_2)(1 - x \cdot y / (d_1 d_2))$,
+    while $\|DG\|^2 = 2(1 - x \cdot y/(d_1 d_2))$; so $L\, \hat u \cdot DG = (d_1 + d_2)\|DG\|^2 / 2$. Since
+    $(DG)^\dagger G = DG\, G / \|DG\|^2$, its component along $\hat u$ is $\tfrac{d_1 + d_2}{2L} \cdot \tfrac{2 L s}{d_1 + d_2} = s$.
+    For a point and a line the zero set is a parabola, and the Newton step misses it by an amount of
+    second order in the offset: exact only on the edge itself. The check confirms the identity to
+    $10^{-12}$ at twenty seeded points.
+    </CheckAnswer>
+    <Hints>
+      <>Write G as (d₁² − d₂²)/(d₁ + d₂). What kind of function of q is d₁² − d₂²?</>
+      <>The numerator is affine and vanishes on the bisector, so it is 2L times the signed distance s.</>
+      <>For a parabolic edge the zero set of G curves away from the Newton line; expand to second order in the offset.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="F" difficulty={3} title="OPP is a subset of the GVG, for any slice direction">
+    Prove Choset's Problem 12: for any choice of slice direction, every point of the opportunistic
+    path planner's roadmap lies on the GVG. Use the generalized-gradient characterization of slice
+    maxima, and say where convexity of the obstacles enters (Problem 19: $d_i$ is convex when
+    $\QO_i$ is). Then explain why bridge curves need not lie on the GVG, and whether that matters for
+    the claim.
+    <Hints>
+      <>Restrict d_i to a line: a convex function on a line has no strict interior maximum.</>
+      <>So a strict slice maximum of D̃ = min d̃_i cannot be a smooth point of a single d̃_i: at least two obstacles are active there.</>
+      <>At a tie with 0 ∈ Co of the slopes, two of the active slopes have opposite signs, so the gradients differ: SS_ij. Now check the "closest" condition of F_ij.</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="C" difficulty={1} title="Predict the landing time, then check">
+    <Predict
+      id="ch09.e3"
+      question="In the Lyapunov Funnel with the micro-example's sites, set β = −3 and put Rusty at (3, 0) heading up. With explicit Euler steps of dt = 0.05 s, how many steps until |x − 2| < 0.01? Predict from Γ̇ = βG² before you run anything."
+      options={[
+        { label: 'About 15', because: 'That is half the time needed: the offset decays like exp(βt) and must shrink a hundredfold, so t ≈ ln 100 / 3 ≈ 1.5 s — about 31 steps of 0.05 s in continuous time, not 15.' },
+        { label: '29 without the tangent term, 30 with α = 1', correct: true, because: 'At (3, 0) the tangent is vertical and the offset obeys x − 2 ← (1 + βdt)(x − 2) = 0.85(x − 2), so ⌈ln 0.01 / ln 0.85⌉ = 29 steps. With α = 1 the robot climbs the edge, where DG tilts and v acquires an x-component of the wrong sign, and it takes one more: 30. The check pins both.' },
+        { label: 'About 300', because: 'That would be the count at β = −0.3: the offset shrinks by (1 + βdt) per step, so a gain ten times smaller needs about ten times as many steps.' },
+      ]}
+    >
+    Explain the discrepancy between the discrete count and the continuous prediction $\ln 100 / 3
+    \approx 1.54$ s $\approx 31$ steps: Euler's factor $0.85$ per step decays slightly faster than
+    $e^{-0.15} = 0.861$. Then explain why $\alpha v$, which is perpendicular to $DG$ and so cannot
+    change $G$ to first order, still costs a step: $G$'s level sets are not parallel to the bisector
+    away from the sites' axis. The widget integrates with $dt = 0.02$ s, so verify there by time rather
+    than by step count: the offset should fall below $0.01$ after about $1.5$ s.
+    </Predict>
+  </Exercise>
+
+  <Exercise level="C" difficulty={2} title="Break the meet-point detector">
+    In the GVG Explorer, raise the range noise $\sigma$ step by step until the exploration no longer
+    terminates cleanly — it reports spurious ties, revisits a meet point as a new node, or misses a
+    doorway. From the event log and the meet-point count, decide for one failure whether a meet point
+    was *spurious* (announced where no third obstacle is near) or *missed* (driven through), and relate
+    it to Choset's detector, "a sudden change in one of the two closest obstacles". Which tolerance
+    would you widen to fix each kind, and what does widening it break?
+    <Hints>
+      <>The detector fires when the third reading comes within meetTol of the first. Noise of σ on each of two readings moves their difference by about √2 σ.</>
+      <>A spurious meet fires when noise closes the gap; a missed one when noise opens it as the robot passes. The node tolerance decides whether a re-homed point is "the same node".</>
+    </Hints>
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="Follow a period to the halo">
+    Implement `follow_period` in `hgvg.rs` for the box-in-a-room world of Choset Fig. 5.19, extruded
+    from analytic planes: explore the second-order GVG on the floor–ceiling sheet with the sheet's own
+    nearest-obstacle query, detect the period whose common second-closest obstacle is the box, descend
+    $-\pi_{T F_{fc}} \nabla d_{box}$ from it, and trace the halo. Assert that the descent stops on a
+    three-way tie of the floor, the ceiling and the box at clearance $1.5$, and that the halo closes.
+    Then move the box off-centre vertically and explain what happens to the floor–ceiling sheet's hole.
+  </Exercise>
+
+  <Exercise level="P" difficulty={3} title="The rod-GVG in the Workbench (stretch)">
+    Implement the rod-GVG of Choset §5.4: $d_i(q)$ for a rod at $q = (x, y, \theta)$ as segment–polygon
+    distance with `parry2d`, its gradient in $(x, y, \theta)$ from the closest pair of points, and
+    $RF_{ijk}$ traced with the Lyapunov law over $SE(2)$ ($G \in \mathbb{R}^2$, $DG$ a $2 \times 3$
+    matrix). Sample R-edges as rod placements tangent to Chapter 8's planar GVD, and render Choset
+    Fig. 5.22's panels for the Workbench: the rod-GVG edges as swept placements, the R-edges, and
+    the union in $SE(2)$. Check that a short rod's $RF_{ijk}$ is a single closed curve over $\theta$
+    (footnote 5) and find the rod length at which it splits.
+  </Exercise>
+</Exercises>
+
+## References
+
+<References>
+  <Reference
+    authors="Choset, H., Lynch, K. M., Hutchinson, S., Kantor, G., Burgard, W., Kavraki, L. E., and Thrun, S."
+    year={2005}
+    title="Principles of Robot Motion: Theory, Algorithms, and Implementations"
+    venue="MIT Press"
+    url="https://mitpress.mit.edu/9780262033275/principles-of-robot-motion/"
+    note="Chapter 5, §5.3–5.5, is this chapter's source: the GVG and transversality (Fig. 5.17, Table 5.2), the HGVG and eq. (5.4), the Lyapunov tracing law eq. (5.5) and homing, the rod-HGVG, Canny's roadmap with Lemmas 5.5.1–5.5.2 and the slice lemma, and the OPP with the generalized gradient. Canny's roadmap and complexity bound are from Canny's The Complexity of Robot Motion Planning (MIT Press, 1988) and the OPP from Canny and Lin (1990), Choset's refs. 90–93."
+  />
+  <Reference
+    authors="Choset, H. and Burdick, J."
+    year={2000}
+    title="Sensor-Based Exploration: The Hierarchical Generalized Voronoi Graph"
+    venue="International Journal of Robotics Research 19(2), 96–125"
+    doi="10.1177/02783640022066770"
+    note="The HGVG in full: the GVG in R^m, its disconnection, second-order edges and periods, the connectivity argument this chapter cites rather than proves, and the sensor-based exploration procedure."
+  />
+  <Reference
+    authors="Choset, H. and Nagatani, K."
+    year={2001}
+    title="Topological Simultaneous Localization and Mapping (SLAM): Toward Exact Localization Without Explicit Localization"
+    venue="IEEE Transactions on Robotics and Automation 17(2), 125–137"
+    doi="10.1109/70.928558"
+    note="The explored GVG used as a topological map for localization: what the integration lab's graph becomes when odometry drifts."
+  />
+  <Reference
+    authors="Schwartz, J. T. and Sharir, M."
+    year={1983}
+    title="On the “Piano Movers” Problem II: General Techniques for Computing Topological Properties of Real Algebraic Manifolds"
+    venue="Advances in Applied Mathematics 4(3), 298–351"
+    doi="10.1016/0196-8858(83)90014-3"
+    note="The first general complete algorithm, by cylindrical algebraic decomposition, doubly exponential in the dimension — the bound Canny's roadmap improved to singly exponential."
+  />
+  <Reference
+    authors="Reif, J. H."
+    year={1979}
+    title="Complexity of the Mover's Problem and Generalizations"
+    venue="20th Annual Symposium on Foundations of Computer Science (FOCS), 421–427"
+    doi="10.1109/SFCS.1979.10"
+    note="PSPACE-hardness of the generalized mover's problem: the lower bound that makes 'exact planning is expensive' a theorem rather than an observation (Appendix D)."
+  />
+  <Reference
+    authors="Clarke, F. H."
+    year={1990}
+    title="Optimization and Nonsmooth Analysis"
+    venue="SIAM Classics in Applied Mathematics 5 (reprint of the 1983 Wiley edition)"
+    doi="10.1137/1.9781611971309"
+    note="The generalized gradient as the convex hull of limiting gradients, and the first-order characterization of extrema of nonsmooth functions used for the OPP's slice maxima (Choset's ref. 114)."
+  />
+</References>

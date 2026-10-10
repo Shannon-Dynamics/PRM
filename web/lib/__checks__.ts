@@ -22,14 +22,21 @@ import { runCh05Checks } from './manifold/__checks_ch05__';
 import { runCh06Checks } from './search/__checks_ch06__';
 import { runCh07Checks } from './potential/__checks_ch07__';
 import { runCh08Checks } from './roadmap/__checks_ch08__';
+import { runCh09Checks } from './roadmap/__checks_ch09__';
+import { runCh10Checks } from './cells/__checks_ch10__';
 import { runCh11Checks } from './sampling/__checks_ch11__';
 import { runCh12Checks } from './sampling/__checks_ch12__';
 import { runCh13Checks } from './sampling/__checks_ch13__';
+import { runCh14Checks } from './multi/__checks_ch14__';
 import { runCh15Checks } from './estimate/__checks_ch15__';
 import { runCh16Checks } from './estimate/__checks_ch16__';
 import { runCh17Checks } from './dynamics/__checks_ch17__';
 import { runCh18Checks } from './trajectory/__checks_ch18__';
 import { runCh19Checks } from './trajopt/__checks_ch19__';
+import { runCh20Checks } from './nonholonomic/__checks_ch20__';
+import { runCh21Checks } from './nonholonomic/__checks_ch21__';
+import { runCh22Checks } from './learn/__checks_ch22__';
+import { runCh23Checks } from './capstone/__checks_ch23__';
 // @chapter-check-imports-end
 
 export interface CheckResult {
@@ -97,14 +104,21 @@ const CHAPTER_CHECKS: Array<() => CheckResult[]> = [
   runCh06Checks, // Chapter 6
   runCh07Checks, // Chapter 7
   runCh08Checks, // Chapter 8
+  runCh09Checks, // Chapter 9
+  runCh10Checks, // Chapter 10
   runCh11Checks, // Chapter 11
   runCh12Checks, // Chapter 12
   runCh13Checks, // Chapter 13
+  runCh14Checks, // Chapter 14
   runCh15Checks, // Chapter 15
   runCh16Checks, // Chapter 16
   runCh17Checks, // Chapter 17
   runCh18Checks, // Chapter 18
   runCh19Checks, // Chapter 19
+  runCh20Checks, // Chapter 20
+  runCh21Checks, // Chapter 21
+  runCh22Checks, // Chapter 22
+  runCh23Checks, // Chapter 23
 ];
 
 export function runSelfChecks(): CheckResult[] {

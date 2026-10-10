@@ -46,6 +46,7 @@ import { FIG_5_19_BOX_CENTER, FIG_5_19_HALO_CLEARANCE, FIG_5_19_INDEX, FIG_5_19_
 import { OPP_WORLD, oppRoadmap } from './opp';
 import { rEdgePlacements, rodQuery, rodTieResidual, sampleRodEdge, type RodObstacle } from './rod';
 import { ScanQuery, apartmentExactGvd, apartmentExactQuery } from './scan-query';
+import { gvgVersusShortest } from './gvg-lab';
 import { cannySweep, drilledEllipsoid, rankDeficiency, sliceCurves, sphere, torus } from './silhouette';
 
 const fmt = (x: number, d = 4) => (Math.abs(x) < 1e-12 ? (0).toFixed(d) : x.toFixed(d));
@@ -70,10 +71,29 @@ export function runCh09Checks(): CheckResult[] {
       close(e.qdot[0], -0.3964, T) && close(e.qdot[1], 1.0467, T) &&
       close(e.gamma, 0.3959, T) && close(e.dGamma, -0.7918, T) &&
       close(e.correction[0], -(MICRO_Q[0] - 2), 1e-12);
+    // Exercise 1: for two point sites (DG)†G, projected on the sites' axis, is the signed distance to
+    // the bisector — everywhere, not only at q. Twenty seeded points around two seeded sites, and the
+    // exercise's own point (3, −1) with the micro sites (correction x-component −1 at β = −1).
+    const rng = new Rng(19);
+    let worstId = 0;
+    for (let k = 0; k < 20; k++) {
+      const a = [rng.uniform(-2, 2), rng.uniform(-2, 2)];
+      const b = [rng.uniform(2, 6), rng.uniform(-2, 2)];
+      const q = [rng.uniform(-3, 7), rng.uniform(-4, 4)];
+      const near = pointSitesQuery([a, b])(q).sort((x, y) => x.index - y.index);
+      const st = traceLaw(near, 0, -1, [0, 1]);
+      if (st.singular) continue;
+      const L = vdist(a, b);
+      const u = [(b[0] - a[0]) / L, (b[1] - a[1]) / L];
+      const off = (q[0] - (a[0] + b[0]) / 2) * u[0] + (q[1] - (a[1] + b[1]) / 2) * u[1];
+      worstId = Math.max(worstId, Math.abs(st.correction[0] * u[0] + st.correction[1] * u[1] + off));
+    }
+    const ex1 = traceLaw(pointSitesQuery(MICRO_SITES)([3, -1]).sort((x, y) => x.index - y.index), 1, -1, [0, 1]);
+    const okId = worstId < 1e-12 && close(ex1.correction[0], -1, 1e-12);
     push(
-      'ch09 §3 micro-example: sites (0,0),(4,0), q = (2.5,1), α = 1, β = −1 → G = 0.8898, DG = (1.7605, −0.1833), DG† = (0.5619, −0.0585), v = (0.1036, 0.9946), q̇ = (−0.3964, 1.0467), Γ = 0.3959, Γ̇ = −0.7918 (all to 10⁻⁴); the correction\'s x-component is exactly −0.5, minus the offset from the bisector',
-      ok,
-      `G ${fmt(e.G)} DG (${fmt(e.DG[0])}, ${fmt(e.DG[1])}) DG† (${fmt(e.DGdag[0])}, ${fmt(e.DGdag[1])}) v (${fmt(e.v[0])}, ${fmt(e.v[1])}) corr (${fmt(e.correction[0])}, ${fmt(e.correction[1])}) q̇ (${fmt(e.qdot[0])}, ${fmt(e.qdot[1])}) Γ ${fmt(e.gamma)} Γ̇ ${fmt(e.dGamma)}`,
+      'ch09 §3 micro-example: sites (0,0),(4,0), q = (2.5,1), α = 1, β = −1 → G = 0.8898, DG = (1.7605, −0.1833), DG† = (0.5619, −0.0585), v = (0.1036, 0.9946), q̇ = (−0.3964, 1.0467), Γ = 0.3959, Γ̇ = −0.7918 (all to 10⁻⁴); the correction\'s x-component is exactly −0.5, minus the offset from the bisector — and (Exercise 1) the correction along the sites\' axis is −(signed distance to the bisector) at 20 seeded points around 20 seeded site pairs to 10⁻¹², e.g. −1 at (3, −1)',
+      ok && okId,
+      `G ${fmt(e.G)} DG (${fmt(e.DG[0])}, ${fmt(e.DG[1])}) DG† (${fmt(e.DGdag[0])}, ${fmt(e.DGdag[1])}) v (${fmt(e.v[0])}, ${fmt(e.v[1])}) corr (${fmt(e.correction[0])}, ${fmt(e.correction[1])}) q̇ (${fmt(e.qdot[0])}, ${fmt(e.qdot[1])}) Γ ${fmt(e.gamma)} Γ̇ ${fmt(e.dGamma)}; Exercise 1 identity worst ${worstId.toExponential(2)}, at (3, −1): ${fmt(ex1.correction[0], 6)}`,
     );
   }
 
@@ -98,10 +118,16 @@ export function runCh09Checks(): CheckResult[] {
     // Mixed strategy: the law needs G and DG only; evaluate it from a scan-like query with no site identities.
     const anonymous: NearestQuery = (q) => query(q).map((n) => ({ ...n, index: -1 }));
     const st = traceLaw(anonymous(MICRO_Q), 1, -1, [0, 1]);
+    // Exercise 3: β = −3, dt = 0.05 from (3, 0). Without the tangent term the offset shrinks by
+    // (1 + β dt) = 0.85 per step, so ⌈ln 0.01 / ln 0.85⌉ = 29 steps to |x − 2| < 0.01; with α = 1
+    // the robot also moves along the edge, where v has an x-component, and it takes 30.
+    const firstWithin = (alpha: number) => integrateTracer(query, [3, 0], [0, 1], alpha, -3, 0.05, 100).path.findIndex((p) => Math.abs(p[0] - 2) < 0.01);
+    const ex3a0 = firstWithin(0);
+    const ex3a1 = firstWithin(1);
     push(
-      'ch09 Lyapunov box: along q̇ = αv + β(DG)†G with β = −1, Γ = ½G² is monotone non-increasing (200 Euler steps of 0.01 s and of 0.05 s) and decays like e^{2βt} (ratio to e^{−4}Γ₀ within 3 % at t = 2 s); after 10 s the robot is on the bisector x = 2 to 10⁻³ and has advanced along it; β = +1 makes Γ grow; the law evaluates identically from anonymous (sensor-style) readings',
-      monotone && monotone2 && Math.abs(end[0] - 2) < 1e-3 && end[1] > 5 && Math.abs(ratio - 1) < 0.03 && grows && close(st.dGamma, -0.7918, 1e-4),
-      `Γ: ${fmt(run.gamma[0])} → ${run.gamma[run.gamma.length - 1].toExponential(3)} at t = 2 (ratio to e^{−4}Γ₀ ${fmt(ratio, 3)}); t = 10: Γ ${long.gamma[long.gamma.length - 1].toExponential(2)}, end (${fmt(end[0])}, ${fmt(end[1])}); β = +1: Γ ${fmt(bad.gamma[0])} → ${fmt(bad.gamma[bad.gamma.length - 1])}`,
+      'ch09 Lyapunov box: along q̇ = αv + β(DG)†G with β = −1, Γ = ½G² is monotone non-increasing (200 Euler steps of 0.01 s and of 0.05 s) and decays like e^{2βt} (ratio to e^{−4}Γ₀ within 3 % at t = 2 s); after 10 s the robot is on the bisector x = 2 to 10⁻³ and has advanced along it; β = +1 makes Γ grow; the law evaluates identically from anonymous (sensor-style) readings; Exercise 3: from (3, 0) with β = −3 and dt = 0.05, |x − 2| < 0.01 after 29 Euler steps without the tangent term (⌈ln 0.01 / ln 0.85⌉) and 30 with α = 1',
+      monotone && monotone2 && Math.abs(end[0] - 2) < 1e-3 && end[1] > 5 && Math.abs(ratio - 1) < 0.03 && grows && close(st.dGamma, -0.7918, 1e-4) && ex3a0 === 29 && ex3a1 === 30,
+      `Γ: ${fmt(run.gamma[0])} → ${run.gamma[run.gamma.length - 1].toExponential(3)} at t = 2 (ratio to e^{−4}Γ₀ ${fmt(ratio, 3)}); t = 10: Γ ${long.gamma[long.gamma.length - 1].toExponential(2)}, end (${fmt(end[0])}, ${fmt(end[1])}); β = +1: Γ ${fmt(bad.gamma[0])} → ${fmt(bad.gamma[bad.gamma.length - 1])}; Exercise 3 (β = −3, dt = 0.05, from (3, 0)): ${ex3a0} steps with α = 0, ${ex3a1} with α = 1`,
     );
   }
 
@@ -177,8 +203,8 @@ export function runCh09Checks(): CheckResult[] {
     ];
     const found = expected.every((p) => meets.some((m) => vdist(m.q, p) < 1e-6));
     push(
-      'ch09 Derivation 1 (GVG in R³, 10×8×3 room): exploration from one start finds the 4 meet points (1.5,1.5,1.5), (8.5,1.5,1.5), (8.5,6.5,1.5), (1.5,6.5,1.5) — each four-equidistant to 10⁻⁹ and of degree 4 — and 8 corner spokes ending at boundary points; every edge sample is three-equidistant to 10⁻⁶ and the sheets meet transversally (smallest singular value of DG ≥ 0.87 = √(3 − √5), the rectangle edges\' value)',
-      ex.phase === 'done' && meets.length === 4 && found && worstMeet < 1e-9 && degrees.every((d) => d === 4) && boundary === 8 && worstTie < 1e-6 && minMargin > 0.87,
+      'ch09 Derivation 1 (GVG in R³, 10×8×3 room): exploration from one start finds the 4 meet points (1.5,1.5,1.5), (8.5,1.5,1.5), (8.5,6.5,1.5), (1.5,6.5,1.5) — each four-equidistant to 10⁻⁹ and of degree 4 — and 8 corner spokes ending at boundary points (13 edges in all); every edge sample is three-equidistant to 10⁻⁶ and the sheets meet transversally (smallest singular value of DG ≥ 0.87 = √(3 − √5), the rectangle edges\' value)',
+      ex.phase === 'done' && meets.length === 4 && found && worstMeet < 1e-9 && degrees.every((d) => d === 4) && boundary === 8 && ex.edges.length === 13 && worstTie < 1e-6 && minMargin > 0.87,
       `${ex.phase}; ${meets.length} meet points (degrees ${degrees.join(',')}), ${boundary} boundary points, ${ex.edges.length} edges, ${samples} samples; worst tie ${worstTie.toExponential(2)}, worst 4-tie ${worstMeet.toExponential(2)}, min margin ${fmt(minMargin, 4)}; driven ${fmt(ex.distanceDriven, 1)} m`,
     );
   }
@@ -205,8 +231,8 @@ export function runCh09Checks(): CheckResult[] {
       haloDetail = `descent ${link.stop} in ${link.path.length} steps to (${fmt(end[0], 3)}, ${fmt(end[1], 3)}, ${fmt(end[2], 3)}), d = ${fmt(near[0].d, 6)}, ${fmt(r, 3)} from the box axis; halo ${halo.closed ? 'closes' : 'open'} after ${fmt(halo.length, 2)} m, worst tie ${halo.worstTie.toExponential(2)}`;
     }
     push(
-      'ch09 Derivation 2 (HGVG, Fig. 5.19): the outer GVG never touches the box; on the floor–ceiling sheet z = 1.5 the second-order edges whose tied pair includes the box form a closed period around it; descending −π∇d_box from the period reaches d_box = d_floor = d_ceiling = 1.5 — the halo — which traces as a closed GVG cycle, three-equidistant to 10⁻⁶',
-      !touchesBox && period.closes && haloOk && hg.sheet.explorer.phase === 'done',
+      'ch09 Derivation 2 (HGVG, Fig. 5.19): the outer GVG never touches the box; on the floor–ceiling sheet z = 1.5 the second-order edges whose tied pair includes the box form a closed period around it; descending −π∇d_box from the period reaches d_box = d_floor = d_ceiling = 1.5 — the halo — which traces as a closed GVG cycle, three-equidistant to 10⁻⁶ (9 second-order edges on the sheet, a period of 4, a halo 13.42 m long)',
+      !touchesBox && period.closes && haloOk && hg.sheet.explorer.phase === 'done' && hg.sheet.explorer.edges.length === 9 && period.edges.length === 4 && !!halo && close(halo.length, 13.42, 0.01),
       `sheet: ${hg.sheet.explorer.phase}, ${hg.sheet.explorer.edges.length} second-order edges, ${hg.sheet.explorer.meetPoints.length} second-order meet points; period: ${period.edges.length} edges, largest angular gap ${fmt(period.maxGap, 3)} rad; ${haloDetail}`,
     );
   }
@@ -229,10 +255,14 @@ export function runCh09Checks(): CheckResult[] {
     const matched = truth.filter((t) => ex.meetPoints.some((m) => Math.hypot(m.q[0] - t.q.x, m.q[1] - t.q.y) < tol));
     const extra = ex.meetPoints.filter((m) => !truth.some((t) => Math.hypot(m.q[0] - t.q.x, m.q[1] - t.q.y) < tol));
     const missed = truth.filter((t) => !matched.includes(t));
+    // The integration lab: the explored graph as a roadmap, fifty seeded queries (29 pass Chapter 8's filter).
+    const lab = gvgVersusShortest(ex);
     push(
-      'ch09 §5.3.3 (Apartment): Rusty\'s 360-ray ring (bearings refined between rays) builds the GVG from (1.0, 1.2) to completion; every meet point it homes onto is three-equidistant by exact wall geometry to 10⁻⁶; all 26 meet points of Chapter 8\'s exact GVD are found within 5 cm, and the two the exact tracer\'s seeding missed — (6.00, 4.30) in the corridor and (7.85, 6.79) in the bedroom — are genuine (same exact-geometry test)',
-      ex.phase === 'done' && worstTie < 1e-6 && missed.length === 0 && truth.length === 26 && extra.length === 2 && extra.every((m) => Math.hypot(m.q[0] - 6, m.q[1] - 4.3) < 0.02 || Math.hypot(m.q[0] - 7.85, m.q[1] - 6.79) < 0.02),
-      `${ex.phase} after ${ex.ticks} ticks, ${fmt(ex.distanceDriven, 1)} m driven; ${ex.meetPoints.length} meet points, ${ex.nodes.filter((n) => n.kind === 'boundary').length} boundary points, ${ex.edges.length} edges (${fmt(ex.roadmapLength, 1)} m); worst exact 3-tie ${worstTie.toExponential(2)}; exact GVD ${truth.length} meet points, ${matched.length} matched, ${missed.length} missed${missed.length ? ` (${missed.slice(0, 4).map((t) => `(${t.q.x.toFixed(2)},${t.q.y.toFixed(2)})`).join(' ')})` : ''}, ${extra.length} extra${extra.length ? ` (${extra.slice(0, 4).map((m) => `(${m.q[0].toFixed(2)},${m.q[1].toFixed(2)})`).join(' ')})` : ''}`,
+      'ch09 §5.3.3 (Apartment): Rusty\'s 360-ray ring (bearings refined between rays) builds the GVG from (1.0, 1.2) to completion (5779 ticks, 205.0 m driven; 27 meet points, 33 boundary points, 62 edges, 103.4 m of roadmap); every meet point it homes onto is three-equidistant by exact wall geometry to 10⁻⁶; all 26 meet points of Chapter 8\'s exact GVD are found within 5 cm, and the two the exact tracer\'s seeding missed — (6.00, 4.30) in the corridor and (7.85, 6.79) in the bedroom — are genuine (same exact-geometry test); integration lab: the explored graph is one component, every gradient-ascent landing is within 2 cm of it, and all 29 seeded queries are answered — mean length 10.88 m on the GVG against 6.68 m shortest (ratio 1.62 mean, 2.46 worst), mean minimum clearance 0.48 m against 0.22 m',
+      ex.phase === 'done' && worstTie < 1e-6 && missed.length === 0 && truth.length === 26 && extra.length === 2 && extra.every((m) => Math.hypot(m.q[0] - 6, m.q[1] - 4.3) < 0.02 || Math.hypot(m.q[0] - 7.85, m.q[1] - 6.79) < 0.02) &&
+        ex.ticks === 5779 && close(ex.distanceDriven, 205.0, 0.05) && ex.edges.length === 62 && ex.nodes.filter((n) => n.kind === 'boundary').length === 33 && close(ex.roadmapLength, 103.4, 0.05) &&
+        lab.tried === 29 && lab.answered === 29 && lab.components === 1 && lab.worstHop < 0.02 && close(lab.meanGvg, 10.88, 0.02) && close(lab.meanShortest, 6.68, 0.02) && close(lab.meanRatio, 1.62, 0.01) && close(lab.worstRatio, 2.46, 0.01) && close(lab.meanGvgClearance, 0.48, 0.01) && close(lab.meanShortestClearance, 0.22, 0.01),
+      `${ex.phase} after ${ex.ticks} ticks, ${fmt(ex.distanceDriven, 1)} m driven; ${ex.meetPoints.length} meet points, ${ex.nodes.filter((n) => n.kind === 'boundary').length} boundary points, ${ex.edges.length} edges (${fmt(ex.roadmapLength, 1)} m); worst exact 3-tie ${worstTie.toExponential(2)}; exact GVD ${truth.length} meet points, ${matched.length} matched, ${missed.length} missed${missed.length ? ` (${missed.slice(0, 4).map((t) => `(${t.q.x.toFixed(2)},${t.q.y.toFixed(2)})`).join(' ')})` : ''}, ${extra.length} extra${extra.length ? ` (${extra.slice(0, 4).map((m) => `(${m.q[0].toFixed(2)},${m.q[1].toFixed(2)})`).join(' ')})` : ''}; lab ${lab.answered}/${lab.tried}, ${lab.components} component, worst hop ${fmt(lab.worstHop, 3)} m, GVG ${fmt(lab.meanGvg, 2)} m vs shortest ${fmt(lab.meanShortest, 2)} m (ratio ${fmt(lab.meanRatio, 3)} mean, ${fmt(lab.worstRatio, 3)} worst), clearance ${fmt(lab.meanGvgClearance, 3)} vs ${fmt(lab.meanShortestClearance, 3)} m`,
     );
   }
 
@@ -269,7 +299,7 @@ export function runCh09Checks(): CheckResult[] {
     const atRminusR = interior.every((c) => Math.abs(Math.abs(c.lambda) - (R - r)) < 0.02);
     push(
       'ch09 Derivation 5 (torus R = 2, r = 0.7): the slice q₁ = λ meets the torus in two curves for |λ| < R − r and one for |λ| > R − r (C Fig. 5.31); the sweep finds the two interior critical slices at λ = ±(R − r) = ±1.3 to 2 cm and the birth/death slices at ±2.7; the silhouette is four arcs (upper and lower halves of the outer and inner equators) that only the critical slices\' curves connect: 4 components → 1',
-      before.pieces.length === 2 && after.pieces.length === 1 && before.extrema.length === 4 && after.extrema.length === 2 && interior.length === 2 && atRminusR && sil.critical.length === 4 && sil.curves.length === 4 && sil.componentsWithoutLinks === 4 && sil.componentsWithLinks === 1,
+      before.pieces.length === 2 && after.pieces.length === 1 && before.extrema.length === 4 && after.extrema.length === 2 && interior.length === 2 && atRminusR && sil.critical.length === 4 && [-2.7, -1.3, 1.3, 2.7].every((l, i) => close(sil.critical[i].lambda, l, 2e-3)) && sil.curves.length === 4 && sil.componentsWithoutLinks === 4 && sil.componentsWithLinks === 1,
       `pieces ${before.pieces.length} → ${after.pieces.length} (extrema ${before.extrema.length} → ${after.extrema.length}); critical λ: ${sil.critical.map((c) => fmt(c.lambda, 3)).join(', ')}; ${sil.curves.length} curves; components ${sil.componentsWithoutLinks} → ${sil.componentsWithLinks}`,
     );
   }
@@ -284,8 +314,10 @@ export function runCh09Checks(): CheckResult[] {
     const inHole = (sl: { pieces: unknown[]; extrema: unknown[] }) => sl.pieces.length === 2 && sl.extrema.length === 6;
     const mid = sliceCurves(de, 0.6, { step: 0.03, seeds: 14 });
     push(
-      'ch09 Derivation 5 (ellipsoid with a bent hole): the slice curve count changes exactly twice, where the hole punches through at λ = 0.6 − 0.7 and closes at 0.6 + 0.7 (to 3 cm); midway through the hole the slice is two curves with six extrema — the outer extremum, the bent wall\'s extremum and the rim\'s two corners on one side, two on the other; the fillet adds a dimple critical slice just outside each punch-through; the silhouette curves are disconnected on their own and connected once the critical slices\' curves are added',
-      punch.length === 2 && nearEnds && dimples.length <= 2 && dimples.every((c) => punch.some((p) => Math.abs(p.lambda - c.lambda) < 0.05)) && inHole(mid) && sil.componentsWithoutLinks > 1 && sil.componentsWithLinks === 1,
+      'ch09 Derivation 5 (ellipsoid with a bent hole): the slice curve count changes exactly twice, where the hole punches through at λ = 0.6 − 0.7 and closes at 0.6 + 0.7 (to 3 cm); midway through the hole the slice is two curves with six extrema — the outer extremum, the bent wall\'s extremum and the rim\'s two corners on one side, two on the other; the fillet adds a dimple critical slice just outside each punch-through; the six critical values are −2.999, −0.122, −0.109, 1.307, 1.322, 2.992 (to 2·10⁻³), and the silhouette curves fall into 6 components on their own and 1 once the critical slices\' curves are added',
+      punch.length === 2 && nearEnds && dimples.length <= 2 && dimples.every((c) => punch.some((p) => Math.abs(p.lambda - c.lambda) < 0.05)) && inHole(mid) && sil.componentsWithoutLinks === 6 && sil.componentsWithLinks === 1 &&
+        sil.critical.length === 6 && [-2.999, -0.122, -0.109, 1.307, 1.322, 2.992].every((l, i) => close(sil.critical[i].lambda, l, 2e-3)) &&
+        sil.critical.map((c) => `${c.before.join('/')}>${c.after.join('/')}`).join(' ') === '0/0>1/2 1/2>1/10 1/10>2/6 2/6>1/6 1/6>1/2 1/2>0/0',
       `critical λ: ${sil.critical.map((c) => `${fmt(c.lambda, 3)} (${c.before.join('/')}→${c.after.join('/')})`).join(', ')}; ${sil.curves.length} silhouette curves; components ${sil.componentsWithoutLinks} → ${sil.componentsWithLinks}`,
     );
   }
@@ -304,8 +336,9 @@ export function runCh09Checks(): CheckResult[] {
       if (fp.active.length >= 2) ties++;
     }
     push(
-      'ch09 Derivation 6 (OPP): at every slice-restricted maximum of D̃ the generalized gradient contains 0 (the active slopes bracket zero); every maximum is a tie of two or more obstacles, so OPP ⊂ GVD (Problem 12, convex obstacles); the channel count changes at 4 interesting critical values, and the bridge curves there plus the bifurcation bridges where a freeway ends in free space connect the freeways into one roadmap',
-      n > 150 && gz === n && ties === n && rm.critical.length === 4 && rm.componentsWithoutBridges > 1 && rm.componentsWithBridges === 1,
+      'ch09 Derivation 6 (OPP): at every slice-restricted maximum of D̃ the generalized gradient contains 0 (the active slopes bracket zero); every maximum is a tie of two or more obstacles, so OPP ⊂ GVD (Problem 12, convex obstacles); the channel count changes at 4 interesting critical values, and the bridge curves there plus the bifurcation bridges where a freeway ends in free space connect the freeways into one roadmap (181 freeway points on 4 freeways; critical λ = 2.2, 4.6, 6.0, 8.2; 10 bridges; 4 components → 1)',
+      n === 181 && gz === n && ties === n && rm.critical.length === 4 && rm.freeways.length === 4 && rm.bridges.length === 10 && rm.componentsWithoutBridges === 4 && rm.componentsWithBridges === 1 &&
+        [2.2, 4.6, 6.0, 8.2].every((l, i) => close(rm.critical[i].lambda, l, 1e-3)),
       `${n} freeway points, ${gz} with 0 ∈ ∂D̃, ${ties} ties; ${rm.freeways.length} freeways; critical λ: ${rm.critical.map((c) => `${fmt(c.lambda, 3)} (${c.before}→${c.after})`).join(', ')}; ${rm.bridges.length} bridges; components ${rm.componentsWithoutBridges} → ${rm.componentsWithBridges}`,
     );
   }
@@ -327,8 +360,8 @@ export function runCh09Checks(): CheckResult[] {
     const worst = rodTieResidual(query, samples);
     const r = rEdgePlacements(gvd);
     push(
-      'ch09 §5.4 (rod-HGVG sketch): a 0.3 m rod spun through 36 orientations about the Workbench\'s widest meet point stays three-way equidistant at every orientation (Newton in (x, y) at fixed θ converges to 10⁻¹⁰) — RF_ijk is a closed curve over θ, footnote 5 — and the R-edge placements sampled from the point-GVD number in the hundreds',
-      !!mp && samples.length === 36 && worst < 1e-9 && r.length > 100,
+      'ch09 §5.4 (rod-HGVG sketch): a 0.3 m rod spun through 36 orientations about the Workbench\'s widest meet point stays three-way equidistant at every orientation (Newton in (x, y) at fixed θ converges to 10⁻¹⁰) — RF_ijk is a closed curve over θ, footnote 5 — (the meet point has clearance 1.539), and 130 R-edge placements are sampled from the point-GVD',
+      !!mp && samples.length === 36 && worst < 1e-9 && r.length === 130 && close(mp.clearance, 1.539, 1e-3),
       `meet point (${mp?.q.x.toFixed(3)}, ${mp?.q.y.toFixed(3)}) clearance ${mp?.clearance.toFixed(3)}; ${samples.length}/36 orientations, worst tie ${worst.toExponential(2)}; ${r.length} R-edge placements, ${gvd.edges.length} GVD edges`,
     );
   }
@@ -339,7 +372,7 @@ export function runCh09Checks(): CheckResult[] {
   {
     const rows = [2, 3, 4, 6].map((n) => cannyBoundLog10(10, n, 2));
     push(
-      'ch09 complexity: log₁₀ of Canny\'s bound p^n (log p) w^{n⁴} at p = 10, w = 2 is 7.2, 27.7, 81.5 and 396.4 for n = 2, 3, 4, 6 — singly exponential in the dimension',
+      'ch09 complexity: log₁₀ of Canny\'s bound p^n (log p) w^{n⁴} at p = 10, w = 2 is 7.2, 27.7, 81.4 and 396.5 for n = 2, 3, 4, 6 — singly exponential in the dimension',
       close(rows[0], 7.18, 0.05) && close(rows[1], 27.74, 0.05) && close(rows[2], 81.44, 0.05) && close(rows[3], 396.47, 0.1),
       rows.map((v) => fmt(v, 2)).join(', '),
     );

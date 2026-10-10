@@ -31,10 +31,13 @@ demonstrate.
 | `Resource/choset.txt` (ignored, local) | Extracted text of the baseline book, `=== PAGE N ===` markers = PDF pages. The PDF-page start of every Choset chapter/appendix is tabulated in `TOC.md §4`; book-page → PDF-page offsets drift (19 → 14), so use that table, never an offset rule. |
 | `CLAUDE.md` | This file: how to build the book. |
 
-**Current state: Phase B (implementation) in progress.** `web/` has been forked from the sister
-book and re-pointed at this book (structure, roles/colors, macros, home, notation); chapters land
-one by one as MDX + widgets + `lib/` modules. `pr-latex/` is forked and re-pointed (planning
-colour macros in `shannon.sty`, 23-chapter `main.tex`); it builds once the chapters exist.
+**Current state: web edition complete (2026-10-12).** All 23 chapters are implemented in `web/`
+(MDX + widgets + `web/lib/<module>` + `__checks_chNN__.ts`); `npm run verify` passes strictly
+(307 numerical checks, 24 pages render, 82 widgets, 174 references) and the site builds both at `/`
+and under the GitHub Pages sub-path. The site chrome follows the Shannon Dynamics website reskin
+(`app/shannon.css`, `components/shannon/*`); chapter figures keep the planning palette.
+`pr-latex/` converts all 23 chapters (`make convert`); typesetting needs a TeX install (TinyTeX at
+`~/.TinyTeX` or `pdflatex` on PATH) that this machine does not have yet.
 
 The running lab: robots **Rusty** (disc / differential drive, shared with the sister book),
 **Reach** (planar 2R arm; 3R variant), **Hitch** (car, optional single trailer); worlds **Apartment**
@@ -123,7 +126,7 @@ renumber chapters or reuse widget ids; `TOC.md` and all cross-references move in
 Every Choset section claimed in a doc's §2 must match the `TOC.md §4` source map. Modern citations
 not yet verified carry "(verify)" until someone checks authors/year/venue/DOI.
 
-### Phase B (current): implementing a chapter
+### Phase B (complete): implementing a chapter
 1. Fork `web/` and `pr-latex/` from the sister book; replace `lib/book-structure.ts`,
    `content/chapters/meta.json`, color tokens, and KaTeX macros per `TOC.md`; port
    `lib/{prob,geom,sim,mapping/edt}` unchanged; delete the sister's other `lib/` modules and
