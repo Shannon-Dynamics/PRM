@@ -1,9 +1,9 @@
 /**
  * Where the book sits relative to Shannon Dynamics.
  *
- * The book's navigation is its own; the only links back out are the wordmark
- * and the footer, and those are absolute cross-origin URLs to the marketing
- * site.
+ * The book's navigation is its own; the only links back out are the wordmark,
+ * the footer, and the PDF, and those are absolute cross-origin URLs to the
+ * marketing site.
  */
 
 const trimEnd = (s: string) => s.replace(/\/+$/, '');
@@ -50,6 +50,14 @@ export const BOOK_HOME = '/';
 
 /** The book's title, as the breadcrumb and the mobile bar say it. */
 export const BOOK_TITLE = 'PRINCIPLES OF ROBOT MOTION';
+
+/**
+ * The PDF edition.
+ *
+ * The file itself is published by the marketing site, so this stays an absolute
+ * URL to it rather than a copy of a multi-megabyte asset in this deployment.
+ */
+export const BOOK_PDF = site('book-pdf/principles-of-robot-motion-via-rust.pdf');
 
 /** The Library sections, for the footer's column back to the site. */
 export const LIBRARY_LINKS = [

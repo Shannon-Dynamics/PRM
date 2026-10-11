@@ -36,8 +36,11 @@ demonstrate.
 (307 numerical checks, 24 pages render, 82 widgets, 174 references) and the site builds both at `/`
 and under the GitHub Pages sub-path. The site chrome follows the Shannon Dynamics website reskin
 (`app/shannon.css`, `components/shannon/*`); chapter figures keep the planning palette.
-`pr-latex/` converts all 23 chapters (`make convert`); typesetting needs a TeX install (TinyTeX at
-`~/.TinyTeX` or `pdflatex` on PATH) that this machine does not have yet.
+**Print edition typeset (2026-10-11):** `cd pr-latex && make` converts all 23 chapters and builds
+`main.pdf` (~657 pages) with TinyTeX at `~/.TinyTeX`; a clean build has 0 LaTeX errors, 0 undefined
+references and no overfull box above ~1pt — keep it that way. After any MDX change, run `make` and
+then `make publish`, which copies the PDF to `../Website/book-pdf/principles-of-robot-motion-via-rust.pdf`;
+the web home's "Download PDF" button (`web/lib/shannon.ts` `BOOK_PDF`) links there on shannon.id.
 
 The running lab: robots **Rusty** (disc / differential drive, shared with the sister book),
 **Reach** (planar 2R arm; 3R variant), **Hitch** (car, optional single trailer); worlds **Apartment**

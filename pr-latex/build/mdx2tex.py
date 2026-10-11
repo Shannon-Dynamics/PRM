@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -265,6 +266,14 @@ MATH_SYMBOL = {
     "⌈": r"\lceil", "⌉": r"\rceil",
 }
 
+MATH_SYMBOL.update({
+    "½": r"\tfrac{1}{2}", "¼": r"\tfrac{1}{4}", "¾": r"\tfrac{3}{4}",
+    "ς": r"\varsigma", "ϵ": r"\epsilon", "↦": r"\mapsto",
+    "⇔": r"\Leftrightarrow", "≻": r"\succ", "⊖": r"\ominus",
+    "⋯": r"\cdots", "◀": r"\blacktriangleleft",
+    "–": r"\text{--}", "—": r"\text{---}",
+})
+
 UNICODE = {
     "—": "---", "–": "--", "’": "'", "‘": "`",
     "“": "``", "”": "''", "…": r"\dots{}", "§": r"\S{}",
@@ -334,6 +343,64 @@ def asciify_code(s: str) -> str:
     return "".join(out)
 
 
+# Accents the tables above do not spell out, recovered by decomposition.
+TEXT_ACCENT = {"\u0301": "\\'", "\u0300": "\\`", "\u0302": "\\^", "\u0303": "\\~",
+               "\u0304": "\\=", "\u0307": "\\.", "\u0308": '\\"', "\u030c": "\\v",
+               "\u0327": "\\c", "\u0331": "\\b"}
+MATH_ACCENT = {**COMBINING, "\u0331": r"\underline"}
+_warned: set[str] = set()
+
+
+def _script_run(s: str, i: int):
+    """A run of Unicode super- or subscripts at s[i] → (^{…} or _{…}, length)."""
+    def kind(c):
+        d = unicodedata.decomposition(c).split()
+        return (d[0], chr(int(d[1], 16))) if len(d) == 2 and d[0] in ("<super>", "<sub>") else None
+    k = kind(s[i])
+    if not k:
+        return None
+    tag, parts, j = k[0], [], i
+    while j < len(s) and (kk := kind(s[j])) and kk[0] == tag:
+        base = kk[1]
+        parts.append(r"\mathsf{T}" if s[j] == "ᵀ" else MATH_SYMBOL.get(base, base))
+        j += 1
+    return ("^{" if tag == "<super>" else "_{") + "".join(parts) + "}", j - i
+
+
+def _fallback(ch: str, prev: str, nxt: str, escape: bool) -> str:
+    """A character no table names: decompose it rather than drop it."""
+    math = lambda m: "$" + m + "$" if escape else m  # noqa: E731
+    nfd = unicodedata.normalize("NFD", ch)
+    if len(nfd) == 2 and nfd[0].isascii() and nfd[0].isalpha():
+        base, mark = nfd
+        # Inside a word it is a name (Şucan, Taïx); standing alone it is a
+        # symbol (ĝ(v), ṡ), and this book's accents on symbols are math.
+        if escape and (prev.isalpha() or nxt.isalpha()) and mark in TEXT_ACCENT:
+            return TEXT_ACCENT[mark] + "{" + base + "}"
+        if mark in MATH_ACCENT:
+            return math(MATH_ACCENT[mark] + "{" + base + "}")
+    d = unicodedata.decomposition(ch).split()
+    if len(d) == 2 and d[0] == "<font>":
+        base = chr(int(d[1], 16))
+        name = unicodedata.name(ch, "")
+        if "SCRIPT" in name:
+            cmd = r"\mathcal{" + base + "}"
+        elif "DOUBLE-STRUCK" in name:
+            cmd = r"\mathbb{" + base + "}"
+        elif "FRAKTUR" in name:
+            cmd = r"\mathfrak{" + base + "}"
+        else:
+            cmd = base
+        if "BOLD" in name:
+            cmd = (r"\mathbf{" + base + "}") if cmd == base else (r"\boldsymbol{" + cmd + "}")
+        return math(cmd)
+    if ch not in _warned:
+        _warned.add(ch)
+        print(f"  warning: no LaTeX for {ch!r} (U+{ord(ch):04X} "
+              f"{unicodedata.name(ch, '?')}); dropped", file=sys.stderr)
+    return ""
+
+
 def _walk(s, symbol_map, wrap, escape):
     """Shared scanner for text and math mode, with combining-mark lookahead."""
     out = []
@@ -350,6 +417,11 @@ def _walk(s, symbol_map, wrap, escape):
         ch = s[i]
         nxt = s[i + 1] if i + 1 < len(s) else ""
         pair = ch + nxt
+        run = _script_run(s, i)
+        if run:
+            out.append(run[0] if not escape else "$" + run[0] + "$")
+            i += run[1]
+            continue
         if pair in MATH_PAIRS:
             rep = MATH_PAIRS[pair]
             out.append(rep if not escape else "$" + rep + "$")
@@ -370,7 +442,7 @@ def _walk(s, symbol_map, wrap, escape):
         elif ch in symbol_map:
             out.append(emit(symbol_map[ch], nxt))
         elif ord(ch) > 127:
-            out.append("")
+            out.append(_fallback(ch, s[i - 1] if i else "", nxt, escape))
         else:
             out.append(ch)
         i += 1
@@ -461,9 +533,68 @@ def fix_math(s):
         s = re.sub(src + r"(?![A-Za-z])", lambda _m, d=dst: d, s)
     # \htmlId / \htmlData carry no meaning on paper.
     s = re.sub(r"\\html(?:Id|Data|Style)\{[^}]*\}", "", s)
+    # A prime only merges with a following *literal* ^, so q'\T is a double
+    # superscript to TeX (KaTeX accepts it). Spell the transpose out there.
+    s = re.sub(r"'\\T(?![A-Za-z])", lambda _m: r"'^{\mathsf{T}}", s)
     s = re.sub(r"(?<!\\)%", lambda _m: "\\%", s)
     # \text{…} contents may hold Unicode that must not reach math mode raw.
     return _walk(s, MATH_SYMBOL, lambda cmd: cmd, False)
+
+
+def boxable_display(eq: str) -> bool:
+    """Can this display equation be set inside an hbox (and so be measured)?
+
+    Everything can except `split` and a bare top-level `\\\\`, which need the
+    display environment itself; aligned, cases, arrays and matrices are fine.
+    """
+    if r"\begin{split}" in eq:
+        return False
+    flat = eq
+    while True:
+        nxt = re.sub(r"\\begin\{(\w+\*?)\}(?:(?!\\begin\{).)*?\\end\{\1\}", "", flat, flags=re.S)
+        if nxt == flat:
+            break
+        flat = nxt
+    return r"\\" not in flat
+
+
+def breakable_math(s: str) -> str:
+    """Let a list of symbols wrap: TeX never breaks math after a comma itself."""
+    out, depth, i = [], 0, 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\":
+            m = re.match(r"\\(?:[A-Za-z]+|.)", s[i:])
+            tok = m.group(0)
+            if depth == 0 and tok == r"\quad":
+                out.append(r"\allowbreak")
+            out.append(tok)
+            i += len(tok)
+            continue
+        depth += (c == "{") - (c == "}")
+        out.append(c)
+        if depth == 0 and c in ",;":
+            out.append(r"\allowbreak ")
+        i += 1
+    return "".join(out)
+
+
+def inline_math(s: str) -> str:
+    """Inline math; a long one may also wrap at its top-level commas."""
+    tex = fix_math(s)
+    return breakable_math(tex) if len(tex) > 40 else tex
+
+
+def inline_code(code: str) -> str:
+    """An inline code span, with the break points typewriter type lacks."""
+    tex = escape_text(code)
+    tex = re.sub(r"(::|/|,|\()", r"\1\\allowbreak{}", tex)
+    # It never hyphenates, so let wasm32-unknown-unknown break at its own
+    # hyphens; a -- stays whole (and \/ keeps it from ligaturing to a dash).
+    tex = re.sub(r"(?<=\w)-(?=\w)", lambda _m: r"-\allowbreak{}", tex)
+    tex = re.sub(r"-(?!\\allowbreak)", lambda _m: r"-\/", tex)
+    tex = tex.replace(r"\_", r"\_\allowbreak{}")
+    return r"\texttt{" + tex + "}"
 
 
 def inline(text: str) -> str:
@@ -482,23 +613,23 @@ def inline(text: str) -> str:
     )
     text = re.sub(
         r"(?<!\$)\$([^\$\n]+?)\$(?!\$)",
-        lambda m: stash("$" + fix_math(m.group(1)) + "$"),
+        lambda m: stash("$" + inline_math(m.group(1)) + "$"),
         text,
     )
-    text = re.sub(
-        r"`([^`]+)`",
-        lambda m: stash(r"\texttt{"
-                        + escape_text(m.group(1))
-                          .replace("-", r"-\/")
-                          .replace(r"\_", r"\_\allowbreak{}")
-                        + "}"),
-        text,
-    )
+    text = re.sub(r"`([^`]+)`", lambda m: stash(inline_code(m.group(1))), text)
+    # Markdown backslash escapes (A\*, \_, \[) mean the bare character.
+    text = re.sub(r"\\([*_\[\]#`<>!|~])",
+                  lambda m: stash(escape_text(m.group(1))), text)
     text = re.sub(
         r"\[([^\]]+)\]\(([^)]+)\)",
         lambda m: stash(_link(m.group(1), m.group(2))),
         text,
     )
+    # Typewriter quotes in prose become typographic ones: a quote opens at the
+    # start or after a space or bracket, and closes everywhere else.
+    text = re.sub(r"""(?:^|(?<=[\s(\[{—–]))"(?=\S)""", "“", text)
+    text = text.replace('"', "”")
+    text = re.sub(r"(?:^|(?<=[\s(\[{—–]))'(?=\w)", "‘", text)
 
     text = escape_text(text)
 
@@ -547,6 +678,15 @@ CALLOUT_ENV = {
 }
 
 
+def camel_breaks(cell: str) -> str:
+    """A narrow column may split `PlanningRequestAdapter` at its humps."""
+    return re.sub(
+        r"\\texttt\{[^{}]*\}",
+        lambda m: re.sub(r"(?<=[a-z])(?=[A-Z])", lambda _m: r"\allowbreak{}", m.group(0)),
+        cell,
+    )
+
+
 def convert_table(lines: list[str]) -> str:
     rows = []
     for ln in lines:
@@ -562,11 +702,13 @@ def convert_table(lines: list[str]) -> str:
     ncols = max(len(r) for r in rows)
     rows = [r + [""] * (ncols - len(r)) for r in rows]
 
-    first = 0.22 if ncols > 2 else 0.34
-    rest = (0.94 - first) / max(ncols - 1, 1)
-    colspec = f">{{\\raggedright\\arraybackslash}}p{{{first}\\linewidth}}" + "".join(
-        [f">{{\\raggedright\\arraybackslash}}p{{{rest:.3f}\\linewidth}}"
-         for _ in range(ncols - 1)]
+    # Shares of the line, each net of its own two \tabcolsep (4pt apiece), so
+    # the table fills the measure exactly instead of overrunning it.
+    first = 0.24 if ncols > 2 else 0.36
+    rest = (1 - first) / max(ncols - 1, 1)
+    colspec = "".join(
+        f">{{\\raggedright\\arraybackslash}}p{{\\dimexpr{w:.3f}\\linewidth-8pt\\relax}}"
+        for w in [first] + [rest] * (ncols - 1)
     )
 
     size = "\\scriptsize" if ncols >= 4 else "\\footnotesize"
@@ -576,7 +718,7 @@ def convert_table(lines: list[str]) -> str:
     out.append(" & ".join(f"\\textbf{{{inline(c)}}}" for c in rows[0]) + " \\\\")
     out.append("\\midrule\\endhead")
     for r in rows[1:]:
-        out.append(" & ".join(inline(c) for c in r) + " \\\\")
+        out.append(" & ".join(camel_breaks(inline(c)) for c in r) + " \\\\")
     out += ["\\bottomrule", "\\end{longtable}", "\\endgroup", ""]
     return "\n".join(out)
 
@@ -655,14 +797,14 @@ def convert_markdown(md: str) -> str:
             body = "\n".join(block).strip()
             body = body[2:-2] if body.startswith("$$") and body.endswith("$$") else body
             eq = fix_math(body.strip())
-            structured = any(
-                tok in eq for tok in (r"\begin{aligned}", r"\begin{split}",
-                                      r"\begin{array}", r"\begin{cases}",
-                                      r"\begin{gathered}", r"\begin{alignedat}", r"\\")
-            )
-            if len(eq) > 118 and not structured:
-                out += [r"\begin{equation*}",
-                        r"\resizebox{\linewidth}{!}{$\displaystyle " + eq + "$}",
+            if boxable_display(eq):
+                # Measured in TeX, not guessed from the source length: only an
+                # equation that really overruns the measure is scaled to fit.
+                # A \tag belongs to the display, not to the box being measured.
+                tag = re.search(r"\\tag\{(?:[^{}]|\{[^{}]*\})*\}", eq)
+                body, tag = (eq[:tag.start()] + eq[tag.end():], tag.group(0)) if tag else (eq, "")
+                out += [r"\begin{equation*}", (r"\shfitdisplay[6em]{" if tag else r"\shfitdisplay{")
+                        + body.rstrip() + "}" + tag,
                         r"\end{equation*}", ""]
             else:
                 out += [r"\begin{equation*}", eq, r"\end{equation*}", ""]
@@ -714,11 +856,15 @@ def convert_markdown(md: str) -> str:
 
         # Lists
         m_ul = re.match(r"^(\s*)[-*+]\s+(.*)$", ln)
-        m_ol = re.match(r"^(\s*)\d+\.\s+(.*)$", ln)
+        m_ol = re.match(r"^(\s*)(\d+)\.\s+(.*)$", ln)
+        # CommonMark: only "1." may interrupt a paragraph, so a wrapped line
+        # that happens to start "10. Total …" is still prose — as on the web.
+        if m_ol and para and not list_stack and m_ol.group(2) != "1":
+            m_ol = None
         if m_ul or m_ol:
             flush_para()
             env = "itemize" if m_ul else "enumerate"
-            body = (m_ul or m_ol).group(2)
+            body = m_ul.group(2) if m_ul else m_ol.group(3)
             if not list_stack:
                 out.append(f"\\begin{{{env}}}")
                 list_stack.append(env)
@@ -761,6 +907,13 @@ def find_component(text: str, start: int):
             return None
         # A component inside a fenced code block is Rust generics, not JSX.
         if text.count("```", 0, m.start()) % 2 == 1:
+            pos = m.end()
+            continue
+        # So is one glued to an identifier — `Path<M>` in an inline code span —
+        # or sitting inside such a span on its line: a JSX tag never is.
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        if (m.start() > 0 and re.match(r"[\w:&]", text[m.start() - 1])) \
+                or text.count("`", line_start, m.start()) % 2 == 1:
             pos = m.end()
             continue
         break
@@ -973,7 +1126,7 @@ def render_component(comp: dict) -> str:
         for r in rows:
             if not isinstance(r, dict):
                 continue
-            sym = fix_math(str(r.get("sym", "")))
+            sym = breakable_math(fix_math(str(r.get("sym", ""))))
             meaning = inline(str(r.get("meaning", "")))
             note = r.get("note")
             if note:

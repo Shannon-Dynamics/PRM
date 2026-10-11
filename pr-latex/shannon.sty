@@ -33,6 +33,9 @@
 \RequirePackage{longtable}
 \RequirePackage{enumitem}
 \RequirePackage{microtype}
+% Long identifiers and inline code would otherwise force overfull lines; a
+% little emergency stretch lets TeX loosen the paragraph instead.
+\setlength{\emergencystretch}{3em}
 \RequirePackage{caption}
 \RequirePackage{listings}
 \RequirePackage{fontawesome5}
@@ -427,9 +430,16 @@
     \vspace{3pt}
     {\fontsize{9.5}{12.5}\selectfont\color{shInkSecondary} #3}\par
     \vspace{5pt}
-    {\fontsize{8}{10}\selectfont\color{shInkMuted}%
-     Run this simulation in the web edition: \texttt{/chapters/\shchapterslug\ \##1}}
+    {\fontsize{8}{10}\selectfont\color{shInkMuted}\raggedright
+     Run this simulation in the web edition:
+     \href{\shwebedition/chapters/\shchapterslug\##1}%
+       {\texttt{\shwebeditionlabel/\allowbreak chapters/\allowbreak\shchapterslug\##1}}\par}
   \end{tcolorbox}}
+
+% Where the web edition is published. A reader holding paper needs the whole
+% address, not a site-relative path; main.tex may \renewcommand both.
+\newcommand{\shwebedition}{https://shannon-dynamics.github.io/PRM}
+\newcommand{\shwebeditionlabel}{shannon-dynamics.github.io/PRM}
 
 \newcommand{\shchapterslug}{}
 \newcommand{\setchapterslug}[1]{\renewcommand{\shchapterslug}{#1}}
@@ -491,7 +501,8 @@
   \begin{minipage}[t]{\dimexpr\linewidth-8pt\relax}
     {\fontsize{9.5}{12}\selectfont
      \color{shInkSecondary}#1\ {\color{shInkMuted}(#2).}\ %
-     {\color{shInk}#3}\ifx\relax#4\relax\else{\color{shInkSecondary}\itshape\ #4}\fi.}%
+     {\color{shInk}#3\ifx\relax#4\relax\else\@addpunct{.}\fi}%
+     \ifx\relax#4\relax\else{\color{shInkSecondary}\itshape\ #4}\fi.}%
     \ifx\relax#5\relax\else\par{\fontsize{8.5}{10.5}\selectfont\color{shInkMuted}#5}\fi
   \end{minipage}}
 
@@ -514,6 +525,36 @@
 \providecommand{\KL}{}\renewcommand{\KL}{\operatorname{KL}}
 \providecommand{\bel}{}\renewcommand{\bel}{\operatorname{bel}}
 \providecommand{\belbar}{}\renewcommand{\belbar}{\overline{\operatorname{bel}}}
+% A one-line display set at natural size, or scaled down to the measure only
+% if it would otherwise run into the margin. The web edition scrolls a wide
+% equation sideways; paper cannot.
+\newsavebox{\shmathbox}
+% The optional argument reserves room beside it, for an equation's \tag.
+\newcommand{\shfitdisplay}[2][0pt]{%
+  \sbox{\shmathbox}{$\displaystyle #2$}%
+  \ifdim\wd\shmathbox>\dimexpr\linewidth-#1\relax
+    \resizebox{\dimexpr\linewidth-#1\relax}{!}{\usebox{\shmathbox}}%
+  \else
+    \usebox{\shmathbox}%
+  \fi}
+
+% Configuration space (Choset) — TOC.md §2, mirrored from katex-macros.ts.
+\providecommand{\W}{}\renewcommand{\W}{\mathcal{W}}
+\providecommand{\WO}{}\renewcommand{\WO}{\mathcal{WO}}
+\providecommand{\Q}{}\renewcommand{\Q}{\mathcal{Q}}
+\providecommand{\QO}{}\renewcommand{\QO}{\mathcal{QO}}
+\providecommand{\Qfree}{}\renewcommand{\Qfree}{\mathcal{Q}_{\mathrm{free}}}
+\providecommand{\Wfree}{}\renewcommand{\Wfree}{\mathcal{W}_{\mathrm{free}}}
+\providecommand{\Rq}{}\renewcommand{\Rq}{R(q)}
+\providecommand{\qstart}{}\renewcommand{\qstart}{q_{\mathrm{start}}}
+\providecommand{\qgoal}{}\renewcommand{\qgoal}{q_{\mathrm{goal}}}
+\providecommand{\dist}{}\renewcommand{\dist}{\operatorname{d}}
+\providecommand{\lie}{}\renewcommand{\lie}[2]{\left[ #1, #2 \right]}
+\providecommand{\Lie}{}\renewcommand{\Lie}{\mathcal{L}}
+\providecommand{\Dist}{}\renewcommand{\Dist}{\Delta}
+\providecommand{\Tq}{}\renewcommand{\Tq}{T_{q}\mathcal{Q}}
+\providecommand{\Sone}{}\renewcommand{\Sone}{S^{1}}
+\providecommand{\Torus}{}\renewcommand{\Torus}[1]{T^{#1}}
 \newcommand{\SOtwo}{\mathrm{SO}(2)}
 \newcommand{\SOthree}{\mathrm{SO}(3)}
 \newcommand{\SEtwo}{\mathrm{SE}(2)}

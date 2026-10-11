@@ -7,12 +7,24 @@ The LaTeX edition of the book, generated from the interactive web edition in
 make          # convert MDX → LaTeX, then build main.pdf
 make convert  # regenerate chapters/*.tex only
 make pdf      # build the PDF from the current chapters/
+make publish  # copy main.pdf to ../../Website/book-pdf/, where shannon.id serves it
 make clean    # remove build artefacts, keep the PDF
 make dist     # remove everything generated, including the PDF
 ```
 
 Requires `pdflatex` with `newpx`, `tcolorbox`, `fontawesome5`, `listings` and
-`microtype` — a full TeX Live or TinyTeX install covers all of it.
+`microtype` — a full TeX Live covers all of it. On this machine it is TinyTeX at
+`~/.TinyTeX` (the Makefile finds it there), plus the packages TinyTeX leaves out:
+
+```sh
+tlmgr install newpx newtx txfonts kastrup fontaxes xstring xkeyval tcolorbox pgf \
+  environ trimspaces fontawesome5 listings listingsutf8 microtype titlesec enumitem \
+  fancyhdr caption booktabs colortbl mathtools helvetic bera tools etoolbox pdfcol \
+  tikzfill psnfss iftex xpatch carlisle oberdiek tex-gyre
+```
+
+A clean build reports no LaTeX errors, no undefined references, and no overfull
+box wider than about a point (`grep '^Overfull' build/pass3.log`); keep it so.
 
 ## How it works
 
@@ -31,7 +43,7 @@ of truth for content; the script projects it onto the print design system:
 | `<KeyIdea>` / `<Callout>` | insight and note callouts |
 | ` ```rust ` fences | captioned `shrust` listing with line numbers |
 | `$…$`, `$$…$$` | passed through — it is already LaTeX |
-| `\htmlClass{term-prior}{…}` | `\prior{…}`, so equation tinting survives into ink |
+| `\htmlClass{term-path}{…}` | `\pathterm{…}`, so equation tinting survives into ink |
 | a widget component | a described figure carrying the widget's id and teaching point |
 
 **Widget descriptions are read out of the React source**, not maintained
@@ -48,19 +60,28 @@ substitutes under pdfLaTeX), a Palatino-class serif for long-form reading, the
 slate neutral scale, and teal as the single chrome accent. Flat card-like blocks
 with a coloured leading rule; no gradients, no shadows.
 
-This volume adds what a book about estimation needs:
+This volume adds what a book about motion planning needs:
 
-- **The estimation palette** — `\prior`, `\prediction`, `\measurement`,
-  `\posterior`, `\truthterm`, deepened from the screen values for ink. These are
-  reserved for data and never used for chrome, so blue always means prior and
-  purple always means posterior, in the prose, in the equations and in the
-  figures alike. `\shcolorkey` prints the legend.
-- **The book's math macros** — `\bel`, `\belbar`, `\SEtwo`, `\bplus`, `\Normal`
-  and the rest, ported from `../web/lib/katex-macros.ts` so both editions render
-  identical mathematics from identical source.
+- **The planning palette** — `\startterm`, `\goalterm`, `\obstacleterm`,
+  `\cobstacleterm`, `\graphterm`, `\pathterm`, `\robotterm` (TOC.md §2),
+  deepened from the screen values for ink. Green is always the start, red the
+  goal, amber the C-obstacle, blue what a planner explored, purple the path it
+  chose, orange the robot — in the prose, the equations and the figures alike.
+  `\shplanningkey` prints the legend. The sister volume's estimation palette
+  (`\prior` … `\truthterm`, `\shcolorkey`) is kept for the belief chapters.
+- **The book's math macros** — `\Q`, `\QO`, `\Qfree`, `\qstart`, `\lie`,
+  `\SEtwo`, `\bel` and the rest, mirrored from `../web/lib/katex-macros.ts` so
+  both editions render identical mathematics from identical source. Add a macro
+  there and here together.
+- **`\shfitdisplay`** — the web edition scrolls a wide equation sideways; paper
+  cannot, so a one-line display is measured and scaled to the measure only if it
+  would overrun it.
 - **`shderivation`**, the print form of the web edition's collapsible algebra.
 - **`shalgorithm`**, numbered pseudocode in the style of Choset's algorithm boxes.
 - **`shnotation`**, the per-chapter symbol table.
+- **Widget cards** print the full address of each simulation in the web edition
+  (`\shwebedition`, set to the GitHub Pages site; change it there if the book
+  moves to its own domain).
 
 ## Editing
 

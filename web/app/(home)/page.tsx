@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { HeroPlanner } from '@/components/home/hero-planner';
 import { PARTS } from '@/lib/book-structure';
 import { PageBanner, bookCrumb } from '@/components/shannon/page-banner';
+import { BOOK_PDF } from '@/lib/shannon';
 
 /** Build-time check: which chapters have been written so far. */
 const isWritten = (slug: string) =>
@@ -48,6 +49,9 @@ export default function HomePage() {
               <Link href="/chapters/ch04-configuration-space-i" className="sd-btn">
                 Jump to configuration space
               </Link>
+              <a className="sd-btn" href={BOOK_PDF} target="_blank" rel="noopener">
+                Download PDF <span aria-hidden="true">↓</span>
+              </a>
             </div>
           </div>
 
