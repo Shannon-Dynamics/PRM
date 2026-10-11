@@ -9,6 +9,7 @@ export const metadata: Metadata = {
   title: 'Notation',
   description:
     'Every symbol used in Principles of Robot Motion via Rust, following Choset et al., extended where the modern planning literature demands it.',
+  alternates: { canonical: '/notation/' },
 };
 
 export default function NotationPage() {

@@ -15,6 +15,7 @@ import { RootProvider } from 'fumadocs-ui/provider/next';
 import { SiteFooter } from '@/components/shannon/site-footer';
 
 export const metadata: Metadata = {
+  metadataBase: new URL('https://prm.shannon.id'),
   title: {
     default: 'Principles of Robot Motion via Rust',
     template: '%s · Principles of Robot Motion via Rust',
