@@ -213,7 +213,7 @@ readout under the ellipse. Every widget autoplays a seeded default and degrades 
 ## 5. Practical (P) — Rust Implementation
 
 **Crates:** `nalgebra` 0.35 (`SMatrix`/`SVector`; `DMatrix` only for the observability matrix,
-whose row count $np$ is not a const expression), `rand` 0.9 (`Pcg64`), the Ch. 2 ports `sim`,
+whose row count $np$ is not a const expression), `rand_pcg` 0.9 (`Pcg64`), the Ch. 2 ports `sim`,
 `geom`, `prob`, and the sister book's filter crates vendored unchanged as the `filters` port (this
 chapter extends Ch. 2's port list): `Kf<N, U, M>` (its Ch. 6), `Ekf` + `MotionModel` /
 `MeasurementModel` (its Ch. 7), `EkfLocalizer`/`ml_associate` (its Ch. 11), `EkfSlam` (its Ch. 14).

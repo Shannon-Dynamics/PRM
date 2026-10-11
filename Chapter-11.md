@@ -204,7 +204,7 @@ w11.2 half-width beside the expansiveness definitions in F (its $w/W$ readout po
 
 ## 5. Practical (P) — Rust Implementation
 
-**Crates:** `nalgebra` 0.35 (`SVector<f64, D>` chart coordinates), `parry2d` 0.30 only through the
+**Crates:** `nalgebra` 0.35 (`DVector<f64>` chart coordinates), `parry2d` 0.30 only through the
 Ch. 2 `collide` crate, `petgraph` 0.8 (`UnGraph` roadmap, `UnionFind`), `rand` 0.9 (`SmallRng`;
 `rand_distr::Normal` for the Gaussian sampler), `kiddo` as a *candidate* cross-check for flat
 $\mathbb{R}^d$ in tests only (verify WASM and metric hooks; the book's tree is hand-rolled because
@@ -242,7 +242,7 @@ pub struct Uniform;  pub struct Gaussian { pub sigma: f64 }  pub struct Bridge {
 /// The metric stays Manifold::dist — the chart only decides how to split and prune.
 pub trait Chart: Manifold {
     const D: usize;
-    fn coords(&self, q: &Self::Point) -> nalgebra::SVector<f64, { Self::D }>;
+    fn coords(&self, q: &Self::Point) -> nalgebra::DVector<f64>;   // not SVector<f64, {Self::D}>: unstable
     fn period(&self, axis: usize) -> Option<f64>;
 }
 pub trait NearestNeighbors<M: Manifold> {

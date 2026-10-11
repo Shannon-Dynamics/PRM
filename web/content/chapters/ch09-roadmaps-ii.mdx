@@ -968,7 +968,7 @@ fn main() {
         let (tw, gamma) = tracer.trace_step(&nearest(q, &sites), heading).unwrap();
         assert!(gamma <= prev + 1e-12, "Γ must not increase");
         prev = gamma;
-        q += 0.05 * tw.v;
+        q += tw.v * 0.05;
     }
     println!("200 steps of dt = 0.05: Gamma monotone, |x - 2| < 1e-3: {}", (q.x - 2.0).abs() < 1e-3);
 }

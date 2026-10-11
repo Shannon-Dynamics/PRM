@@ -630,7 +630,7 @@ pub use filters::nonparametric::{HistogramFilter, ParticleFilter, ParticleSet, l
 pub use filters::localize::{GridLocalizer, Mcl, AugmentedMcl};
 pub use filters::occgrid::OccGrid;
 use search::{Lattice, CellIdx};   // the Chapter 6 grid and its moves
-use rand::rngs::Pcg64;
+use rand_pcg::Pcg64;
 
 /// What a planner needs from any posterior: weighted samples on the planning
 /// lattice plus the two statistics Choset discusses (§9.1.4). Implemented for the

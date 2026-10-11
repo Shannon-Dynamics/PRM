@@ -454,6 +454,25 @@ struct Cell { x: i32, y: i32 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Dir { E, S, W, N }
 
+/// The index into STEP back to a heading: 0 → E, 1 → S, 2 → W, 3 → N.
+impl From<usize> for Dir {
+    fn from(i: usize) -> Dir { [Dir::E, Dir::S, Dir::W, Dir::N][i % 4] }
+}
+
+impl Dir {
+    fn right(self) -> Dir { Dir::from(self as usize + 1) }
+    fn left(self) -> Dir { Dir::from(self as usize + 3) }
+    fn back(self) -> Dir { Dir::from(self as usize + 2) }
+}
+
+impl Cell {
+    /// One unit move; STEP is defined with the behaviors below.
+    fn step(self, d: Dir) -> Cell {
+        let (dx, dy) = STEP[d as usize];
+        Cell { x: self.x + dx, y: self.y + dy }
+    }
+}
+
 impl TextWorld {
     /// The contact sensor: is the cell blocked — or outside the bounded workspace?
     /// Choset assumes W is bounded; here the border is simply a wall the sensor feels.
@@ -561,6 +580,17 @@ fn bug1(w: &TextWorld, start: Cell, goal: Cell) -> (Outcome, Vec<usize>) {
     (Outcome::Reached(path), perimeters)
 }
 
+/// The map with the executed path marked `·`, and S and G on top.
+fn render(w: &TextWorld, s: Cell, g: Cell, path: &[Cell]) -> String {
+    let mut rows: Vec<Vec<char>> = w.rows.iter()
+        .map(|r| r.iter().map(|&b| if b == b'#' { '#' } else { '.' }).collect())
+        .collect();
+    for c in path { rows[c.y as usize][c.x as usize] = '·'; }
+    rows[s.y as usize][s.x as usize] = 'S';
+    rows[g.y as usize][g.x as usize] = 'G';
+    rows.iter().map(|r| r.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+}
+
 const WORLD: &str = "\
 .........
 ...###...
@@ -584,16 +614,17 @@ fn main() {
 ```
 
 ```text
-·········
-··#·###··
+..·····..
+..·###·..
 S··###··G
-···###···
-·········
+..·###·..
+..·····..
 steps: 28  straight-line: 8  bound d + 1.5·Σp: 32
 ```
 
-(The rendering marks the executed path with `·`; the full program also marks `H` at $(2, 2)$ and `L`
-at $(6, 2)$.) The tests lock the number, and lock the failure mode:
+(The rendering marks the executed path with `·`: out along row 2, once around the block, then the
+shorter way back to the leave point. The Bug Preview above also marks the hit point `H` at $(2, 2)$
+and the leave point `L` at $(6, 2)$.) The tests lock the number, and lock the failure mode:
 
 ```rust title="crates/ch01_hello/tests/worked_example.rs"
 #[test]
@@ -613,9 +644,11 @@ fn unreachable_is_detected() {
     assert_eq!(perimeters.len(), 1, "one circumnavigation, then give up");
 }
 
+/// Exercise 6: implement `bug2`, then `cargo test --features exercise-bug2`.
+#[cfg(feature = "exercise-bug2")]
 #[test]
 fn bug2_text_world() {
-    // Chapter 3 fills in bug2; the expected count on this world is 12.
+    // Chapter 3 derives Bug2 properly; the expected count on this world is 12.
     let (w, s, g) = TextWorld::parse(WORLD);
     assert_eq!(bug2(&w, s, g).len() - 1, 12);
 }
@@ -726,7 +759,8 @@ above opened: three robots, one planning stack, running live.
   <Exercise level="P" difficulty={3} title="Bug2, and a world where it loses">
     Implement Bug2 in `ch01_hello` by changing only the exit condition of boundary following: leave
     when back on the fixed m-line, closer to the goal than the hit point, and able to step toward
-    it. Make `bug2_text_world` pass with 12. Then construct a text world where Bug2's count exceeds
+    it. Make `bug2_text_world` pass with 12 — it compiles only when you ask for it, with
+    `cargo test --features exercise-bug2`. Then construct a text world where Bug2's count exceeds
     Bug1's. The comb preset in the Bug Preview is one answer — a hook whose nearest-to-goal point
     sits high above the m-line, so that Bug1 leaves from there on a fresh line over a row of teeth
     that Bug2, welded to the m-line, must climb one by one. You have just drawn Choset's figure 2.4.

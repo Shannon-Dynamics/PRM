@@ -183,7 +183,7 @@ canvases stack.
 **This section is the book's architectural contract.** Later chapters add crates and modules but
 never restructure what is fixed here.
 
-**Crates:** `nalgebra` 0.35 (`Point2`, `Isometry2`); `parry2d` 0.30 as `parry2d-f64` (shapes, `Qbvh`,
+**Crates:** `nalgebra` 0.35 (`Point2`, `Isometry2`); `parry2d` 0.30 as `parry2d-f64` (shapes, `Bvh`,
 `query::{distance, closest_points, intersection_test, cast_shapes}`; WASM-clean, no `rayon`); `rand`
 0.9 with `SmallRng` (seeded streams; `Pcg64` where a long period matters); `serde` 1 for `Log`. Geometry
 is the one thing this book does not hand-roll — Ch. 4 explains it, Appendix C documents it.
@@ -192,7 +192,9 @@ is the one thing this book does not hand-roll — Ch. 4 explains it, Appendix C 
 
 ```text
 crates/
-  core/          # PORTED: prob (Rng = seeded SmallRng wrapper), geom (Pose2 = SE(2)), edt
+  prob/          # PORTED: Rng = seeded SmallRng wrapper
+  geom/          # PORTED: Pose2 = SE(2)
+  edt/           # PORTED: exact Euclidean distance transform
   sim/           # PORTED: World (Apartment), Rusty (diff-drive step, encoders), ray cast
   robots/        # THIS CHAPTER: Reach<N> (FK), Hitch (car + trailer), Workbench, Lot scenes
   collide/       # THIS CHAPTER: trait Collision over parry2d; Footprint; Scene; RangeSensor
@@ -212,12 +214,13 @@ worlds.ts}` and `web/lib/collide/{footprint.ts, scene.ts, sensor.ts}` as mirrors
 **Key types & signatures** (the API later chapters program against):
 
 ```rust
-// crates/core — PORTED. Names are the sister book's; do not redesign.
+// crates/prob, crates/geom — PORTED. Names are the sister book's; do not redesign.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose2 { pub x: f64, pub y: f64, pub theta: f64 }        // SE(2); compose/inverse/exp/log
 pub struct Rng(rand::rngs::SmallRng);                             // seeded; split() for substreams
 pub mod edt { pub fn exact_distance_field(/* rasterized walls */) -> DistanceField; }
 
-// crates/sim — PORTED. World is the Apartment's polyline walls + Qbvh; Rusty is the rover.
+// crates/sim — PORTED. World is the Apartment's polyline walls + Bvh; Rusty is the rover.
 pub struct World { pub walls: Vec<Segment>, pub bounds: Aabb, /* bvh */ }
 impl World { pub fn apartment() -> Self; pub fn raycast(&self, o: Point2<f64>, angle: f64, max: f64) -> Hit; }
 pub struct Rusty { pub pose: Pose2, pub params: RobotParams /* body_radius 0.11 m */ }
@@ -254,7 +257,7 @@ impl Hitch {
 
 // crates/collide — R(q) as data; the three worlds speak one language; THE black box.
 pub struct Footprint { pub parts: Vec<(Isometry2<f64>, parry2d::shape::SharedShape)> }
-pub struct Scene { obstacles: Vec<Obstacle /* name, SharedShape, Isometry2 */>, bvh: Qbvh<u32>, pub bounds: Aabb }
+pub struct Scene { obstacles: Vec<Obstacle /* name, SharedShape, Isometry2 */>, bvh: Bvh, pub bounds: Aabb }
 impl Scene {
     pub fn from_world(w: &World) -> Self;     // Apartment walls become thin segment obstacles
     pub fn workbench() -> Self;               // table with the block, the post, the shelf

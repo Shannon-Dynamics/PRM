@@ -249,7 +249,8 @@ pub fn plan(d: &Decomposition, q_s: Point2<f64>, q_g: Point2<f64>) -> Option<Vec
 // src/morse.rs — C §6.2
 pub trait SliceFn { fn h(&self, q: Point2<f64>) -> f64; fn grad_h(&self, q: Point2<f64>) -> nalgebra::Vector2<f64>; }
 pub struct Vertical; pub struct Radial { pub center: Point2<f64> } pub struct Squarel { pub center: Point2<f64> }
-pub struct CriticalPoint { pub q: Point2<f64>, pub kind: Split /* 1→2 */ | Merge /* 2→1 */ | Birth | Death }
+pub enum CriticalKind { Split /* 1→2 */, Merge /* 2→1 */, Birth, Death }
+pub struct CriticalPoint { pub q: Point2<f64>, pub kind: CriticalKind }
 pub fn boustrophedon(world: &PolyWorld, h: &dyn SliceFn) -> (Decomposition, Vec<CriticalPoint>);
 // src/reeb.rs — C §6.2.4
 pub struct ReebGraph { pub graph: UnGraph<CriticalPoint, usize /* cell id */> }

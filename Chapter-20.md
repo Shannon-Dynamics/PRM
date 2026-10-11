@@ -226,7 +226,7 @@ prose. Derivation 1's four-term equation sits in a sticky panel lit term by term
 
 ## 5. Practical (P) — Rust Implementation
 
-**Crates:** `nalgebra` 0.35 (`SVector`, `SMatrix`, SVD rank with tolerance), `rand` 0.9 (`Pcg64`;
+**Crates:** `nalgebra` 0.35 (`SVector`, `SMatrix`, SVD rank with tolerance), `rand_pcg` 0.9 (`Pcg64`;
 only the reachable-set sampler and the hook target are stochastic), `robots` (Ch. 2 Hitch, the Lot),
 `dynamics` (Ch. 17 `Model`, `Pfaffian`), `manifold` (Ch. 5 `SE2`, `S1` wrap), `collide` (Ch. 2, lab
 only). Brackets, filtrations and symmetric products are hand-rolled, per the book's policy.

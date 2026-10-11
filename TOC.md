@@ -143,10 +143,10 @@ A later chapter must not re-introduce these. On the web side the same rule appli
 | Layer | Primary | Notes / alternates |
 |---|---|---|
 | Linear algebra | `nalgebra` 0.35 | `SMatrix`/`SVector` for configurations, Jacobians, inertia matrices; WASM-clean |
-| Collision & distance | `parry2d` 0.30 (`parry2d-f64`), `parry3d` for the one 3D showpiece | GJK/EPA, BVH, shape-cast for swept edges. **The one thing this book does not hand-roll** — Ch. 4 explains what it does, App. C documents it |
+| Collision & distance | `parry2d` 0.30 (`parry2d-f64`), `parry3d` for the one 3D showpiece | GJK/EPA, BVH, shape-cast for swept edges. **The one thing this book does not hand-roll** — Ch. 4 explains what it does, App. C documents it; parry ≥ 0.26 does its math in glam (`glamx`), so `collide` converts poses and points to and from nalgebra at its boundary, and no other crate sees a parry type |
 | Dynamics cross-check | `rapier2d` | tests only: our hand-rolled Lagrangian for Reach must match the engine |
 | Graphs & search | `petgraph` 0.8, `pathfinding` 4.15 | roadmaps and lattices; `pathfinding` cross-checks our hand-rolled A\*/Dijkstra |
-| Randomness | `rand` 0.9 (`SmallRng`/`Pcg64`) | seeded everywhere; never `thread_rng()` |
+| Randomness | `rand` 0.9 (`SmallRng`), `rand_pcg` 0.9 (`Pcg64`), `rand_distr` 0.5 | seeded everywhere; never `thread_rng()`. `Pcg64` lives in `rand_pcg`, not `rand::rngs`; `rand_distr` 0.5 is the release built on `rand` 0.9 |
 | Nearest neighbors | `kiddo` (or hand-rolled kd-tree in Ch. 11) | needed in $T^2$, $SE(2)$, $\mathbb{R}^d$ with custom metrics — verify the crate's metric hooks; hand-roll if they are missing |
 | Arm kinematics cross-check | `k`, `urdf-rs` | Reach's FK/Jacobian validated against a URDF model |
 | Optimization | hand-rolled GN/LM + iLQR; `argmin` as the comparison library | Ch. 19 trajectory optimization, Ch. 21 nonlinear steering |

@@ -671,6 +671,17 @@ pub trait VectorField<const N: usize> {
     }
 }
 
+/// A borrowed or boxed field is still a field, so `Bracket(&g1, &g2)` needs no clones
+/// and the filtration can bracket `Box<dyn VectorField<N>>` generators.
+impl<const N: usize, F: VectorField<N> + ?Sized> VectorField<N> for &F {
+    fn eval(&self, x: &SVector<f64, N>) -> SVector<f64, N> { (**self).eval(x) }
+    fn jacobian(&self, x: &SVector<f64, N>) -> SMatrix<f64, N, N> { (**self).jacobian(x) }
+}
+impl<const N: usize, F: VectorField<N> + ?Sized> VectorField<N> for Box<F> {
+    fn eval(&self, x: &SVector<f64, N>) -> SVector<f64, N> { (**self).eval(x) }
+    fn jacobian(&self, x: &SVector<f64, N>) -> SMatrix<f64, N, N> { (**self).jacobian(x) }
+}
+
 /// ∂f/∂x by the 5-point stencil (f(x−2h) − 8f(x−h) + 8f(x+h) − f(x+2h)) / 12h, per column.
 pub fn central_difference<const N: usize>(
     f: impl Fn(&SVector<f64, N>) -> SVector<f64, N>,

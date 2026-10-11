@@ -286,12 +286,12 @@ pub fn car_grid_search<C: CarModel>(car: &C, q_start: &C::Config, goal: &GoalReg
 pub trait Propagate {
     type State; type Control;
     fn propagate(&self, x: &Self::State, u: &Self::Control, dt: f64) -> Self::State;  // RK4 inside
-    fn sample_control(&self, rng: &mut rand::rngs::Pcg64) -> Self::Control;
+    fn sample_control(&self, rng: &mut rand_pcg::Pcg64) -> Self::Control;
 }
 pub struct KinoRrt<P: Propagate> { pub sys: P, pub controls_per_extend: usize, pub dt: f64 /* … */ }
 impl<P: Propagate> KinoRrt<P> {
     pub fn plan(&mut self, x_start: P::State, goal: &dyn Fn(&P::State) -> bool, n: usize,
-                metric: &dyn Fn(&P::State, &P::State) -> f64, rng: &mut rand::rngs::Pcg64) -> Option<Trajectory<P>>;
+                metric: &dyn Fn(&P::State, &P::State) -> f64, rng: &mut rand_pcg::Pcg64) -> Option<Trajectory<P>>;
 }
 // KinoRrtStar<P: Propagate + Linearize> adds Webb & van den Berg's (verify) LQR edges to RRT*.
 

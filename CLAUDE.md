@@ -72,7 +72,16 @@ other, and make sure the chapter's worked numeric example still holds in both.
   bare `{…}` in prose is a JavaScript expression, and a `$…$` span broken across a line that starts
   with `+`/`-`/`*` becomes a list item, so its braces leak. `ALLOW_MISSING=1 npm run check:book`
   tolerates chapters not yet written; `npm run build` regenerates the sidebar from the files present.
-- Rust versions for printed listings: the crate table in `TOC.md §2`.
+- Rust versions for printed listings: the crate table in `TOC.md §2`, made executable in
+  `tools/rust-snippets/harness/Cargo.toml` — change both together.
+- **Rust listings are compiler-checked:** `tools/rust-snippets/check.sh` (or `cd web && npm run
+  check:rust`) parses every ```rust block in the chapters and design docs, type-checks each against
+  the real crate stack with the other listings of its file as context, runs self-contained programs
+  and compares their output with the ```text block the book prints. Run it after editing any
+  listing; it must say `RESULT: PASS`. Conventions it understands: an elided body is `{ /* … */ }`,
+  an API line is `fn sig;`, a partial `impl`/struct carries a `/* … */` comment. Write the `use`
+  line for every external name — an unimported name cannot be checked. Deliberate compile errors
+  go in `tools/rust-snippets/accepted.toml` with a reason. See `tools/rust-snippets/README.md`.
 
 ## Non-negotiable conventions
 

@@ -569,7 +569,7 @@ pub struct Rrt<M: Chart, S: Extend<M>, Smp: Sampler<M>> {
 impl<M: Chart, S: Extend<M>, Smp: Sampler<M>> Rrt<M, S, Smp> {
     /// Choset Alg. 11 driven by the sampler; returns the status so callers can count Trapped.
     pub fn extend_once(&mut self, free: &dyn FreeSpace<M>, goal: &M::Point) -> ExtendStatus<M::Point> {
-        let q_rand = if self.rng.gen::<f64>() < self.bias.p { goal.clone() }
+        let q_rand = if self.rng.random::<f64>() < self.bias.p { goal.clone() }
                      else { match self.sampler.sample(&self.tree.space, free, &mut self.rng) {
                          Some(q) => q, None => return ExtendStatus::Trapped } };
         let (near, _) = self.tree.nearest(&q_rand);

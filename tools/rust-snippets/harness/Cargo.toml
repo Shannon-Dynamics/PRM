@@ -1,0 +1,23 @@
+# The crate stack the book's Rust listings are checked against.
+#
+# This is TOC.md §2 made executable. Every listing in the book is compiled as
+# its own crate (generated under gen/, one per snippet) depending on exactly
+# the crates below. When the book changes a crate or a version, change it here
+# too and rerun the checker.
+[workspace]
+members = ["gen/*"]
+resolver = "3"
+
+[workspace.dependencies]
+nalgebra = "0.35"
+rand = { version = "0.9", features = ["small_rng"] }
+rand_distr = "0.5"        # 0.5 is the release built on rand 0.9
+rand_pcg = "0.9"          # Pcg64 lives here, not in rand::rngs
+# The book uses the f64 build of parry under its usual name (TOC.md §2).
+parry2d = { package = "parry2d-f64", version = "0.30" }
+petgraph = "0.8"
+pathfinding = "4.15"
+ordered-float = "5"
+proptest = "1"
+candle-core = "0.11"
+candle-nn = "0.11"

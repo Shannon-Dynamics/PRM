@@ -617,9 +617,11 @@ pub struct Scripted<P> { list: Vec<P>, i: usize, require_free: bool }
 
 /// Coordinates for kd-tree splitting; `period(axis)` is Some(2π) on S¹ factors.
 /// The metric stays Manifold::dist — the chart only decides how to split and prune.
+/// `DVector`, not `SVector<f64, { Self::D }>`: stable Rust cannot size an array with an
+/// associated const inside generic code (that needs the unstable `generic_const_exprs`).
 pub trait Chart: Manifold {
     const D: usize;
-    fn coords(&self, q: &Self::Point) -> nalgebra::SVector<f64, { Self::D }>;
+    fn coords(&self, q: &Self::Point) -> nalgebra::DVector<f64>;
     fn period(&self, axis: usize) -> Option<f64>;
 }
 pub trait NearestNeighbors<M: Manifold> {
@@ -651,10 +653,10 @@ pruning bound is the one place the periodicity must be exact.
 /// its point set one node at a time.
 pub struct KdTree<M: Chart> {
     root: Option<Box<Node<M>>>,
-    weights: SVector<f64, { M::D }>,     // per-axis scale so the bound never exceeds dist
+    weights: DVector<f64>,               // per-axis scale so the bound never exceeds dist
     space: M,
 }
-struct Node<M: Chart> { idx: usize, c: SVector<f64, { M::D }>, axis: usize,
+struct Node<M: Chart> { idx: usize, c: DVector<f64>, axis: usize,
                         left: Option<Box<Node<M>>>, right: Option<Box<Node<M>>> }
 
 impl<M: Chart> KdTree<M> {
@@ -673,7 +675,7 @@ impl<M: Chart> KdTree<M> {
     /// √Σ (wᵢ·gapᵢ)²: the distance from a query to a box, with the circular gap on a
     /// periodic axis — min(|c − s|, T − |c − s|) — so a subtree touching the seam is
     /// never pruned away from a query on the other side of it.
-    fn lower_bound(&self, qc: &SVector<f64, { M::D }>, lo: &[f64], hi: &[f64]) -> f64 {
+    fn lower_bound(&self, qc: &DVector<f64>, lo: &[f64], hi: &[f64]) -> f64 {
         let mut s = 0.0;
         for i in 0..M::D {
             let c = qc[i];

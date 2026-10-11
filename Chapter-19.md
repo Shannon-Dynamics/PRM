@@ -218,7 +218,7 @@ the MPC subsection; f19.4 closes the chapter.
 **Crates:** `nalgebra` 0.35 (`SVector`/`SMatrix` states; $A^{-1}$ hand-rolled as a block-tridiagonal
 Thomas sweep), `potential` (Ch. 7 — `DistanceField`, grid distance transform), `robots` + `cspace`
 (Chs. 2/4 — body-point Jacobians), `dynamics` (Ch. 17), `trajectory` (Ch. 18 — `CubicSpline`,
-`time_scale`), `rand` 0.9 (`Pcg64` for STOMP), `argmin` — **comparison only**: its L-BFGS and
+`time_scale`), `rand_pcg` 0.9 (`Pcg64` for STOMP), `argmin` — **comparison only**: its L-BFGS and
 Gauss–Newton must reach the same stationary points as ours in tests; `widget-kit`, `plotters`.
 
 **Module plan:**

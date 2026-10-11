@@ -1,0 +1,16 @@
+# Findings that are not defects, each with the reason it is accepted.
+#
+# The checker reports every rustc error in a listing that is not merely "this name lives in
+# another chapter's crate". Some are intentional — the book's deliberate compile-error listings
+# (e.g. Chapter 5's `mix_spaces.rs`, which must NOT compile) — and belong here. An entry that
+# stops matching anything is reported as stale, so this list cannot rot.
+#
+# [[accept]]
+# file = "ch05-configuration-space-ii.mdx"   # file name, or a suffix of its path
+# title = "crates/manifold/tests/ui/mix_spaces.rs (checked by trybuild: must NOT compile)"
+# # index = 5                                # instead of title, for an untitled block (1-based)
+# code = "E0308"                             # rustc code, or "syntax", "output", "run"
+# contains = "expected `T2`"                 # optional: a substring of the message
+# reason = "Deliberate: the listing shows the compile error that mixing T² and SE(2) produces."
+#
+# Today there are no accepted findings: every listing type-checks.

@@ -216,7 +216,7 @@ distance readout at right; w5.3 and w5.4 half-width beside §3.4.2 and §3.5.1; 
 ## 5. Practical (P) — Rust Implementation
 
 **Crates:** `nalgebra` 0.35 (`UnitQuaternion`, `UnitComplex`, `SVector`); `rand` 0.9 `SmallRng` through
-the ported `Rng` for `sample`; `core::geom::Pose2` (ported $SE(2)$, Ch. 2) — `Manifold` is implemented
+the ported `Rng` for `sample`; `geom::Pose2` (ported $SE(2)$, Ch. 2) — `Manifold` is implemented
 *for* it, the type is not redefined; `cspace` (Ch. 4) for the integration lab; `proptest` and `trybuild` (dev).
 
 **Module plan:** `crates/manifold/src/{lib.rs, s1.rs, torus.rs, se2.rs, so3.rs, product.rs}`;
@@ -226,7 +226,8 @@ mirror: `web/lib/manifold/{s1.ts, torus.ts, se2.ts, so3.ts}`, pinned in `__check
 **Key types & signatures:**
 
 ```rust
-use core::{geom::Pose2, prob::Rng};
+use geom::Pose2;
+use prob::Rng;
 use nalgebra::{SVector, UnitQuaternion};
 
 /// THE OWNED ARTIFACT. Every planner from Ch. 6 on is generic over this trait and never
@@ -302,7 +303,7 @@ visible: $k$ components on the square, $k' \le k$ on the torus, the seam-crossin
 | w5.1 | Torus Unwrapper | interactive animation | `manifold::Torus` + `cspace::raster` (Ch. 4); `web/lib/manifold/torus.ts` | fold slider; drag path ends; naive-vs-`dist` toggle; joint limits | the square is a chart; seams are artifacts; limits change topology |
 | w5.2 | Rotation Zoo | interactive animation | `manifold::So3`; `web/lib/manifold/so3.ts` | scrubber; steer through $R_{33}=1$; convention picker | gimbal lock is a missing chart; quaternions stay smooth |
 | w5.3 | Atlas of the Circle | interactive animation | `manifold::S1`; `web/lib/manifold/s1.ts` | drag point; two- vs four-chart atlas; single-chart attempt | charts, overlaps, transition maps, cover |
-| w5.4 | Frame Composer | interactive animation | `core::geom::Pose2` (ported) + `manifold::Se2` | drag frames; body/world toggle; show matrices | $T_{AB}T_{BC} = T_{AC}$; frame change vs. displacement; non-commutativity |
+| w5.4 | Frame Composer | interactive animation | `geom::Pose2` (ported) + `manifold::Se2` | drag frames; body/world toggle; show matrices | $T_{AB}T_{BC} = T_{AC}$; frame change vs. displacement; non-commutativity |
 | — | Folding hook | animation (autoplay) | `web/lib/manifold/torus.ts` | none | two path pieces are one curve (chapter hook) |
 
 ## 7. Exercises & Extensions

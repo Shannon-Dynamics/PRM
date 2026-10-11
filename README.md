@@ -27,6 +27,7 @@ npm run build        # static export of all 23 chapters to web/out
 npm run preview      # serve the built book (compressed, like GitHub Pages)
 npm run check        # numerical invariants of every landed algorithm module
 npm run smoke        # compile + server-render every chapter in seconds
+npm run check:rust   # compile every Rust listing against the real crate stack (tools/rust-snippets)
 npm run verify       # everything above, strictly, then the build
 ```
 

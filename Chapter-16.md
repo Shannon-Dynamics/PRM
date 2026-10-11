@@ -226,7 +226,7 @@ histogram cache of §9.1.5, `fit_ml`); `odometry.rs` (the $(\alpha, \beta, d)$ i
 pub use filters::nonparametric::{HistogramFilter, ParticleFilter, ParticleSet, low_variance_resample};
 pub use filters::localize::{GridLocalizer, Mcl, AugmentedMcl};
 pub use filters::occgrid::OccGrid;
-use search::{Lattice, CellIdx, Action};  use rand::rngs::Pcg64;   // Ch. 6 grid and its moves
+use search::{Lattice, CellIdx, Action};  use rand_pcg::Pcg64;   // Ch. 6 grid and its moves
 
 /// What a planner needs from any posterior: weighted samples on the planning lattice plus the two
 /// statistics Choset discusses. Implemented for the grid belief, the particle set, and the Ch. 15

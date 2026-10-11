@@ -497,13 +497,15 @@ This section is the book's architectural contract. Later chapters add crates; no
 is fixed here.
 
 **Crates.** `nalgebra` 0.35 for `Point2` and `Isometry2`; `parry2d` 0.30 as `parry2d-f64` for
-shapes, the `Qbvh` broad phase, and `query::{distance, closest_points, intersection_test,
+shapes, the `Bvh` broad phase, and `query::{distance, closest_points, intersection_test,
 cast_shapes}` — WASM-clean, no `rayon`; `rand` 0.9 with `SmallRng` for seeded streams; `serde` for
 the replay log. Geometry is the one thing this book does not hand-roll.
 
 ```text
 crates/
-  core/          # PORTED: prob (Rng = seeded SmallRng wrapper), geom (Pose2 = SE(2)), edt
+  prob/          # PORTED: Rng = seeded SmallRng wrapper
+  geom/          # PORTED: Pose2 = SE(2)
+  edt/           # PORTED: exact Euclidean distance transform
   sim/           # PORTED: World (Apartment), Rusty (diff-drive step, encoders), ray cast
   robots/        # THIS CHAPTER: Reach<N> (FK, IK), Hitch (car + trailer), Workbench, Lot
   collide/       # THIS CHAPTER: trait Collision over parry2d; Footprint; Scene; RangeSensor
@@ -639,7 +641,9 @@ impl Hitch {
 
 ### The black box
 
-```rust title="crates/collide/src/collision.rs" {22-47}
+```rust title="crates/collide/src/collision.rs" {28-77}
+use nalgebra::{Isometry2, Point2};
+use parry2d::math::{Pose, Vector};
 use parry2d::query::{self, ClosestPoints, ShapeCastOptions};
 
 pub struct Witness { pub on_robot: Point2<f64>, pub on_obstacle: Point2<f64>, pub dist: f64 }
@@ -654,28 +658,48 @@ pub trait Collision {
     fn swept(&self, fp_a: &Footprint, fp_b: &Footprint) -> bool;
 }
 
-/// Walls as thin segments, obstacles as convex polygons, all under one Qbvh.
-pub struct Scene { obstacles: Vec<Obstacle>, bvh: Qbvh<u32>, pub bounds: Aabb }
+/// Walls as thin segments, obstacles as convex polygons, all under one Bvh. Obstacles are
+/// stored in parry's own types; only the robot's footprint arrives in nalgebra's.
+pub struct Scene { obstacles: Vec<Obstacle>, bvh: Bvh, pub bounds: Aabb }
+
+/// parry ≥ 0.26 does its math in glam; the rest of the workspace speaks nalgebra.
+/// The two meet here and nowhere else.
+fn to_parry(p: &Isometry2<f64>) -> Pose {
+    Pose::new(Vector::new(p.translation.x, p.translation.y), p.rotation.angle())
+}
+fn from_parry(v: Vector) -> Point2<f64> { Point2::new(v.x, v.y) }
 
 impl Collision for Scene {
     // The only module in the workspace that imports parry2d::query.
 
     fn intersects(&self, fp: &Footprint) -> bool {
         fp.parts.iter().any(|(pose, shape)| {
-            self.candidates(pose, shape).any(|o| {
-                query::intersection_test(pose, &**shape, &o.pose, &*o.shape).unwrap_or(true)
+            let pose = to_parry(pose);
+            self.candidates(&pose, shape).any(|o| {
+                query::intersection_test(&pose, &**shape, &o.pose, &*o.shape).unwrap_or(true)
             })
         })
+    }
+
+    fn distance(&self, fp: &Footprint) -> f64 {
+        self.witness(fp).map_or(f64::INFINITY, |w| w.dist)   // 0.0 on contact; ∞ in an empty scene
     }
 
     fn witness(&self, fp: &Footprint) -> Option<Witness> {
         let mut best: Option<Witness> = None;
         for (pose, shape) in &fp.parts {
-            for o in self.candidates(pose, shape) {
+            let pose = to_parry(pose);
+            for o in self.candidates(&pose, shape) {
                 // GJK, inside the engine (Choset App. F.5). We never see the simplex.
-                match query::closest_points(pose, &**shape, &o.pose, &*o.shape, f64::MAX).ok()? {
-                    ClosestPoints::Intersecting => return Some(Witness::contact(pose)),
-                    ClosestPoints::WithinMargin(a, b) | ClosestPoints::Disjoint => { /* keep min */ }
+                match query::closest_points(&pose, &**shape, &o.pose, &*o.shape, f64::MAX).ok()? {
+                    ClosestPoints::Intersecting => return Some(Witness::contact(&pose)),
+                    ClosestPoints::WithinMargin(a, b) => {
+                        let dist = a.distance(b);
+                        if best.as_ref().is_none_or(|w| dist < w.dist) {
+                            best = Some(Witness { on_robot: from_parry(a), on_obstacle: from_parry(b), dist });
+                        }
+                    }
+                    ClosestPoints::Disjoint => {} // cannot happen: the margin is infinite
                 }
             }
         }
@@ -684,10 +708,11 @@ impl Collision for Scene {
 
     fn swept(&self, fp_a: &Footprint, fp_b: &Footprint) -> bool {
         fp_a.parts.iter().zip(&fp_b.parts).any(|((pa, shape), (pb, _))| {
-            let vel = (pb.translation.vector - pa.translation.vector) / 1.0;
-            self.candidates(pa, shape).any(|o| {
+            let (pa, pb) = (to_parry(pa), to_parry(pb));
+            let vel = pb.translation - pa.translation;   // over unit time
+            self.candidates(&pa, shape).any(|o| {
                 // A shape-cast reports a time of impact in [0, 1] if the swept volume hits.
-                query::cast_shapes(pa, &vel, &**shape, &o.pose, &Vector2::zeros(), &*o.shape,
+                query::cast_shapes(&pa, vel, &**shape, &o.pose, Vector::ZERO, &*o.shape,
                                    ShapeCastOptions::with_max_time_of_impact(1.0))
                     .map(|hit| hit.is_some()).unwrap_or(true)
             })
@@ -971,7 +996,7 @@ section, expanded into a reference.
     title="parry: 2D and 3D collision-detection library for the Rust programming language"
     venue="Documentation and source"
     url="https://parry.rs"
-    note="The crate behind crates/collide: shapes, the Qbvh broad phase, and query::{distance, closest_points, intersection_test, cast_shapes}. Appendix C documents what it does."
+    note="The crate behind crates/collide: shapes, the Bvh broad phase, and query::{distance, closest_points, intersection_test, cast_shapes}. Appendix C documents what it does."
   />
   <Reference
     authors="Thrun, S., Burgard, W., and Fox, D."

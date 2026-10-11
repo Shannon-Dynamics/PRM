@@ -854,7 +854,8 @@ pub fn car_grid_search<C: CarModel>(
 ```
 
 ```rust title="crates/kinodynamic/src/rrt.rs"
-use rand::{rngs::Pcg64, Rng};
+use rand::Rng;
+use rand_pcg::Pcg64;
 
 /// §7.5.1: planning with a simulator instead of a steer.
 pub trait Propagate {

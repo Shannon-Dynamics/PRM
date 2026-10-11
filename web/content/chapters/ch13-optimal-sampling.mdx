@@ -660,7 +660,7 @@ and no planner code changed.
 ```rust title="crates/sampling/src/optimal/informed.rs"
 pub struct InformedSampler<M: Chart> {
     start: M::Point, goal: M::Point, c_min: f64, pub c_best: f64,
-    center: SVector<f64, { M::D }>, axis: SVector<f64, { M::D }>, fallback: Uniform,
+    center: DVector<f64>, axis: DVector<f64>, fallback: Uniform,
 }
 
 impl<M: Chart> Sampler<M> for InformedSampler<M> {

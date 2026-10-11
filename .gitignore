@@ -40,3 +40,9 @@ Thumbs.db
 *.tmp
 __pycache__/
 *.pyc
+
+# --- Rust snippet checker ------------------------------------------------------
+# One generated crate per listing, rebuilt every run; the lock churns with them.
+tools/rust-snippets/target/
+tools/rust-snippets/harness/gen/
+tools/rust-snippets/harness/Cargo.lock
