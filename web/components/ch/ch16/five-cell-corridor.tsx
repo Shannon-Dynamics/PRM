@@ -19,7 +19,7 @@ import { FIVE_CELLS, fiveCellSenseMove } from '@/lib/estimate';
 const STAGES = ['prior', 'likelihood', 'posterior', 'moved'] as const;
 type Stage = (typeof STAGES)[number];
 
-const SISTER_HALLWAY = 'https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch05-bayes-filter';
+const SISTER_HALLWAY = 'https://prvr.shannon.id/chapters/ch05-bayes-filter';
 
 const FRACTIONS: Record<Exclude<Stage, 'likelihood'>, string[]> = {
   prior: ['1/5', '1/5', '1/5', '1/5', '1/5'],

@@ -127,7 +127,7 @@ other, and make sure the chapter's worked numeric example still holds in both.
     treatment; the sister's Ch. 20 is a preview. Port only `sim`/`geom`/`prob`/`edt` (plus the
     sister's `filters`/`localize` vendored into Part IV's thin `estimate` crate); never copy its
     `lib/plan`. Cross-book links use the sister's published URL
-    (`https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/<slug>`).
+    (`https://prvr.shannon.id/chapters/<slug>`).
 
 ## Workflow
 

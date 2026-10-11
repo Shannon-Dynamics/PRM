@@ -45,7 +45,7 @@ Story line:
   (`trait Manifold` is implemented *for* the configuration types defined here), Chs. 7–14 and 17–21
   (every planner takes a `&dyn Collision` and a robot from `robots`), Ch. 23, Appendix F (reference).
 - **Baseline sources:** NEW chapter mirroring the sister book's Ch. 4
-  (`https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch04-rusty-and-sensors`),
+  (`https://prvr.shannon.id/chapters/ch04-rusty-and-sensors`),
   whose `World`, `Rusty`, LiDAR, and determinism discipline are ported. C §3.8 (b. 69–71) for the
   forward kinematics map $\varphi : \mathcal{Q} \to M$ and Example 3.8.1 (the 2R arm) — **FK only**;
   the Jacobian and singularities of the same section are Ch. 4's. C App. F.5 (b. 509–512) as the black

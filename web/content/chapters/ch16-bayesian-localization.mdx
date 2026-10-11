@@ -44,7 +44,7 @@ compressed and linked.
 What neither book writes down is the half a *planner* needs: what do Parts II–III do when $\qstart$
 is a distribution? Not "plan from the mean" — the mean can be inside a wall. Not "solve a POMDP" —
 that is the sister's
-[Chapter 22](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch22-pomdps). The
+[Chapter 22](https://prvr.shannon.id/chapters/ch22-pomdps). The
 answer every fielded robot runs is a loop: **sample the belief, score each first action against a
 cost-to-go field computed once by backward Dijkstra, take the cheapest in expectation, sense,
 update, repeat.** The Chapter 6 universal plan is exactly what makes planning on a belief cheap.
@@ -265,7 +265,7 @@ and the motion *did* carry information about $x(k{-}1)$. Small time steps make t
 (9.15), which is (9.1).
 
 *Collapsibles.* The sister book proves the same recursion by induction on $t$ in its
-[Chapter 5](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch05-bayes-filter),
+[Chapter 5](https://prvr.shannon.id/chapters/ch05-bayes-filter),
 with the Markov assumption named once and tested by its Markov Breaker widget. Problem 2 — rederive
 the Kalman filter from (9.2) by assuming Gaussian motion and sensor models — is the bridge back to
 Chapter 15.
@@ -330,9 +330,9 @@ then applies (9.18): $x' = x + d'\cos(\theta + \alpha')$, $y' = y + d'\sin(\thet
 $\theta' = \theta + \alpha' + \beta'$. With all $\sigma_i = 0$ this is the exact increment, and the
 check confirms the sampler's mean displacement is unbiased to a millimetre over 20 000 draws. Samples
 that would cross a wall are rejected, as Choset suggests. The sister's
-[Chapter 8](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch08-nonparametric-filters)
+[Chapter 8](https://prvr.shannon.id/chapters/ch08-nonparametric-filters)
 owns resampling variance, KLD-adaptive sample sizes and the histogram filter's bookkeeping; its
-[Chapter 12](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch12-localization-global)
+[Chapter 12](https://prvr.shannon.id/chapters/ch12-localization-global)
 owns Augmented MCL and the grid-versus-MCL comparison table. Both are vendored unchanged under
 `web/lib/localize/`, and nothing in this chapter re-implements a filter.
 
@@ -367,7 +367,7 @@ within $0.03$. Two honesty items Choset insists on, and the code keeps:
   the same 600 particles both ways on the same log: at $0.25$ m the mode ends within $0.6$ m of the
   truth; at the raw $0.08$ m no particle ever lands within one $\sigma$ of the right answer and the
   cloud starves, six metres off. That is Choset's problem 9, and the sister's
-  [Chapter 10](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch10-sensor-models)
+  [Chapter 10](https://prvr.shannon.id/chapters/ch10-sensor-models)
   is where beam intrinsics and the likelihood-field alternative are fitted properly.
 
 The cost trick is also his: discretize distances to 256 values and $P(y \mid d)$ is "only 256
@@ -417,7 +417,7 @@ is false again. Choset's inverse model for sonar is the piecewise-linear cone (9
 $s(y, \theta) = g(y)\,\Normal(\theta; 0, \sigma_\theta)$ (9.42), $\sigma_\theta = 0.05$ rad; at
 $y = 2$ m on the optical axis he states $s \approx 0.16$, and the library's `chosetConeModel` gives
 $0.1596$. The lasers in this book use the sister's thin-beam inverse model instead; its
-[Chapter 13](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch13-occupancy-grids)
+[Chapter 13](https://prvr.shannon.id/chapters/ch13-occupancy-grids)
 has the independence trap and the MAP-mapping repair. Mapping the Apartment from 120 known poses
 marks $88.7\,\%$ of observed wall cells occupied and $99.8\,\%$ of observed free cells free, and the
 map's total entropy falls to under $30\,\%$ of its initial value — not monotonically, because a
@@ -458,7 +458,7 @@ $P(y(k) \mid x(k), \hat m)\,P(x(k) \mid u(k{-}1), \hat x(k{-}1))$ — produces l
 inconsistent maps (Figs. 9.19–9.20); the particle posterior over paths is what repairs them. On a
 45-step Apartment log with slipping odometry, six particles each carrying a 0.2 m occupancy grid end
 $0.12$ m from the truth where dead reckoning ends $0.20$ m off. The sister's
-[Chapter 17](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch17-fastslam) is the
+[Chapter 17](https://prvr.shannon.id/chapters/ch17-fastslam) is the
 full treatment, landmark and grid versions both.
 </Derivation>
 
@@ -515,12 +515,12 @@ expected one-step entropy reduction a scan would deliver after $a$. The library 
 mutual information between "which sample is true" and the noise-free scan each sample predicts:
 positions whose predicted scans differ are told apart by one reading, mirror rooms are not. It makes
 the path hug distinctive geometry. It is a heuristic for the POMDP of the sister's
-[Chapter 22](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch22-pomdps), and
+[Chapter 22](https://prvr.shannon.id/chapters/ch22-pomdps), and
 it is switched off by default.
 
 *Collapsibles.* The belief roadmap of Prentice and Roy plans in the space of Gaussians with
 covariance propagated along roadmap edges; the sister's
-[Chapter 21](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch21-mdps) is the
+[Chapter 21](https://prvr.shannon.id/chapters/ch21-mdps) is the
 value function our $J$ specializes. When only the map changes, Chapter 6's D* repairs $J$ instead of
 rerunning Dijkstra (Exercise 6). Nav2's fielded stack is this loop with AMCL as the belief and a
 costmap-based planner as $J$.
@@ -1092,7 +1092,7 @@ loop.
     year={2026}
     title="Probabilistic Robotics via Rust — Chapters 5, 8, 10, 12, 13, 17, 21, 22"
     venue="Sister volume, web edition"
-    url="https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch12-localization-global"
+    url="https://prvr.shannon.id/chapters/ch12-localization-global"
     note="The induction proof of the recursion (Ch. 5), histogram and particle filters with KLD sizing (Ch. 8), sensor models (Ch. 10), grid localization and Augmented MCL with the comparison table (Ch. 12), occupancy grids and MAP mapping (Ch. 13), FastSLAM (Ch. 17), and the value function and POMDP this chapter's planner approximates (Chs. 21–22). The filters this chapter wraps are vendored from there."
   />
 </References>

@@ -53,7 +53,7 @@ Story line:
   tables of figure F.7), F.3 the star algorithm and Minkowski difference (eq. F.7, [C ref. 124]), F.4
   $SE(2)$ obstacles (figure F.8, [C refs. 69, 70]), F.5 GJK (Alg. 23, eqs. F.8–F.14, [C ref. 163]
   Gilbert, Johnson and Keerthi). App. B (b. 477) for Minkowski sum/difference, convexity, star-shaped
-  sets. Sister cross-links: Ch. 20 (`https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch20-motion-planning`),
+  sets. Sister cross-links: Ch. 20 (`https://prvr.shannon.id/chapters/ch20-motion-planning`),
   whose derivation F.1 is the one-paragraph version of this chapter; Ch. 13
   (`…/chapters/ch13-occupancy-grids`) for the inflated occupancy grid, the disc's $\mathcal{QO}$ on a
   lattice. Modernization: `parry2d` (Dimforge) for GJK/EPA and shape-casting (verify 0.30 API); `k` and

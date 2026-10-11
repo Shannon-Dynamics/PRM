@@ -44,7 +44,7 @@ chapter owns one artifact, `replan_on_belief`, which the capstone's navigation p
   Algs. 17–18, motion model 9.18–9.21, mean/mode 9.17, kidnapped-robot remedies), §9.1.5 (sensor
   model 9.22–9.25); C §9.2 (b. 328–345): §9.2.1 (9.26–9.42, Alg. 19), §9.2.2 (9.43, scan matching
   9.44, Rao-Blackwellization 9.45–9.48, Alg. 20). Sister cross-links
-  (`https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/<slug>`):
+  (`https://prvr.shannon.id/chapters/<slug>`):
   `ch05-bayes-filter` (recursion, induction proof), `ch08-nonparametric-filters` (histogram and
   particle filters, KLD sizing), `ch10-sensor-models`, `ch12-localization-global` (grid, MCL,
   Augmented MCL, comparison table), `ch13-occupancy-grids`, `ch17-fastslam`, `ch21-mdps` (the value

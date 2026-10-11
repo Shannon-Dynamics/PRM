@@ -172,7 +172,7 @@ is a preview and cross-links here.** What is shared:
   two books overlap (A\*, PRM, RRT, RRT\*, Dubins) the implementations here are the reference ones
   and the sister book's are the simplified versions; the text may say so.
 - **Cross-book links** use the sister's published URL
-  (`https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/<slug>`) and are listed
+  (`https://prvr.shannon.id/chapters/<slug>`) and are listed
   per chapter in §2 of each design doc.
 
 ### Publishing architecture (web) — inherited
@@ -180,7 +180,7 @@ is a preview and cross-links here.** What is shared:
 Identical to the sister book, by decision: the `web/` scaffolding (Next.js 16 App Router static
 export, React 19, Fumadocs 16, MDX per chapter, `remark-math` + `rehype-katex`, Shiki, Nivo 0.99,
 Canvas 2D sim framework with `useSimulation`/`SimCanvas`/`WidgetFrame`, Tailwind v4, self-hosted
-fonts), its `check`/`check:book`/`verify` scripts, the GitHub Pages deploy workflow, and the
+fonts), its `check`/`check:book`/`verify` scripts, the deploy setup, and the
 `pr-latex` MDX→LaTeX print pipeline are forked from `../ProbabilisticRoboticRust/web` and
 `pr-latex` when implementation begins. Only the book structure, the color tokens, and the
 algorithm library change.

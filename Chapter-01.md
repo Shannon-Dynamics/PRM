@@ -52,7 +52,7 @@ Story line:
 - **Baseline sources:** C Ch. 1 — the motivating examples (b. 1–9), §1.1 Overview of Concepts in
   Motion Planning (b. 9–11; Table 1.1), §1.2 Overview of the Book (b. 12–13), §1.3 Mathematical Style
   (b. 13–15; eq. 1.1 and figure 1.10). Sister-book cross-links: Ch. 1
-  (`https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch01-robot-that-doubts`) for
+  (`https://prvr.shannon.id/chapters/ch01-robot-that-doubts`) for
   the shared hook-first pedagogy and the shared protagonist, Ch. 20
   (`…/chapters/ch20-motion-planning`) as the sister's one-chapter preview that this whole book
   expands. Modernization set: OMPL (Şucan, Moll & Kavraki 2012) as the systems framing for "what a

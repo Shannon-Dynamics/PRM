@@ -48,7 +48,7 @@ estimation vocabulary Chapters 16 and 23 consume.
   §8.2.6 example), §8.3 (b. 289–294: eqs. 8.37–8.45, Jacobians, data association, range-only),
   §8.4.1–8.4.2 (b. 294–297); App. J.1, J.4 (eq. J.9, Thm. J.4.1), J.5 ($F = I + TA$, Thms.
   J.5.1–J.5.2). App. I is **not** used: the sister book's Ch. 2 is the Gaussian primer —
-  `https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch02-probability`. Sister
+  `https://prvr.shannon.id/chapters/ch02-probability`. Sister
   cross-links (same prefix): `ch05-bayes-filter` (the recursion the KF instantiates),
   `ch06-kalman-filters` (completing the square, information form, RTS), `ch07-ekf-ukf-manifolds`
   (UKF, error-state EKF on $SE(2)$), `ch11-localization-gaussian` (gating, MHT), `ch14-ekf-slam`

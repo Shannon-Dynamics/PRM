@@ -284,7 +284,7 @@ That is eq. (8.24) with $R$ as stated, and $P^+ = P^- - RHP^-$ follows as in pro
 but the *correct* posterior: if the belief at $k$ is Gaussian, so is the belief at $k{+}1$, and this is
 it. For non-Gaussian noise the same equations give the best *linear* estimator, and a nonlinear one
 may do better. The sister book reaches the same formulas by completing the square — see
-[its Chapter 6](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch06-kalman-filters)
+[its Chapter 6](https://prvr.shannon.id/chapters/ch06-kalman-filters)
 for that route, the information form, and the proof the two coincide.
 </Derivation>
 
@@ -458,9 +458,9 @@ observability consequences are the subject of the Probe below.
 *Wrap the bearing innovation.* The 2005 text subtracts angles; near $\pm\pi$ that produces an innovation
 of $2\pi$ and a catastrophic update. The implementation here takes the residual through `angleDiff` and
 the heading through $\bplus$. The sister book's
-[Chapter 7](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch07-ekf-ukf-manifolds)
+[Chapter 7](https://prvr.shannon.id/chapters/ch07-ekf-ukf-manifolds)
 does this properly — the UKF and the error-state EKF on $\SEtwo$ — and its
-[Chapter 11](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch11-localization-gaussian)
+[Chapter 11](https://prvr.shannon.id/chapters/ch11-localization-gaussian)
 covers gating and multi-hypothesis tracking when association is genuinely ambiguous.
 </Derivation>
 
@@ -536,7 +536,7 @@ landmarks and the rank is $3$; put both landmarks and the robot on one line and 
 (Exercise 4). Range *and* bearing from one landmark is observable while the robot moves — the third
 column of $HF$ carries $u_1$ — and loses a rank the moment it stops: two numbers cannot pin three.
 The NEES tile reads near $3$ for the observable cases, which is what a consistent 3-DOF filter should
-report ([sister Ch. 6](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch06-kalman-filters)
+report ([sister Ch. 6](https://prvr.shannon.id/chapters/ch06-kalman-filters)
 on NEES and NIS).
 
 ### Kalman SLAM
@@ -558,7 +558,7 @@ a high threshold founds a new one. The *forget the map* toggle in the Probe runs
 founded from their first sightings, $588$ of the remaining $597$ sightings matched, the worst map error
 $0.12$ m at $1.6\sigma$. Honest caveats: the covariance update is $O(n_\ell^2)$ per step, and on long
 loops the linearization makes the filter inconsistent. The sister book's
-[Chapter 14](https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch14-ekf-slam) shows
+[Chapter 14](https://prvr.shannon.id/chapters/ch14-ekf-slam) shows
 the cost and the inconsistency, and its Chapter 15 shows what replaced it.
 
 ## Implementation in Rust
@@ -979,7 +979,7 @@ and how to plan on it.
     year={2026}
     title="Probabilistic Robotics via Rust — Chapters 5–7, 11, 14"
     venue="Sister volume, web edition"
-    url="https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch06-kalman-filters"
+    url="https://prvr.shannon.id/chapters/ch06-kalman-filters"
     note="Completing the square, the information form and RTS smoothing (Ch. 6); UKF and the error-state EKF on SE(2) (Ch. 7); gating and multi-hypothesis tracking (Ch. 11); EKF-SLAM's cost and inconsistency (Ch. 14). The filters this chapter wraps are vendored from there."
   />
 </References>

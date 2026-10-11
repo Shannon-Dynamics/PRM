@@ -54,7 +54,7 @@ Story line:
   (Definition C.4.1, Example C.4.2), C.5 Jacobians and gradients (the chain rule; Example C.5.1); App. E
   (b. 489–498) **demoted**: E.1 Euler angles and the lost chart at $R_{33} = \pm1$, E.3 axis–angle, E.4
   quaternions as a four-chart atlas — one short section here, the card in Appendix B. Sister cross-links:
-  Ch. 3 (`https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch03-geometry-of-motion`)
+  Ch. 3 (`https://prvr.shannon.id/chapters/ch03-geometry-of-motion`)
   for $SE(2)$ as a Lie group, $\exp/\log$, $\boxplus/\boxminus$, and its Appendix C for $SO(3)$ machinery;
   Ch. 7 (`…/chapters/ch07-ekf-ukf-manifolds`) for why estimators also need manifolds. Modernization: Solà,
   Deray & Atchuthan, micro-Lie theory (arXiv 1812.01537; verify); Lynch & Park, *Modern Robotics* (verify).

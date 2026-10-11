@@ -53,7 +53,7 @@ Story line:
   cross-linked, not re-taught), §2.3.3 continuation methods (b. 35–37; eq. 2.5), App. D.1 the implicit
   function theorem and D.2 the Newton–Raphson convergence theorem (b. 487–488). Bug1/Bug2 are
   [C ref. 301]; Tangent Bug [C refs. 216, 217]; curve tracing [C ref. 232]. Sister cross-links: Ch. 4
-  (`https://shannon-dynamics.github.io/ProbabilisticRoboticRust/chapters/ch04-rusty-and-sensors`)
+  (`https://prvr.shannon.id/chapters/ch04-rusty-and-sensors`)
   and Ch. 10 (`…/chapters/ch10-sensor-models`) for sonar beam patterns, the centerline model, and
   what real range sensors return. Modernization: comparative Bug-algorithm studies (Ng & Bräunl 2007,
   verify) for the "which Bug wins where" question w3.1 lets the reader answer empirically.
