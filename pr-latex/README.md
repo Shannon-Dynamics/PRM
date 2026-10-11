@@ -80,7 +80,7 @@ This volume adds what a book about motion planning needs:
 - **`shalgorithm`**, numbered pseudocode in the style of Choset's algorithm boxes.
 - **`shnotation`**, the per-chapter symbol table.
 - **Widget cards** print the full address of each simulation in the web edition
-  (`\shwebedition`, set to the GitHub Pages site; change it there if the book
+  (`\shwebedition`, set to https://prm.shannon.id; change it there if the book
   moves to its own domain).
 
 ## Editing

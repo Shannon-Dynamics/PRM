@@ -74,8 +74,8 @@ for (const slug of SLUGS) {
   const body = text.slice(fm[0].length);
 
   // Cross-chapter links must resolve. Links into the sister book
-  // (…/ProbabilisticRoboticRust/chapters/<slug>) are external and skipped.
-  for (const [, target] of body.matchAll(/(?<!ProbabilisticRoboticRust)\/chapters\/([a-z0-9-]+)/g)) {
+  // (https://prvr.shannon.id/chapters/<slug>) are external and skipped.
+  for (const [, target] of body.matchAll(/(?<!prvr\.shannon\.id)\/chapters\/([a-z0-9-]+)/g)) {
     if (!BY_SLUG.has(target)) fail(slug, `link to unknown chapter slug "${target}"`);
   }
 

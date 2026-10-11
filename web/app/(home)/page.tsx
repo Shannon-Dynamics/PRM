@@ -176,7 +176,7 @@ export default function HomePage() {
           <p className="mt-3 max-w-2xl font-prose text-base leading-relaxed text-fd-muted-foreground">
             This book shares its robot, its simulator, and its method with{' '}
             <a
-              href="https://shannon-dynamics.github.io/ProbabilisticRoboticRust/"
+              href="https://prvr.shannon.id/"
               className="text-fd-primary underline-offset-2 hover:underline"
             >
               Probabilistic Robotics via Rust
