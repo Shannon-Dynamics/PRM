@@ -32,6 +32,19 @@ const config = {
   assetPrefix: basePath || undefined,
   images: { unoptimized: true },
   typescript: { ignoreBuildErrors: false },
+
+  experimental: {
+    /**
+     * Bound the prerender workers.
+     *
+     * Vercel's basic build machine has 8 GB. Left to itself Next sizes the
+     * worker pool from the host's core count, and each worker holds its own
+     * copy of the chapter bundles — 23 chapters of MDX, KaTeX and simulation
+     * components. Two is enough to overlap I/O without the pool being what
+     * fills the box. Same setting as the sister book, for the same reason.
+     */
+    cpus: 2,
+  },
 };
 
 export default withMDX(config);
