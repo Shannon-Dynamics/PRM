@@ -42,14 +42,17 @@
   --color-posterior: #a855f7;
   --color-truth: #6b7280;
 
-  /* Semantic planning palette — this book's color code (TOC.md §2). */
-  --color-start: #16a34a;
-  --color-goal: #dc2626;
-  --color-obstacle: #475569;
-  --color-cobstacle: #d97706;
-  --color-graph: #2563eb;
-  --color-path: #7c3aed;
-  --color-robot: #ea580c;
+  /* Semantic planning palette — this book's color code (TOC.md §2).
+     Namespaced `plan-` because Tailwind turns every `--color-<name>` into a
+     `text-<name>` utility: a bare `--color-start` made `text-start` — the
+     text-align utility fumadocs puts on every sidebar link — paint text green. */
+  --color-plan-start: #16a34a;
+  --color-plan-goal: #dc2626;
+  --color-plan-obstacle: #475569;
+  --color-plan-cobstacle: #d97706;
+  --color-plan-graph: #2563eb;
+  --color-plan-path: #7c3aed;
+  --color-plan-robot: #ea580c;
 
   /* Chrome accent: instrument phosphor, deliberately outside the data hues. */
   --color-instrument: #0d9488;
