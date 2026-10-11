@@ -23,6 +23,9 @@ const config = {
   // The book is a static site: every chapter renders at build time, so readers
   // download HTML + the simulation bundles and nothing else.
   output: 'export',
+  // Every page is emitted as <route>/index.html and linked with a trailing
+  // slash, matching the canonical URLs and the sitemap.
+  trailingSlash: true,
   basePath,
   // Rewrites `/_next/...` in the emitted HTML. Next derives this from basePath
   // anyway; stating it keeps the two from drifting if one is ever overridden.
