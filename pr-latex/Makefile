@@ -7,7 +7,8 @@
 #   make clean    remove build artefacts (keeps the PDF)
 #   make dist     remove everything generated, including the PDF
 
-TEXMF  := $(HOME)/.TinyTeX/bin/x86_64-linux
+# TinyTeX installs to ~/.TinyTeX on Linux and ~/Library/TinyTeX on macOS.
+TEXMF  := $(firstword $(wildcard $(HOME)/.TinyTeX/bin/x86_64-linux $(HOME)/Library/TinyTeX/bin/universal-darwin))
 LATEX  := $(shell command -v pdflatex 2>/dev/null || echo $(TEXMF)/pdflatex)
 PYTHON := python3
 CHAPTERS := $(wildcard chapters/ch*.tex)
@@ -31,7 +32,7 @@ pdf: main.tex shannon.sty $(CHAPTERS)
 	 if [ "$$errors" != "0" ]; then \
 	   echo "LaTeX reported $$errors error(s):"; grep -aE '^!' -A3 build/pass3.log | head -40; exit 1; \
 	 fi
-	@echo "main.pdf  —  $$(grep -aoP 'Output written on main.pdf \(\K[0-9]+' build/pass3.log) pages"
+	@echo "main.pdf  —  $$(LC_ALL=C sed -n 's/^Output written on main.pdf (\([0-9]*\) pages.*/\1/p' build/pass3.log) pages"
 
 publish: main.pdf
 	@test -d $(dir $(SITE_PDF)) || { echo "no site checkout at $(dir $(SITE_PDF))"; exit 1; }
